@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  stt_service:
+    build: ./stt_service
+    ports:
+      - "8001:8000"
+    environment:
+      - LOGIC_SERVICE_URL=http://logic_service:8000
+    volumes:
+      - ./stt_service:/app
+
+  logic_service:
+    build: ./logic_service
+    ports:
+      - "8002:8000"
+    environment:
+      - TTS_SERVICE_URL=http://tts_service:8000
+    volumes:
+      - ./logic_service:/app
+
+  tts_service:
+    build: ./tts_service
+    ports:
+      - "8003:8000"
+    volumes:
+      - ./tts_service:/app
