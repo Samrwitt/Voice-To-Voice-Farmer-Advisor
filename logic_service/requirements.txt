@@ -1,4 +1,10 @@
 fastapi
 uvicorn
+chromadb
+sentence-transformers
+langchain
+langchain-community
+llama-cpp-python
+
 pydantic
 requests

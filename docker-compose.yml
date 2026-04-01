@@ -9,6 +9,13 @@ services:
       - LOGIC_SERVICE_URL=http://logic_service:8000
     volumes:
       - ./stt_service:/app
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
 
   logic_service:
     build: ./logic_service
@@ -18,6 +25,7 @@ services:
       - TTS_SERVICE_URL=http://tts_service:8000
     volumes:
       - ./logic_service:/app
+      - ./data:/data
 
   tts_service:
     build: ./tts_service
@@ -25,3 +33,28 @@ services:
       - "8003:8000"
     volumes:
       - ./tts_service:/app
+
+  admin_dashboard:
+    build: ./admin_dashboard
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./admin_dashboard:/app
+      - ./data:/data
+    depends_on:
+      - logic_service
+
+  telephony_service:
+    build: ./telephony_service
+    environment:
+      - STT_URL=http://stt_service:8000/transcribe
+      - LOGIC_URL=http://logic_service:8000/ask
+      - TTS_URL=http://tts_service:8000/synthesize
+    ports:
+      - "5060:5060/udp"
+    volumes:
+      - ./telephony_service:/app
+    depends_on:
+      - stt_service
+      - logic_service
+      - tts_service
