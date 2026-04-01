@@ -6,5 +6,4 @@ langchain
 langchain-community
 llama-cpp-python
 
-pydantic
 requests
