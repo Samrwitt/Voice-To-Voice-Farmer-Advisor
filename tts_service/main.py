@@ -3,6 +3,10 @@ from pydantic import BaseModel
 from fastapi.responses import FileResponse
 from gtts import gTTS
 import os
+import logging
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("tts_service")
 
 app = FastAPI()
 
@@ -14,11 +18,12 @@ async def synthesize(req: TTSRequest):
     output_file = "response.mp3"
     
     try:
-        # Generate Amharic speech using Google TTS for quick MVP mockup
+        logger.info(f"Synthesizing speech for payload: {req.text}")
         tts = gTTS(text=req.text, lang='am')
         tts.save(output_file)
+        logger.info("Speech generation successful.")
     except Exception as e:
-        # Fallback if network issue or gTTS fails.
+        logger.error(f"TTS Failed: {e}")
         with open(output_file, "wb") as f:
             f.write(b"mock audio bytes - tts failed")
             

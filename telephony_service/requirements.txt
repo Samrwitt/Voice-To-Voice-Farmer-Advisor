@@ -1,3 +1,4 @@
-pyvoip
+pyvoip==1.6.8
 requests
-wave
+webrtcvad
+

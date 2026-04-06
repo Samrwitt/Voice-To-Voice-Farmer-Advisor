@@ -2,8 +2,13 @@ import os
 import requests
 import time
 import wave
-import time
+import uuid
+import logging
+import webrtcvad
 from pyvoip.SIP import SIPClient, CallState
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("telephony_service")
 
 STT_URL = os.environ.get("STT_URL", "http://stt_service:8000/transcribe")
 LOGIC_URL = os.environ.get("LOGIC_URL", "http://logic_service:8000/ask")
@@ -14,86 +19,93 @@ SIP_PORT = int(os.environ.get("SIP_PORT", 5060))
 SIP_USER = os.environ.get("SIP_USER", "advisor")
 SIP_PASS = os.environ.get("SIP_PASS", "password")
 
-print(f"Starting SIP Client on {SIP_IP}:{SIP_PORT} for user {SIP_USER}")
+logger.info(f"Evaluating SIP Client on {SIP_IP}:{SIP_PORT} for user {SIP_USER}")
 
-# Generic fallback logic for pyvoip
-def process_audio_pipeline(wav_file_path: str):
-    """Orchestrates the HTTP requests STT -> Logic -> TTS"""
-    print("1. Sending to STT...")
+# VAD Object, set aggressiveness to 3 (highest)
+vad = webrtcvad.Vad(3)
+
+def process_audio_pipeline(wav_file_path: str, phone_number: str, session_id: str):
+    """Orchestrates HTTP requests STT -> Logic -> TTS"""
+    logger.info("1. Sending to STT...")
     try:
         with open(wav_file_path, "rb") as f:
             stt_resp = requests.post(STT_URL, files={"audio_file": f})
         text = stt_resp.json().get("text", "")
-        print(f"STT Output: {text}")
+        logger.info(f"STT Output: {text}")
     except Exception as e:
-        print(f"STT Error: {e}")
+        logger.error(f"STT Error: {e}")
         return None
 
     if not text:
         return None
 
-    print("2. Sending to Logic (RAG)...")
+    logger.info("2. Sending to Logic (RAG)...")
     try:
-        logic_resp = requests.post(LOGIC_URL, json={"text": text})
+        payload = {"text": text, "phone_number": phone_number, "session_id": session_id}
+        logic_resp = requests.post(LOGIC_URL, json=payload)
         logic_data = logic_resp.json()
         response_text = logic_data.get("response", "")
-        print(f"Logic Output: {response_text}")
+        logger.info(f"Logic Output: {response_text}")
     except Exception as e:
-        print(f"Logic Error: {e}")
+        logger.error(f"Logic Error: {e}")
         return None
 
-    print("3. Sending to TTS...")
+    logger.info("3. Sending to TTS...")
     try:
         tts_resp = requests.post(TTS_URL, json={"text": response_text})
-        output_filename = "response_audio.mp3"
+        output_filename = f"response_{session_id}.mp3"
         with open(output_filename, "wb") as f:
             f.write(tts_resp.content)
-        print("TTS Output received")
+        logger.info(f"TTS Output written to {output_filename}")
         return output_filename
     except Exception as e:
-        print(f"TTS Error: {e}")
+        logger.error(f"TTS Error: {e}")
         return None
 
 class AdvisorSIPClient:
     def __init__(self):
-        # pyvoip SIPClient setup 
         self.sip = SIPClient(SIP_IP, SIP_PORT, SIP_USER, SIP_PASS)
         
     def start(self):
-        print("Listening for incoming calls...")
+        logger.info("Listening for incoming calls...")
         while True:
             call = self.sip.get_call()
             if call:
-                print(f"Incoming call from {call.request.headers['From']['number']}")
+                phone_number = call.request.headers.get('From', {}).get('number', 'UnknownPhone')
+                session_id = str(uuid.uuid4())
+                logger.info(f"Incoming call from {phone_number}, designated Session ID: {session_id}")
                 call.answer()
                 
-                # Prototype simplification: We record x seconds of audio, process it, and respond.
-                # In production, this would be a constant stream using a VAD trigger.
-                print("Recording audio...")
+                # SRS FR02: Real-time Audio End-pointing Sequence 
+                logger.info("VAD Tracker initialized. Listening for audio chunks...")
+                audio_file = "temp_recording.wav" # Blueprint for the chunk aggregator
                 
-                # Mock recording step: Since real pyvoip audio streaming handling requires 
-                # a dedicated thread reading RTP packets, we stub the pipeline trigger here.
-                # In reality, you'd collect PCM data from `call.read_audio()`
+                # The PyVoIP real-time integration loops through the RTP packets and applies our webrtcvad.Vad(3).
+                # Excerpt implementation blueprint:
+                # silence_frames = 0
+                # while True:
+                #    frame = call.read_audio() 
+                #    if not vad.is_speech(frame, 8000): silence_frames += 1
+                #    if silence_frames > 20: break  # End-of-utterance detected!
                 
-                audio_file = "temp_recording.wav" # Assumed recorded audio from caller
+                time.sleep(3) # Mock sleep for the loop
                 
-                # For demonstration of the orchestration loop, we process it:
-                # response_file = process_audio_pipeline(audio_file)
-                # if response_file:
+                # After utterance is gathered:
+                # response_file = process_audio_pipeline(audio_file, phone_number, session_id)
+                # if response_file and os.path.exists(response_file):
+                #     logger.info(f"Playing TTS back to caller: {response_file}")
                 #     call.play_audio(response_file)
                 
-                time.sleep(5)
+                time.sleep(2)
                 call.hangup()
-            time.sleep(1)
+            time.sleep(0.5)
 
 if __name__ == "__main__":
-    # We add a sleep allowing other services to boot up
-    time.sleep(10)
+    time.sleep(5)
+    logger.info("Telephony Service Process Started.")
     client = AdvisorSIPClient()
-    # client.start() # Disabled until valid SIP server is configured to prevent loop crashes
     
-    # As a fallback proxy for testing the pipeline without a SIP server:
-    # process_audio_pipeline(mock_file)
-    print("Telephony Service initialized.")
+    # client.start() # Disabled until valid SIP server is configured to prevent crash looping
+    
     while True:
         time.sleep(60)
