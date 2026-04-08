@@ -1,10 +1,7 @@
 fastapi
 uvicorn
 python-multipart
-transformers
-torch
-torchaudio
-aiofiles
+faster-whisper
 soundfile
-librosa
+aiofiles
 requests

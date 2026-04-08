@@ -1,4 +1,4 @@
 pyvoip==1.6.8
 requests
-webrtcvad
-
+torch
+torchaudio

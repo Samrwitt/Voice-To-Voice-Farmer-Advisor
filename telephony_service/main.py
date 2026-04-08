@@ -4,8 +4,10 @@ import time
 import wave
 import uuid
 import logging
-import webrtcvad
 import audioop
+import torch
+import torchaudio
+import numpy as np
 from pyvoip.SIP import SIPClient, CallState
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -22,12 +24,14 @@ SIP_PASS = os.environ.get("SIP_PASS", "password")
 
 logger.info(f"Evaluating SIP Client on {SIP_IP}:{SIP_PORT} for user {SIP_USER}")
 
-# VAD Object, set aggressiveness to 3 (highest)
-vad = webrtcvad.Vad(3)
+# Load Silero VAD
+logger.info("Loading Silero VAD...")
+vad_model, vad_utils = torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad', force_reload=False)
+vad_model.eval()
 
 def process_audio_pipeline(wav_file_path: str, phone_number: str, session_id: str):
     """Orchestrates HTTP requests STT -> Logic -> TTS"""
-    logger.info("1. Sending to STT...")
+    logger.info("1. Sending 16kHz audio to STT...")
     try:
         with open(wav_file_path, "rb") as f:
             stt_resp = requests.post(STT_URL, files={"audio_file": f})
@@ -54,7 +58,7 @@ def process_audio_pipeline(wav_file_path: str, phone_number: str, session_id: st
     logger.info("3. Sending to TTS...")
     try:
         tts_resp = requests.post(TTS_URL, json={"text": response_text})
-        output_filename = f"response_{session_id}.mp3"
+        output_filename = f"response_{session_id}.wav"
         with open(output_filename, "wb") as f:
             f.write(tts_resp.content)
         logger.info(f"TTS Output written to {output_filename}")
@@ -77,12 +81,13 @@ class AdvisorSIPClient:
                 logger.info(f"Incoming call from {phone_number}, designated Session ID: {session_id}")
                 call.answer()
                 
-                # SRS FR02: Real-time Audio End-pointing Sequence 
                 logger.info("VAD Tracker initialized. Listening for audio chunks...")
                 audio_file = f"temp_{session_id}.wav"
                 
                 audio_frames = bytearray()
+                vad_buffer = bytearray()
                 silence_frames = 0
+                vad_model.reset_states()
                 
                 while call.state == CallState.ANSWERED:
                     frame = call.read_audio()
@@ -90,39 +95,47 @@ class AdvisorSIPClient:
                         break
                     
                     try:
-                        # PyVoIP typically yields standard 20ms G711 PCMU frames (160 bytes)
+                        # PyVoIP yields 160 bytes = 20ms G711 PCMU frames. We convert to 16-bit PCM (320 bytes)
                         pcm_frame = audioop.ulaw2lin(frame, 2)
                         audio_frames.extend(pcm_frame)
+                        vad_buffer.extend(pcm_frame)
                         
-                        if len(pcm_frame) == 320: # 16-bit * 8000Hz * 0.02s
-                            is_speech = vad.is_speech(pcm_frame, 8000)
-                            if is_speech:
+                        # Silero VAD at 8000Hz works well with chunks of 256 samples = 512 bytes (32ms)
+                        while len(vad_buffer) >= 512:
+                            chunk_bytes = vad_buffer[:512]
+                            vad_buffer = vad_buffer[512:]
+                            
+                            chunk_np = np.frombuffer(chunk_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+                            chunk_tensor = torch.from_numpy(chunk_np)
+                            
+                            speech_prob = vad_model(chunk_tensor, 8000).item()
+                            
+                            if speech_prob > 0.5:
                                 silence_frames = 0
                             else:
                                 silence_frames += 1
                                 
-                        if silence_frames > 40: # ~800ms silence ends utterance
+                        # 30 * 32ms ~= 960ms silence before endpointing
+                        if silence_frames > 30:
                             logger.info("End of utterance detected.")
                             break
                     except Exception as e:
-                        # If frame is unexpected size or codec mismatch
                         pass
 
-                with wave.open(audio_file, 'wb') as wf:
-                    wf.setnchannels(1)
-                    wf.setsampwidth(2)
-                    wf.setframerate(8000)
-                    wf.writeframes(audio_frames)
+                # Upsample accumulated 8000Hz frames to 16000Hz for ASR/STT
+                tensor_8k = torch.from_numpy(np.frombuffer(audio_frames, dtype=np.int16).astype(np.float32) / 32768.0)
+                resampler = torchaudio.transforms.Resample(orig_freq=8000, new_freq=16000)
+                tensor_16k = resampler(tensor_8k)
+                
+                torchaudio.save(audio_file, tensor_16k.unsqueeze(0), 16000, bits_per_sample=16, encoding="PCM_S")
 
-                logger.info("Utterance captured. Routing to pipeline...")
+                logger.info("Utterance captured and upsampled. Routing to pipeline...")
                 response_file = process_audio_pipeline(audio_file, phone_number, session_id)
                 
                 if response_file and os.path.exists(response_file):
                     logger.info(f"Playing HTTP TTS response back to SIP caller: {response_file}")
-                    # Play synthesized audio stream back to handset
                     call.play_audio(response_file)
                 
-                # Brief pause before hanging up to ensure audio empties buffer
                 time.sleep(2)
                 if call.state == CallState.ANSWERED:
                     call.hangup()

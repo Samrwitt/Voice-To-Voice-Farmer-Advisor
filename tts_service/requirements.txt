@@ -1,4 +1,7 @@
 fastapi
 uvicorn
 pydantic
-gTTS
+transformers
+torch
+torchaudio
+scipy
