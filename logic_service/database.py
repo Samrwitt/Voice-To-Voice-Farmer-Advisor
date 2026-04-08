@@ -83,6 +83,21 @@ def init_db():
                   role TEXT NOT NULL,
                   created_at DATETIME DEFAULT CURRENT_TIMESTAMP)''')
 
+    # Alerts / Forecasts
+    c.execute('''CREATE TABLE IF NOT EXISTS alerts
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  target_region TEXT NOT NULL,
+                  alert_message TEXT NOT NULL,
+                  severity TEXT DEFAULT 'warning',
+                  created_at DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+
+    # Session States (For Multi-turn / Safety Confirmations)
+    c.execute('''CREATE TABLE IF NOT EXISTS session_states
+                 (session_id TEXT PRIMARY KEY,
+                  current_state TEXT NOT NULL,
+                  pending_action TEXT,
+                  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+
     conn.commit()
     conn.close()
 
@@ -119,6 +134,67 @@ def get_market_price(crop_name: str, region: str = None):
     result = c.fetchone()
     conn.close()
     return result
+
+def register_farmer(phone_number: str, name: str, location: str, preferred_language: str = 'am'):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        # SQLite UPSERT equivalent (since sqlite 3.24)
+        c.execute("INSERT INTO farmers (phone_number, name, location, preferred_language) VALUES (?, ?, ?, ?) ON CONFLICT(phone_number) DO UPDATE SET name=excluded.name, location=excluded.location, preferred_language=excluded.preferred_language", 
+                  (phone_number, name, location, preferred_language))
+        conn.commit()
+    except Exception as e:
+        print(f"Error registering farmer: {e}")
+    finally:
+        conn.close()
+
+def get_farmer_profile(phone_number: str):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT name, location, preferred_language, registered_at FROM farmers WHERE phone_number = ?", (phone_number,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return {"phone_number": phone_number, "name": row[0], "location": row[1], "preferred_language": row[2], "registered_at": row[3]}
+    return None
+
+def create_alert(target_region: str, alert_message: str, severity: str = "warning"):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO alerts (target_region, alert_message, severity) VALUES (?, ?, ?)", 
+              (target_region, alert_message, severity))
+    conn.commit()
+    conn.close()
+
+def get_alerts_for_region(region: str):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT alert_message, severity FROM alerts WHERE target_region = ? OR target_region = 'all' ORDER BY created_at DESC", (region,))
+    alerts = c.fetchall()
+    conn.close()
+    return alerts
+
+def set_session_state(session_id: str, current_state: str, pending_action: str = None):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        c.execute("INSERT INTO session_states (session_id, current_state, pending_action) VALUES (?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET current_state=excluded.current_state, pending_action=excluded.pending_action, updated_at=CURRENT_TIMESTAMP", 
+                  (session_id, current_state, pending_action))
+        conn.commit()
+    except Exception as e:
+        print(f"Error setting session state: {e}")
+    finally:
+        conn.close()
+
+def get_session_state(session_id: str):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT current_state, pending_action FROM session_states WHERE session_id = ?", (session_id,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return {"current_state": row[0], "pending_action": row[1]}
+    return None
 
 init_kb()
 init_db()

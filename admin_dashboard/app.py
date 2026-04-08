@@ -66,7 +66,7 @@ if not st.session_state.logged_in:
                 st.error("Invalid credentials")
 else:
     st.sidebar.title("Navigation")
-    pages = ["Escalation Queue", "Market Prices", "Knowledge Base"]
+    pages = ["Escalation Queue", "Market Prices", "Knowledge Base", "Alerts & Forecasts"]
     choice = st.sidebar.radio("Go to", pages)
     st.sidebar.write(f"Logged in as: **{st.session_state.role}**")
     if st.sidebar.button("Logout"):
@@ -132,3 +132,49 @@ else:
                         ids=[doc_id]
                     )
                     st.success(f"Successfully added document ID: {doc_id}")
+
+    elif choice == "Alerts & Forecasts":
+        st.title("Predictive Summary & Alerts Broadcast")
+        if st.session_state.role != "admin":
+            st.error("Permission Denied: Only Admins can broadcast alerts.")
+        else:
+            col1, col2 = st.columns(2)
+            with col1:
+                st.subheader("Broadcast New Alert")
+                with st.form("Add Alert"):
+                    target_region = st.selectbox("Target Region", ["all", "Addis Ababa", "Oromia", "Amhara", "SNNPR", "Tigray"])
+                    alert_message = st.text_area("Alert Message (Amharic)")
+                    severity = st.selectbox("Severity", ["info", "warning", "critical"])
+                    submit_alert = st.form_submit_button("Broadcast")
+                    
+                    if submit_alert and alert_message:
+                        conn = get_db_connection()
+                        c = conn.cursor()
+                        c.execute("INSERT INTO alerts (target_region, alert_message, severity) VALUES (?, ?, ?)",
+                                  (target_region, alert_message, severity))
+                        conn.commit()
+                        conn.close()
+                        st.success("Alert Broadcasted Successfully!")
+
+            with col2:
+                st.subheader("Predictive Analytics")
+                conn = get_db_connection()
+                try:
+                    df_alerts = pd.read_sql_query("SELECT target_region, severity, count(*) as count FROM alerts GROUP BY target_region, severity", conn)
+                    if not df_alerts.empty:
+                        st.bar_chart(df_alerts.pivot(index='target_region', columns='severity', values='count').fillna(0))
+                    else:
+                        st.info("No active alerts.")
+                except Exception as e:
+                    pass
+                conn.close()
+                st.markdown("**Simulated Reach:** ~45,000 farmers in active warning zones.")
+                
+        st.subheader("Recent Broadcasts")
+        conn = get_db_connection()
+        try:
+            df = pd.read_sql_query("SELECT id, target_region, alert_message, severity, created_at FROM alerts ORDER BY created_at DESC", conn)
+            st.dataframe(df, use_container_width=True)
+        except Exception:
+            st.warning("Could not load alerts. Make sure the database schema is updated.")
+        conn.close()

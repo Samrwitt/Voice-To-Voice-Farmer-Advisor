@@ -5,6 +5,7 @@ import wave
 import uuid
 import logging
 import webrtcvad
+import audioop
 from pyvoip.SIP import SIPClient, CallState
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -78,26 +79,53 @@ class AdvisorSIPClient:
                 
                 # SRS FR02: Real-time Audio End-pointing Sequence 
                 logger.info("VAD Tracker initialized. Listening for audio chunks...")
-                audio_file = "temp_recording.wav" # Blueprint for the chunk aggregator
+                audio_file = f"temp_{session_id}.wav"
                 
-                # The PyVoIP real-time integration loops through the RTP packets and applies our webrtcvad.Vad(3).
-                # Excerpt implementation blueprint:
-                # silence_frames = 0
-                # while True:
-                #    frame = call.read_audio() 
-                #    if not vad.is_speech(frame, 8000): silence_frames += 1
-                #    if silence_frames > 20: break  # End-of-utterance detected!
+                audio_frames = bytearray()
+                silence_frames = 0
                 
-                time.sleep(3) # Mock sleep for the loop
+                while call.state == CallState.ANSWERED:
+                    frame = call.read_audio()
+                    if not frame:
+                        break
+                    
+                    try:
+                        # PyVoIP typically yields standard 20ms G711 PCMU frames (160 bytes)
+                        pcm_frame = audioop.ulaw2lin(frame, 2)
+                        audio_frames.extend(pcm_frame)
+                        
+                        if len(pcm_frame) == 320: # 16-bit * 8000Hz * 0.02s
+                            is_speech = vad.is_speech(pcm_frame, 8000)
+                            if is_speech:
+                                silence_frames = 0
+                            else:
+                                silence_frames += 1
+                                
+                        if silence_frames > 40: # ~800ms silence ends utterance
+                            logger.info("End of utterance detected.")
+                            break
+                    except Exception as e:
+                        # If frame is unexpected size or codec mismatch
+                        pass
+
+                with wave.open(audio_file, 'wb') as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(8000)
+                    wf.writeframes(audio_frames)
+
+                logger.info("Utterance captured. Routing to pipeline...")
+                response_file = process_audio_pipeline(audio_file, phone_number, session_id)
                 
-                # After utterance is gathered:
-                # response_file = process_audio_pipeline(audio_file, phone_number, session_id)
-                # if response_file and os.path.exists(response_file):
-                #     logger.info(f"Playing TTS back to caller: {response_file}")
-                #     call.play_audio(response_file)
+                if response_file and os.path.exists(response_file):
+                    logger.info(f"Playing HTTP TTS response back to SIP caller: {response_file}")
+                    # Play synthesized audio stream back to handset
+                    call.play_audio(response_file)
                 
+                # Brief pause before hanging up to ensure audio empties buffer
                 time.sleep(2)
-                call.hangup()
+                if call.state == CallState.ANSWERED:
+                    call.hangup()
             time.sleep(0.5)
 
 if __name__ == "__main__":
@@ -105,7 +133,8 @@ if __name__ == "__main__":
     logger.info("Telephony Service Process Started.")
     client = AdvisorSIPClient()
     
-    # client.start() # Disabled until valid SIP server is configured to prevent crash looping
-    
+    logger.info("Starting production SIP loop -> binding pyvoip client server...")
+    client.start() 
+
     while True:
         time.sleep(60)
