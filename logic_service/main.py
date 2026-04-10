@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
 from typing import Optional
 import os
@@ -7,7 +7,7 @@ import logging
 import requests
 import base64
 import time
-from database import collection, add_to_escalation, log_conversation, get_conversation_history, get_market_price, register_farmer, get_farmer_profile, get_alerts_for_region, set_session_state, get_session_state
+from database import collection, add_to_escalation, log_conversation, get_conversation_history, get_market_price, register_farmer, get_farmer_profile, get_alerts_for_region, set_session_state, get_session_state, insert_call_record
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("logic_service")
@@ -35,7 +35,8 @@ from langchain_community.llms import LlamaCpp
 
 llm = None
 # Look for model in a mounted data volume to avoid image bloating
-model_path = "/data/models/llama-2-7b-chat.Q4_K_M.gguf"
+DATA_DIR = os.environ.get("DATA_DIR", "/data")
+model_path = os.path.join(DATA_DIR, "models/llama-2-7b-chat.Q4_K_M.gguf")
 if os.path.exists(model_path):
     logger.info("Initializing LLaMA-2 model for RAG Generation...")
     llm = LlamaCpp(
@@ -141,6 +142,26 @@ def generate_rag_response(query_text: str, phone_number: str, session_id: str):
 async def process_query(query: Query):
     response_text, intent = generate_rag_response(query.text, query.phone_number, query.session_id)
     return {"response": response_text, "intent": intent}
+
+@app.post("/save_call_record")
+async def save_call_record(audio_file: UploadFile = File(...), session_id: str = Form(...), phone_number: str = Form(...), duration: int = Form(...)):
+    DATA_DIR = os.environ.get("DATA_DIR", "/data")
+    recordings_dir = os.path.join(DATA_DIR, "recordings")
+    os.makedirs(recordings_dir, exist_ok=True)
+    
+    file_path = os.path.join(recordings_dir, f"{session_id}.wav")
+    with open(file_path, "wb") as f:
+        f.write(await audio_file.read())
+        
+    db_path = file_path
+    insert_call_record(session_id, phone_number, db_path, duration)
+    
+    # Register/update the farmer profile trivially if not exist
+    profile = get_farmer_profile(phone_number)
+    if not profile:
+        register_farmer(phone_number, "Unknown Caller", "Unknown")
+        
+    return {"status": "success", "file_path": db_path}
 
 @app.post("/register")
 async def register(profile: FarmerProfile):
