@@ -5,5 +5,5 @@ sentence-transformers
 langchain
 langchain-community
 llama-cpp-python
-
 requests
+bcrypt

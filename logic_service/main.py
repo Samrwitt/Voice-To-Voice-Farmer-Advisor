@@ -19,6 +19,10 @@ logger = logging.getLogger("logic_service")
 
 app = FastAPI()
 
+# Mount admin REST API (used by the frontend microservice)
+from admin_api import router as admin_router
+app.include_router(admin_router)
+
 # ── Config (externalized) ────────────────────────────────────────────────────
 RAG_DISTANCE_THRESHOLD = float(os.environ.get("RAG_DISTANCE_THRESHOLD", "1.2"))
 TTS_URL = os.environ.get("TTS_URL", "http://tts_service:8002/synthesize")

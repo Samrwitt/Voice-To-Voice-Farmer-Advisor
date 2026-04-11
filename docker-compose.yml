@@ -5,10 +5,8 @@ services:
     build: ./stt_service
     ports:
       - "8001:8000"
-    environment:
-      - LOGIC_SERVICE_URL=http://logic_service:8000
     volumes:
-      - ./stt_service:/app
+      - ./data:/data
     deploy:
       resources:
         reservations:
@@ -22,17 +20,23 @@ services:
     ports:
       - "8002:8000"
     environment:
-      - TTS_SERVICE_URL=http://tts_service:8000
+      - TTS_URL=http://tts_service:8000/synthesize
+      - STT_URL=http://stt_service:8000/transcribe
+      - DATA_DIR=/data
+      - RAG_DISTANCE_THRESHOLD=1.2
     volumes:
       - ./logic_service:/app
       - ./data:/data
+    depends_on:
+      - stt_service
+      - tts_service
 
   tts_service:
     build: ./tts_service
     ports:
       - "8003:8000"
     volumes:
-      - ./tts_service:/app
+      - ./data:/data
 
   admin_dashboard:
     build: ./admin_dashboard
@@ -49,12 +53,26 @@ services:
     environment:
       - STT_URL=http://stt_service:8000/transcribe
       - LOGIC_URL=http://logic_service:8000/ask
+      - SAVE_RECORD_URL=http://logic_service:8000/save_call_record
       - TTS_URL=http://tts_service:8000/synthesize
+      - SIP_IP=0.0.0.0
+      - SIP_PORT=5060
     ports:
       - "5060:5060/udp"
     volumes:
       - ./telephony_service:/app
+      - ./data:/data
     depends_on:
       - stt_service
       - logic_service
       - tts_service
+
+  # ── New: Web Frontend (nginx SPA) ────────────────────────────────────────
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - logic_service
+    restart: unless-stopped
+
