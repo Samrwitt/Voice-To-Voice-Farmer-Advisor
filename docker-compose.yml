@@ -34,15 +34,7 @@ services:
     volumes:
       - ./data:/data
 
-  admin_dashboard:
-    build: ./admin_dashboard
-    ports:
-      - "8501:8501"
-    volumes:
-      - ./admin_dashboard:/app
-      - ./data:/data
-    depends_on:
-      - logic_service
+  # admin_dashboard (old Streamlit UI) removed — replaced by frontend (nginx)
 
   telephony_service:
     build: ./telephony_service

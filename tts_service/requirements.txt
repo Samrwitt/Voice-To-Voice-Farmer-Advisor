@@ -2,6 +2,5 @@ fastapi
 uvicorn
 pydantic
 transformers
-torch
-torchaudio
 scipy
+# torch and torchaudio are installed CPU-only in the Dockerfile via --no-deps
