@@ -138,12 +138,18 @@ def get_market_price(crop_name: str, region: str = None):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     if region:
-        c.execute("SELECT price, unit FROM market_prices WHERE crop_name = ? AND region = ? ORDER BY updated_at DESC LIMIT 1", (crop_name, region))
+        c.execute(
+            "SELECT price, unit, updated_at FROM market_prices WHERE crop_name = ? AND region = ? ORDER BY updated_at DESC LIMIT 1",
+            (crop_name, region)
+        )
     else:
-        c.execute("SELECT price, unit FROM market_prices WHERE crop_name = ? ORDER BY updated_at DESC LIMIT 1", (crop_name,))
+        c.execute(
+            "SELECT price, unit, updated_at FROM market_prices WHERE crop_name = ? ORDER BY updated_at DESC LIMIT 1",
+            (crop_name,)
+        )
     result = c.fetchone()
     conn.close()
-    return result
+    return result  # (price, unit, updated_at) or None
 
 def register_farmer(phone_number: str, name: str, location: str, preferred_language: str = 'am'):
     conn = sqlite3.connect(DB_PATH)
