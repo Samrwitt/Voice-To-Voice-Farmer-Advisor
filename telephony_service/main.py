@@ -7,9 +7,9 @@ import logging
 import audioop
 import threading
 from typing import Optional
-import torch
-import torchaudio
 import numpy as np
+from scipy.signal import resample_poly
+import webrtcvad
 from pyvoip.SIP import SIPClient, CallState
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -42,16 +42,14 @@ PROMPT_NO_SPEECH   = "ምንም ድምፅ አልሰማሁም። ጥሩ ቀን �
 PROMPT_STT_FAIL    = "ይቅርታ፣ ድምፅዎን ሰምቼ ለመረዳት አልቻልኩም። እባክዎ ይድገሙ።"  # Could not understand. Please repeat.
 
 
-def _load_vad():
-    """Load Silero VAD from torch hub (uses local cache after first download)."""
-    model, _ = torch.hub.load(
-        repo_or_dir='snakers4/silero-vad',
-        model='silero_vad',
-        force_reload=False,
-        verbose=False
-    )
-    model.eval()
-    return model
+def _load_vad(aggressiveness: int = 2) -> webrtcvad.Vad:
+    """
+    Create a WebRTC VAD instance.
+    aggressiveness: 0 (least aggressive) to 3 (most aggressive).
+    2 is a good default for telephony with background noise.
+    """
+    vad = webrtcvad.Vad(aggressiveness)
+    return vad
 
 
 def synthesize_text(text: str, prefix: str = "tts") -> Optional[str]:
@@ -80,25 +78,27 @@ def _play_and_cleanup(call, filepath: Optional[str]):
             os.remove(filepath)
 
 
-def capture_utterance(call, vad_model, session_id: str):
+def capture_utterance(call, vad: webrtcvad.Vad, session_id: str):
     """
-    Captures one spoken utterance from the call using Silero VAD.
+    Captures one spoken utterance using Google WebRTC VAD.
 
     Returns:
         (audio_frames: bytearray, speech_detected: bool)
 
     Logic:
         - Accumulate G.711 μ-law frames, convert to 16-bit PCM.
-        - Run VAD on 32ms chunks at 8000 Hz.
-        - End of utterance = speech was found AND then 960ms of silence.
+        - WebRTC VAD operates on exactly 160-sample (20ms at 8 kHz) = 320-byte frames.
+        - End of utterance = speech detected AND then ~960ms of silence.
         - Timeout = ~16s of no speech (triggers reprompt/hangup upstream).
     """
-    audio_frames = bytearray()
-    vad_buffer = bytearray()
-    silence_frames = 0
+    audio_frames  = bytearray()
+    vad_buffer    = bytearray()
+    silence_frames   = 0
     no_speech_frames = 0
-    speech_detected = False
-    vad_model.reset_states()
+    speech_detected  = False
+
+    # WebRTC VAD: 20ms frame at 8000 Hz = 160 samples × 2 bytes = 320 bytes
+    FRAME_BYTES = 320
 
     while call.state == CallState.ANSWERED:
         frame = call.read_audio()
@@ -106,23 +106,20 @@ def capture_utterance(call, vad_model, session_id: str):
             break
 
         try:
-            pcm_frame = audioop.ulaw2lin(frame, 2)   # G.711 → linear 16-bit
+            pcm_frame = audioop.ulaw2lin(frame, 2)   # G.711 μ-law → 16-bit PCM
             audio_frames.extend(pcm_frame)
             vad_buffer.extend(pcm_frame)
 
-            # Process 512-byte (256-sample, 32ms at 8 kHz) VAD chunks
-            while len(vad_buffer) >= 512:
-                chunk_bytes = bytes(vad_buffer[:512])
-                vad_buffer = vad_buffer[512:]
+            while len(vad_buffer) >= FRAME_BYTES:
+                chunk = bytes(vad_buffer[:FRAME_BYTES])
+                vad_buffer = vad_buffer[FRAME_BYTES:]
 
-                chunk_np = np.frombuffer(chunk_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-                chunk_tensor = torch.from_numpy(chunk_np)
-                speech_prob = vad_model(chunk_tensor, 8000).item()
+                is_speech = vad.is_speech(chunk, sample_rate=8000)
 
-                if speech_prob > 0.5:
-                    silence_frames = 0
+                if is_speech:
+                    silence_frames   = 0
                     no_speech_frames = 0
-                    speech_detected = True
+                    speech_detected  = True
                 else:
                     no_speech_frames += 1
                     if speech_detected:
@@ -142,12 +139,14 @@ def capture_utterance(call, vad_model, session_id: str):
 
 def frames_to_wav_16k(audio_frames: bytearray, out_path: str):
     """Upsample 8 kHz PCM bytearray to 16 kHz WAV file for Whisper."""
-    tensor_8k = torch.from_numpy(
-        np.frombuffer(bytes(audio_frames), dtype=np.int16).astype(np.float32) / 32768.0
-    )
-    resampler = torchaudio.transforms.Resample(orig_freq=8000, new_freq=16000)
-    tensor_16k = resampler(tensor_8k)
-    torchaudio.save(out_path, tensor_16k.unsqueeze(0), 16000, bits_per_sample=16, encoding="PCM_S")
+    pcm_8k  = np.frombuffer(bytes(audio_frames), dtype=np.int16)
+    # resample_poly(up=2, down=1) gives exact 8000→16000 Hz upsampling
+    pcm_16k = resample_poly(pcm_8k, up=2, down=1).astype(np.int16)
+    with wave.open(out_path, 'wb') as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)   # 16-bit
+        wf.setframerate(16000)
+        wf.writeframes(pcm_16k.tobytes())
 
 
 def process_audio_pipeline(wav_path: str, phone_number: str, session_id: str) -> Optional[str]:
@@ -290,11 +289,13 @@ def handle_call(call, phone_number: str, session_id: str):
         if all_audio:
             full_path = f"full_{session_id}.wav"
             try:
-                # Save at 8 kHz (telephony rate) for storage
-                tensor = torch.from_numpy(
-                    np.frombuffer(bytes(all_audio), dtype=np.int16).astype(np.float32) / 32768.0
-                )
-                torchaudio.save(full_path, tensor.unsqueeze(0), 8000, bits_per_sample=16, encoding="PCM_S")
+                # Save at 8 kHz (telephony rate) for storage using wave module
+                pcm = np.frombuffer(bytes(all_audio), dtype=np.int16)
+                with wave.open(full_path, 'wb') as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(8000)
+                    wf.writeframes(pcm.tobytes())
                 # Duration: 16-bit = 2 bytes/sample, 8000 samples/sec → 16000 bytes/sec
                 duration_sec = int(len(all_audio) / 16000)
                 upload_call_record(full_path, phone_number, session_id, duration_sec)

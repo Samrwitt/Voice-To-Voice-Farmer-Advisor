@@ -1,8 +1,5 @@
 pyvoip==1.6.8
 requests
 numpy
-
-# CPU-only wheels — ~250 MB instead of ~2.5 GB (no CUDA needed for VAD + resampling)
---extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.2.2+cpu
-torchaudio==2.2.2+cpu
+scipy
+webrtcvad-wheels
