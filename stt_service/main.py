@@ -12,14 +12,25 @@ logger = logging.getLogger("asr_service")
 app = FastAPI()
 
 # Load faster-whisper model with CUDA/CPU fallback
-logger.info("Loading faster-whisper small model...")
+# WHISPER_MODEL options: tiny / base / small / medium (smaller = faster, less accurate)
+_model_size = os.environ.get("WHISPER_MODEL", "small")
+logger.info(f"Loading faster-whisper model: {_model_size}...")
 try:
-    asr_model = WhisperModel("small", device="cuda", compute_type="float16")
+    asr_model = WhisperModel(_model_size, device="cuda", compute_type="float16")
     logger.info("Loaded successfully on CUDA.")
 except Exception as e:
     logger.warning(f"Failed to load on CUDA: {e}. Falling back to CPU...")
-    asr_model = WhisperModel("small", device="cpu", compute_type="int8")
-    logger.info("Loaded on CPU with int8 quantization.")
+    # cpu_threads: use available cores — Ryzen 7 7840HS has 8 cores / 16 threads
+    import multiprocessing
+    _cpu_threads = int(os.environ.get("WHISPER_THREADS", multiprocessing.cpu_count()))
+    asr_model = WhisperModel(
+        _model_size,
+        device="cpu",
+        compute_type="int8",
+        cpu_threads=_cpu_threads,
+        num_workers=2,
+    )
+    logger.info(f"Loaded on CPU with int8 quantization ({_cpu_threads} threads).")
 
 
 @app.post("/transcribe")

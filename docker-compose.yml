@@ -5,15 +5,11 @@ services:
     build: ./stt_service
     ports:
       - "8001:8000"
+    environment:
+      - WHISPER_MODEL=medium      # options: tiny | base | small | medium
+      - WHISPER_THREADS=8        # Ryzen 7 7840HS: 8 cores
     volumes:
       - ./data:/data
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
 
   logic_service:
     build: ./logic_service
@@ -57,8 +53,11 @@ services:
       - TTS_URL=http://tts_service:8000/synthesize
       - SIP_IP=0.0.0.0
       - SIP_PORT=5060
+      - SIP_USER=${SIP_USER:-advisor}
+      - SIP_PASS=${SIP_PASS:-changeme}
     ports:
       - "5060:5060/udp"
+      - "5060:5060/tcp"
     volumes:
       - ./telephony_service:/app
       - ./data:/data

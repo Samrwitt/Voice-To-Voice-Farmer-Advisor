@@ -6,6 +6,7 @@ import uuid
 import logging
 import audioop
 import threading
+from typing import Optional
 import torch
 import torchaudio
 import numpy as np
@@ -205,9 +206,8 @@ def upload_call_record(wav_path: str, phone_number: str, session_id: str, durati
         logger.error(f"[{session_id}] Upload error: {e}")
 
 
-# ── Per-Call Handler (runs in its own thread) ────────────────────────────────
-from typing import Optional
 
+# ── Per-Call Handler (runs in its own thread) ────────────────────────────────
 def handle_call(call, phone_number: str, session_id: str):
     """
     Handles a single SIP call:
