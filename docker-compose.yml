@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   stt_service:
     build: ./stt_service
@@ -20,6 +18,10 @@ services:
       - STT_URL=http://stt_service:8000/transcribe
       - DATA_DIR=/data
       - RAG_DISTANCE_THRESHOLD=1.2
+      - HF_HOME=/data/hf_cache              # cache HuggingFace models to volume
+      - SENTENCE_TRANSFORMERS_HOME=/data/hf_cache
+      - TRANSFORMERS_CACHE=/data/hf_cache
+      - HF_HUB_DISABLE_PROGRESS_BARS=1
     volumes:
       - ./logic_service:/app
       - ./data:/data

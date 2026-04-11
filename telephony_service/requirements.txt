@@ -1,5 +1,6 @@
 pyvoip==1.6.8
 requests
-numpy
 scipy
 webrtcvad-wheels
+# numpy is installed as a dependency of scipy — not listed explicitly
+# to avoid hash mismatch failures from partial downloads

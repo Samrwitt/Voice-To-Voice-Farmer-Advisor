@@ -2,8 +2,11 @@ fastapi
 uvicorn
 chromadb
 sentence-transformers
+huggingface-hub>=0.23.0
+transformers<4.49.0          # 4.49+ has a NameError: 'nn' not defined bug at import time
 langchain
 langchain-community
-llama-cpp-python
+# llama-cpp-python              # requires VS C++ on Windows; install manually if needed
 requests
 bcrypt
+# torch is installed CPU-only in the Dockerfile via --no-deps
