@@ -5,7 +5,8 @@ import sqlite3
 import os
 
 # Initialize Vector DB for RAG
-chroma_client = chromadb.PersistentClient(path="/data/chroma_db")
+DATA_DIR = os.environ.get("DATA_DIR", "/data")
+chroma_client = chromadb.PersistentClient(path=os.path.join(DATA_DIR, "chroma_db"))
 # Using a lightweight sentence transformer for embeddings
 sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="paraphrase-multilingual-MiniLM-L12-v2")
 
@@ -33,7 +34,7 @@ def init_kb():
             collection.add(documents=documents, metadatas=metadatas, ids=ids)
             print("Knowledge Base Initialized.")
 
-DB_PATH = "/data/advisor.db"
+DB_PATH = os.path.join(DATA_DIR, "advisor.db")
 
 # Initialize SQLite for all entities
 def init_db():
@@ -97,6 +98,15 @@ def init_db():
                   current_state TEXT NOT NULL,
                   pending_action TEXT,
                   updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+
+    # Call Records
+    c.execute('''CREATE TABLE IF NOT EXISTS call_records
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  session_id TEXT UNIQUE NOT NULL,
+                  phone_number TEXT NOT NULL,
+                  recording_path TEXT NOT NULL,
+                  duration INTEGER NOT NULL,
+                  timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
 
     conn.commit()
     conn.close()
@@ -195,6 +205,18 @@ def get_session_state(session_id: str):
     if row:
         return {"current_state": row[0], "pending_action": row[1]}
     return None
+
+def insert_call_record(session_id: str, phone_number: str, recording_path: str, duration: int):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        c.execute("INSERT INTO call_records (session_id, phone_number, recording_path, duration) VALUES (?, ?, ?, ?)",
+                  (session_id, phone_number, recording_path, duration))
+        conn.commit()
+    except Exception as e:
+        print(f"Error inserting call record: {e}")
+    finally:
+        conn.close()
 
 init_kb()
 init_db()

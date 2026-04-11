@@ -6,7 +6,7 @@ import logging
 from faster_whisper import WhisperModel
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("stt_service")
+logger = logging.getLogger("asr_service")
 
 app = FastAPI()
 
@@ -24,7 +24,7 @@ async def transcribe(audio_file: UploadFile = File(...)):
     temp_filename = f"temp_{uuid.uuid4()}.wav"
     text = ""
     try:
-        logger.info(f"Receiving audio payload for transcription...")
+        # 1. Save File
         async with aiofiles.open(temp_filename, 'wb') as out_file:
             content = await audio_file.read()
             await out_file.write(content)
@@ -38,10 +38,9 @@ async def transcribe(audio_file: UploadFile = File(...)):
         logger.info(f"Transcription successful: {text}")
         
     except Exception as e:
-        logger.error(f"Error during transcription: {e}")
-        return {"error": str(e), "text": ""}
+        logger.error(f"[{session_id}] ASR Error: {e}")
+        return {"text": "", "confidence": 0.0, "error": str(e)}
+        
     finally:
         if os.path.exists(temp_filename):
             os.remove(temp_filename)
-    
-    return {"text": text}

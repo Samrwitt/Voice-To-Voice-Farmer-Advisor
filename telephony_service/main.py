@@ -15,6 +15,7 @@ logger = logging.getLogger("telephony_service")
 
 STT_URL = os.environ.get("STT_URL", "http://stt_service:8000/transcribe")
 LOGIC_URL = os.environ.get("LOGIC_URL", "http://logic_service:8000/ask")
+SAVE_RECORD_URL = os.environ.get("SAVE_RECORD_URL", "http://logic_service:8000/save_call_record")
 TTS_URL = os.environ.get("TTS_URL", "http://tts_service:8000/synthesize")
 
 SIP_IP = os.environ.get("SIP_IP", "0.0.0.0")
@@ -28,6 +29,20 @@ logger.info(f"Evaluating SIP Client on {SIP_IP}:{SIP_PORT} for user {SIP_USER}")
 logger.info("Loading Silero VAD...")
 vad_model, vad_utils = torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad', force_reload=False)
 vad_model.eval()
+
+def upload_call_record(wav_file_path: str, phone_number: str, session_id: str, duration: int):
+    logger.info("Uploading full call record to database via Logic Service...")
+    try:
+        with open(wav_file_path, "rb") as f:
+            data = {"session_id": session_id, "phone_number": phone_number, "duration": duration}
+            files = {"audio_file": f}
+            resp = requests.post(SAVE_RECORD_URL, data=data, files=files)
+            if resp.status_code == 200:
+                logger.info("Successfully recorded call in database.")
+            else:
+                logger.warning(f"Failed to record call. Status: {resp.status_code}")
+    except Exception as e:
+        logger.error(f"Error uploading call record: {e}")
 
 def process_audio_pipeline(wav_file_path: str, phone_number: str, session_id: str):
     """Orchestrates HTTP requests STT -> Logic -> TTS"""
@@ -139,6 +154,11 @@ class AdvisorSIPClient:
                 time.sleep(2)
                 if call.state == CallState.ANSWERED:
                     call.hangup()
+                
+                # Upload recording
+                duration_sec = int(len(audio_frames) / 16000)
+                upload_call_record(audio_file, phone_number, session_id, duration_sec)
+                
             time.sleep(0.5)
 
 if __name__ == "__main__":

@@ -4,11 +4,14 @@ import pandas as pd
 import bcrypt
 import chromadb
 from chromadb.utils import embedding_functions
+import os
+import os
 
-DB_PATH = "/data/advisor.db"
+DATA_DIR = os.environ.get("DATA_DIR", "/data")
+DB_PATH = os.path.join(DATA_DIR, "advisor.db")
 
 # Initialize ChromaDB
-chroma_client = chromadb.PersistentClient(path="/data/chroma_db")
+chroma_client = chromadb.PersistentClient(path=os.path.join(DATA_DIR, "chroma_db"))
 sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="paraphrase-multilingual-MiniLM-L12-v2")
 collection = chroma_client.get_or_create_collection(name="agronomy_kb", embedding_function=sentence_transformer_ef)
 
@@ -66,14 +69,48 @@ if not st.session_state.logged_in:
                 st.error("Invalid credentials")
 else:
     st.sidebar.title("Navigation")
-    pages = ["Escalation Queue", "Market Prices", "Knowledge Base", "Alerts & Forecasts"]
+    pages = ["Call Logs & Farmers", "Escalation Queue", "Market Prices", "Knowledge Base", "Alerts & Forecasts"]
     choice = st.sidebar.radio("Go to", pages)
     st.sidebar.write(f"Logged in as: **{st.session_state.role}**")
     if st.sidebar.button("Logout"):
         st.session_state.logged_in = False
         st.rerun()
 
-    if choice == "Escalation Queue":
+    if choice == "Call Logs & Farmers":
+        st.title("Call Logs & Registered Farmers")
+        
+        st.subheader("Registered Farmers")
+        conn = get_db_connection()
+        try:
+            df_farmers = pd.read_sql_query("SELECT * FROM farmers ORDER BY registered_at DESC", conn)
+            st.dataframe(df_farmers, use_container_width=True)
+        except Exception:
+            st.warning("Farmers table not found or empty.")
+
+        st.subheader("Recent Call Records")
+        try:
+            df_calls = pd.read_sql_query("SELECT c.id, c.session_id, c.phone_number, f.name, c.duration, c.timestamp, c.recording_path FROM call_records c LEFT JOIN farmers f ON c.phone_number = f.phone_number ORDER BY c.timestamp DESC LIMIT 50", conn)
+            
+            if df_calls.empty:
+                st.info("No calls recorded yet.")
+            else:
+                st.dataframe(df_calls, use_container_width=True)
+                
+                st.markdown("### Play Back Audio")
+                selected_session = st.selectbox("Select Session ID to play audio:", df_calls['session_id'].tolist())
+                if selected_session:
+                    row = df_calls[df_calls['session_id'] == selected_session].iloc[0]
+                    audio_path = row['recording_path']
+                    if os.path.exists(audio_path):
+                        st.audio(audio_path)
+                    else:
+                        st.warning(f"Audio file not found at {audio_path}")
+        except Exception as e:
+            st.warning(f"Call records not found or empty. Ensure the database has the updated schema. Error: {e}")
+        finally:
+            conn.close()
+
+    elif choice == "Escalation Queue":
         st.title("Escalation Queue")
         conn = get_db_connection()
         df = pd.read_sql_query("SELECT * FROM escalated_queries ORDER BY timestamp DESC", conn)
