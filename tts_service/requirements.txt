@@ -1,6 +1,10 @@
 fastapi
-uvicorn
+uvicorn[standard]
 pydantic
-transformers<4.49.0          # 4.49+ has a NameError: 'nn' not defined bug at import time
-scipy
-# torch and torchaudio are installed CPU-only in the Dockerfile via --no-deps
+gTTS
+transformers
+torch
+soundfile
+librosa
+uroman
+sentencepiece

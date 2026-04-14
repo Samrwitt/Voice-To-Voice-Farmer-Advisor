@@ -1,15 +1,18 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from fastapi.responses import FileResponse
-from starlette.background import BackgroundTask
-from transformers import VitsModel, VitsTokenizer
+from transformers import VitsModel, AutoTokenizer
 import torch
-import torchaudio
+import soundfile as sf
+import tempfile
 import os
-import uuid
 import logging
+import subprocess
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger("tts_service")
 
 app = FastAPI()
@@ -19,78 +22,71 @@ class TTSRequest(BaseModel):
     text: str
 
 
-# ── Model Loading ────────────────────────────────────────────────────────────
-_model_loaded = False
-model = None
-tokenizer = None
-device = "cpu"
+MODEL_ID = "facebook/mms-tts-amh"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-logger.info("Loading MMS TTS Amharic model (facebook/mms-tts-amh)...")
-try:
-    model_name = "facebook/mms-tts-amh"
-    tokenizer = VitsTokenizer.from_pretrained(model_name)
-    model = VitsModel.from_pretrained(model_name)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model.to(device)
-    model.eval()
-    _model_loaded = True
-    logger.info(f"MMS TTS loaded successfully on {device}.")
-except Exception as e:
-    logger.error(f"Failed to load MMS TTS model: {e}. Synthesize will return silence.")
+logger.info(f"Loading model {MODEL_ID} on {DEVICE}...")
+tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+model = VitsModel.from_pretrained(MODEL_ID).to(DEVICE)
+model.eval()
+logger.info("Model loaded successfully.")
 
 
-def _make_silent_wav(path: str, duration_seconds: float = 1.0, sample_rate: int = 8000):
-    """Writes a silent WAV file as a fallback."""
-    n_samples = int(sample_rate * duration_seconds)
-    silent = torch.zeros((1, n_samples))
-    torchaudio.save(path, silent, sample_rate, bits_per_sample=16, encoding="PCM_S")
+def romanize_text(text: str) -> str:
+    """
+    MMS Amharic TTS works best with romanized input.
+    This uses the external `uroman` command if installed.
+    Falls back to the original text if romanization fails.
+    """
+    try:
+        result = subprocess.run(
+            ["uroman"],
+            input=text,
+            text=True,
+            capture_output=True,
+            check=True
+        )
+        romanized = result.stdout.strip()
+        if romanized:
+            return romanized
+        return text
+    except Exception as e:
+        logger.warning(f"Romanization failed, using original text: {e}")
+        return text
 
 
-# ── Synthesis Endpoint ───────────────────────────────────────────────────────
 @app.post("/synthesize")
 async def synthesize(req: TTSRequest):
-    """
-    Converts Amharic text to speech.
-    Returns a WAV file at 8 kHz (telephony-compatible 16-bit PCM).
-    Falls back to 1 second of silence if model cannot synthesize.
-    """
-    output_file = f"response_{uuid.uuid4()}.wav"
-
-    def cleanup():
-        if os.path.exists(output_file):
-            os.remove(output_file)
-
-    if not _model_loaded or model is None or tokenizer is None:
-        logger.warning("Model not loaded — returning silent WAV fallback.")
-        _make_silent_wav(output_file)
-        return FileResponse(output_file, media_type="audio/wav",
-                            filename="response.wav", background=BackgroundTask(cleanup))
+    if not req.text.strip():
+        raise HTTPException(status_code=400, detail="Text must not be empty.")
 
     try:
-        logger.info(f"Synthesizing: '{req.text[:80]}...' " if len(req.text) > 80 else f"Synthesizing: '{req.text}'")
+        logger.info(f"Synthesizing speech for payload: {req.text}")
 
-        inputs = tokenizer(req.text, return_tensors="pt")
-        inputs = {k: v.to(device) for k, v in inputs.items()}
+        processed_text = romanize_text(req.text)
+        logger.info(f"Processed text: {processed_text}")
+
+        inputs = tokenizer(processed_text, return_tensors="pt").to(DEVICE)
 
         with torch.no_grad():
             output = model(**inputs).waveform
 
-        orig_freq = model.config.sampling_rate
+        audio = output.squeeze().cpu().numpy()
+        sample_rate = model.config.sampling_rate
 
-        # Resample to 8 kHz for telephony compatibility
-        if orig_freq != 8000:
-            resampler = torchaudio.transforms.Resample(
-                orig_freq=orig_freq, new_freq=8000
-            ).to(device)
-            output = resampler(output)
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+        tmp_path = tmp.name
+        tmp.close()
 
-        output = output.cpu()
-        torchaudio.save(output_file, output, 8000, bits_per_sample=16, encoding="PCM_S")
-        logger.info(f"Synthesis successful → {output_file}")
+        sf.write(tmp_path, audio, sample_rate)
+        logger.info("Speech generation successful.")
+
+        return FileResponse(
+            tmp_path,
+            media_type="audio/wav",
+            filename="response.wav"
+        )
 
     except Exception as e:
-        logger.error(f"TTS synthesis failed: {e} — returning silent fallback.")
-        _make_silent_wav(output_file)
-
-    return FileResponse(output_file, media_type="audio/wav",
-                        filename="response.wav", background=BackgroundTask(cleanup))
+        logger.exception(f"TTS failed: {e}")
+        raise HTTPException(status_code=500, detail="TTS generation failed.")
