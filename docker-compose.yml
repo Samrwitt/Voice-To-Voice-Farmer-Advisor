@@ -60,11 +60,20 @@ services:
       - logic_service
       - tts_service
 
-  # ── New: Web Frontend (nginx SPA) ────────────────────────────────────────
-  frontend:
-    build: ./frontend
+  # ── Admin Dashboard Frontend (Next.js) ───────────────────────────────────
+  admin_dashboard_frontend:
+    build: ./admin_dashboard_frontend
     ports:
-      - "3000:80"
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - NEXT_TELEMETRY_DISABLED=1
+      # Server-side proxy URL — NOT exposed to browser (no NEXT_PUBLIC_ prefix)
+      - LOGIC_SERVICE_URL=http://logic_service:8000
+      # Path for the /api/audio streaming route
+      - DATA_DIR=/data
+    volumes:
+      - ./data:/data:ro   # read-only: frontend only streams recordings, never writes
     depends_on:
       - logic_service
     restart: unless-stopped
