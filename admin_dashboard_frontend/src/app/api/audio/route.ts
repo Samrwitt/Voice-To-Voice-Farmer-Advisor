@@ -41,7 +41,6 @@ export async function GET(req: NextRequest) {
       const chunk = end - start + 1;
 
       const stream = fs.createReadStream(normalized, { start, end });
-      // @ts-expect-error — ReadStream is compatible with ReadableStream in this context
       return new NextResponse(stream as unknown as ReadableStream, {
         status: 206,
         headers: {

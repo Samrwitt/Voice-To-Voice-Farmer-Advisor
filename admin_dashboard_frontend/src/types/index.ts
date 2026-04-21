@@ -62,8 +62,8 @@ export interface KBEntry {
 
 // ── Escalation — /admin/escalations ──────────────────────────────────────────
 export interface EscalationCase {
-  // backend
-  id: number;
+  // backend (optional so mock data without id is still valid)
+  id?: number;
   query?: string;
   context?: string;
   status: 'pending' | 'resolved' | 'Open' | 'Resolved';

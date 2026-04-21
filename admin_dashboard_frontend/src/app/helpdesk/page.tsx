@@ -39,7 +39,7 @@ export default function Helpdesk() {
   const resolvedCount = cases.filter(c => c.status === 'resolved').length;
 
   const handleResolve = async () => {
-    if (!selected) return;
+    if (!selected || selected.id == null) return;
     setResolving(true);
     try {
       await resolveEscalation(selected.id);
