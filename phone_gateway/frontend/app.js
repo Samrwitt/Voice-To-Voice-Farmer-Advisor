@@ -1,10 +1,15 @@
-let mediaRecorder = null;
 let websocket = null;
 let timerInterval = null;
 let seconds = 0;
 let activeCall = false;
 
+let audioContext = null;
+let mediaStream = null;
+let sourceNode = null;
+let processorNode = null;
+
 const DEFAULT_SERVICE_NUMBER = "8028";
+const TARGET_SAMPLE_RATE = 16000;
 
 let callerId = localStorage.getItem("caller_id");
 let callerName = localStorage.getItem("caller_name");
@@ -147,13 +152,8 @@ function clearCaller() {
   const fullNameInput = document.getElementById("fullName");
   const phoneNumberInput = document.getElementById("phoneNumber");
 
-  if (fullNameInput) {
-    fullNameInput.value = "";
-  }
-
-  if (phoneNumberInput) {
-    phoneNumberInput.value = "";
-  }
+  if (fullNameInput) fullNameInput.value = "";
+  if (phoneNumberInput) phoneNumberInput.value = "";
 
   if (numberDisplay) {
     numberDisplay.value = DEFAULT_SERVICE_NUMBER;
@@ -245,55 +245,36 @@ async function startCall() {
   try {
     setStatus("Requesting microphone...");
 
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: true
+    mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true
+      }
     });
 
     setStatus("Connecting...");
 
     const protocol = window.location.protocol === "https:" ? "wss" : "ws";
 
-    // The dialed number is only used for UI.
-    // We do not send or save the dialed number.
+    // We do not send or save dialedNumber.
+    // It is only used to create the phone-call-like UI.
     const wsUrl =
       `${protocol}://${window.location.host}/ws/call` +
-      `?caller_id=${encodeURIComponent(callerId)}`;
+      `?caller_id=${encodeURIComponent(callerId)}` +
+      `&audio_format=pcm16` +
+      `&sample_rate=${TARGET_SAMPLE_RATE}`;
 
     websocket = new WebSocket(wsUrl);
     websocket.binaryType = "arraybuffer";
 
-    websocket.onopen = () => {
+    websocket.onopen = async () => {
       setStatus("In call");
       activeCall = true;
       startTimer();
 
-      try {
-        mediaRecorder = new MediaRecorder(stream, {
-          mimeType: "audio/webm"
-        });
-      } catch (error) {
-        console.warn("audio/webm not supported, using default MediaRecorder format.");
-        mediaRecorder = new MediaRecorder(stream);
-      }
-
-      mediaRecorder.ondataavailable = async (event) => {
-        if (
-          event.data &&
-          event.data.size > 0 &&
-          websocket &&
-          websocket.readyState === WebSocket.OPEN
-        ) {
-          const buffer = await event.data.arrayBuffer();
-          websocket.send(buffer);
-        }
-      };
-
-      mediaRecorder.onerror = (event) => {
-        console.error("MediaRecorder error:", event);
-        setStatus("Recording error");
-      };
-
-      mediaRecorder.start(500);
+      await startPCMStreaming(mediaStream);
     };
 
     websocket.onmessage = (event) => {
@@ -312,6 +293,16 @@ async function startCall() {
               `Session ended. Audio saved: ${data.session.audio_file_path}`;
           }
         }
+
+        if (data.event === "speech_started") {
+          setStatus("Speaking...");
+        }
+
+        if (data.event === "speech_ended") {
+          setStatus("Listening...");
+          console.log("Utterance saved:", data.utterance_path);
+        }
+
       } catch (err) {
         console.log("Message:", event.data);
       }
@@ -324,12 +315,10 @@ async function startCall() {
 
     websocket.onclose = (event) => {
       console.log("WebSocket closed:", event.code, event.reason);
-
+      cleanupAudio();
       setStatus("Ended");
       activeCall = false;
       stopTimer();
-
-      stream.getTracks().forEach(track => track.stop());
     };
 
   } catch (error) {
@@ -339,14 +328,101 @@ async function startCall() {
   }
 }
 
+async function startPCMStreaming(stream) {
+  audioContext = new AudioContext();
+
+  sourceNode = audioContext.createMediaStreamSource(stream);
+
+  // ScriptProcessorNode is older but simple and works for this pilot.
+  // Later we can replace it with AudioWorklet for production.
+  const bufferSize = 4096;
+  processorNode = audioContext.createScriptProcessor(bufferSize, 1, 1);
+
+  processorNode.onaudioprocess = (event) => {
+    if (!activeCall || !websocket || websocket.readyState !== WebSocket.OPEN) {
+      return;
+    }
+
+    const inputBuffer = event.inputBuffer.getChannelData(0);
+
+    const downsampled = downsampleBuffer(
+      inputBuffer,
+      audioContext.sampleRate,
+      TARGET_SAMPLE_RATE
+    );
+
+    const pcm16 = float32ToPCM16(downsampled);
+
+    websocket.send(pcm16.buffer);
+  };
+
+  sourceNode.connect(processorNode);
+  processorNode.connect(audioContext.destination);
+}
+
+function downsampleBuffer(buffer, inputSampleRate, outputSampleRate) {
+  if (outputSampleRate === inputSampleRate) {
+    return buffer;
+  }
+
+  if (outputSampleRate > inputSampleRate) {
+    throw new Error("Output sample rate must be lower than input sample rate.");
+  }
+
+  const sampleRateRatio = inputSampleRate / outputSampleRate;
+  const newLength = Math.round(buffer.length / sampleRateRatio);
+  const result = new Float32Array(newLength);
+
+  let offsetResult = 0;
+  let offsetBuffer = 0;
+
+  while (offsetResult < result.length) {
+    const nextOffsetBuffer = Math.round((offsetResult + 1) * sampleRateRatio);
+
+    let accum = 0;
+    let count = 0;
+
+    for (
+      let i = offsetBuffer;
+      i < nextOffsetBuffer && i < buffer.length;
+      i++
+    ) {
+      accum += buffer[i];
+      count++;
+    }
+
+    result[offsetResult] = count > 0 ? accum / count : 0;
+
+    offsetResult++;
+    offsetBuffer = nextOffsetBuffer;
+  }
+
+  return result;
+}
+
+function float32ToPCM16(float32Array) {
+  const pcm16 = new Int16Array(float32Array.length);
+
+  for (let i = 0; i < float32Array.length; i++) {
+    let sample = Math.max(-1, Math.min(1, float32Array[i]));
+
+    if (sample < 0) {
+      pcm16[i] = sample * 0x8000;
+    } else {
+      pcm16[i] = sample * 0x7fff;
+    }
+  }
+
+  return pcm16;
+}
+
 function endCall() {
   if (!activeCall) return;
 
   setStatus("Ending call...");
 
-  if (mediaRecorder && mediaRecorder.state !== "inactive") {
-    mediaRecorder.stop();
-  }
+  activeCall = false;
+  stopTimer();
 
   if (websocket && websocket.readyState === WebSocket.OPEN) {
     websocket.send("END_CALL");
@@ -356,6 +432,33 @@ function endCall() {
     }, 300);
   }
 
-  activeCall = false;
-  stopTimer();
+  cleanupAudio();
+}
+
+function cleanupAudio() {
+  if (processorNode) {
+    try {
+      processorNode.disconnect();
+    } catch (e) {}
+    processorNode = null;
+  }
+
+  if (sourceNode) {
+    try {
+      sourceNode.disconnect();
+    } catch (e) {}
+    sourceNode = null;
+  }
+
+  if (audioContext) {
+    try {
+      audioContext.close();
+    } catch (e) {}
+    audioContext = null;
+  }
+
+  if (mediaStream) {
+    mediaStream.getTracks().forEach(track => track.stop());
+    mediaStream = null;
+  }
 }

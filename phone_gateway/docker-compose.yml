@@ -39,6 +39,16 @@ services:
     volumes:
       - pgadmin_data:/var/lib/pgadmin
 
+  vad-service:
+    build:
+      context: ../vad_service
+      dockerfile: Dockerfile
+    container_name: vad_service
+    ports:
+      - "8010:8010"
+    volumes:
+      - ../vad_service/utterances:/app/utterances
+
 volumes:
   postgres_data:
   call_recordings:

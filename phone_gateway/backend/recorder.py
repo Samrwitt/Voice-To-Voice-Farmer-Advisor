@@ -10,7 +10,7 @@ class AudioRecorder:
         self.recordings_dir = Path(recordings_base) / "audio"
         self.recordings_dir.mkdir(parents=True, exist_ok=True)
 
-        self.file_path = self.recordings_dir / f"{session_id}.webm"
+        self.file_path = self.recordings_dir / f"{session_id}.pcm"
         self.file = open(self.file_path, "ab")
 
     def write_chunk(self, chunk: bytes):
