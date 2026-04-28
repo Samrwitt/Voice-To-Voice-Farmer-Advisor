@@ -4,6 +4,8 @@ let timerInterval = null;
 let seconds = 0;
 let activeCall = false;
 
+const DEFAULT_SERVICE_NUMBER = "8028";
+
 let callerId = localStorage.getItem("caller_id");
 let callerName = localStorage.getItem("caller_name");
 let callerPhone = localStorage.getItem("caller_phone");
@@ -17,29 +19,54 @@ const statusEl = document.getElementById("status");
 const timerEl = document.getElementById("timer");
 const sessionInfo = document.getElementById("sessionInfo");
 
-window.onload = () => {
+document.addEventListener("DOMContentLoaded", () => {
+  if (numberDisplay && !numberDisplay.value) {
+    numberDisplay.value = DEFAULT_SERVICE_NUMBER;
+  }
+
   if (callerId && callerName && callerPhone) {
     showDialer();
   } else {
     showCallerForm();
   }
-};
+});
 
 function showCallerForm() {
+  if (!callerForm || !dialer) return;
+
   callerForm.classList.remove("hidden");
   dialer.classList.add("hidden");
+
+  callerForm.style.display = "flex";
+  dialer.style.display = "none";
 }
 
 function showDialer() {
+  if (!callerForm || !dialer) return;
+
   callerForm.classList.add("hidden");
   dialer.classList.remove("hidden");
 
-  callerInfo.innerText = `${callerName} | ${callerPhone}`;
+  callerForm.style.display = "none";
+  dialer.style.display = "flex";
+
+  if (callerInfo) {
+    callerInfo.innerText = `${callerName} | ${callerPhone}`;
+  }
+
+  if (numberDisplay && !numberDisplay.value) {
+    numberDisplay.value = DEFAULT_SERVICE_NUMBER;
+  }
+
+  setStatus("Idle");
 }
 
 async function registerCaller() {
-  const fullName = document.getElementById("fullName").value.trim();
-  const phoneNumber = document.getElementById("phoneNumber").value.trim();
+  const fullNameInput = document.getElementById("fullName");
+  const phoneNumberInput = document.getElementById("phoneNumber");
+
+  const fullName = fullNameInput ? fullNameInput.value.trim() : "";
+  const phoneNumber = phoneNumberInput ? phoneNumberInput.value.trim() : "";
 
   if (!fullName || !phoneNumber) {
     alert("Please enter full name and phone number.");
@@ -47,6 +74,13 @@ async function registerCaller() {
   }
 
   try {
+    const continueButton = document.querySelector(".continue-btn");
+
+    if (continueButton) {
+      continueButton.disabled = true;
+      continueButton.innerText = "Please wait...";
+    }
+
     const response = await fetch("/api/callers/register", {
       method: "POST",
       headers: {
@@ -59,11 +93,19 @@ async function registerCaller() {
     });
 
     if (!response.ok) {
+      const errorText = await response.text();
+      console.error("Registration failed:", errorText);
       alert("Failed to register caller.");
       return;
     }
 
     const data = await response.json();
+
+    if (!data.caller || !data.caller.caller_id) {
+      console.error("Unexpected register response:", data);
+      alert("Registration response is invalid.");
+      return;
+    }
 
     callerId = data.caller.caller_id;
     callerName = data.caller.full_name;
@@ -76,8 +118,15 @@ async function registerCaller() {
     showDialer();
 
   } catch (error) {
-    console.error(error);
+    console.error("Could not connect to the server:", error);
     alert("Could not connect to the server.");
+  } finally {
+    const continueButton = document.querySelector(".continue-btn");
+
+    if (continueButton) {
+      continueButton.disabled = false;
+      continueButton.innerText = "Continue";
+    }
   }
 }
 
@@ -95,31 +144,67 @@ function clearCaller() {
   callerName = null;
   callerPhone = null;
 
-  numberDisplay.value = "";
-  sessionInfo.innerText = "";
-  setStatus("Idle");
-  timerEl.innerText = "00:00";
+  const fullNameInput = document.getElementById("fullName");
+  const phoneNumberInput = document.getElementById("phoneNumber");
 
+  if (fullNameInput) {
+    fullNameInput.value = "";
+  }
+
+  if (phoneNumberInput) {
+    phoneNumberInput.value = "";
+  }
+
+  if (numberDisplay) {
+    numberDisplay.value = DEFAULT_SERVICE_NUMBER;
+  }
+
+  if (sessionInfo) {
+    sessionInfo.innerText = "";
+  }
+
+  if (timerEl) {
+    timerEl.innerText = "00:00";
+  }
+
+  setStatus("Idle");
   showCallerForm();
 }
 
 function pressKey(key) {
-  if (activeCall) return;
+  if (activeCall || !numberDisplay) return;
+
+  if (numberDisplay.value === DEFAULT_SERVICE_NUMBER) {
+    numberDisplay.value = "";
+  }
+
   numberDisplay.value += key;
 }
 
 function deleteKey() {
-  if (activeCall) return;
+  if (activeCall || !numberDisplay) return;
+
   numberDisplay.value = numberDisplay.value.slice(0, -1);
+
+  if (!numberDisplay.value) {
+    numberDisplay.value = DEFAULT_SERVICE_NUMBER;
+  }
 }
 
 function setStatus(text) {
-  statusEl.innerText = text;
+  if (statusEl) {
+    statusEl.innerText = text;
+  }
 }
 
 function startTimer() {
   seconds = 0;
-  timerEl.innerText = "00:00";
+
+  if (timerEl) {
+    timerEl.innerText = "00:00";
+  }
+
+  stopTimer();
 
   timerInterval = setInterval(() => {
     seconds++;
@@ -127,7 +212,9 @@ function startTimer() {
     const mins = String(Math.floor(seconds / 60)).padStart(2, "0");
     const secs = String(seconds % 60).padStart(2, "0");
 
-    timerEl.innerText = `${mins}:${secs}`;
+    if (timerEl) {
+      timerEl.innerText = `${mins}:${secs}`;
+    }
   }, 1000);
 }
 
@@ -139,7 +226,7 @@ function stopTimer() {
 }
 
 async function startCall() {
-  const dialedNumber = numberDisplay.value.trim();
+  const dialedNumber = numberDisplay ? numberDisplay.value.trim() : "";
 
   if (!callerId) {
     alert("Please register caller first.");
@@ -166,8 +253,8 @@ async function startCall() {
 
     const protocol = window.location.protocol === "https:" ? "wss" : "ws";
 
-    // We do NOT send dialedNumber to the backend.
-    // The dialed number is only used for the phone-call-like UI.
+    // The dialed number is only used for UI.
+    // We do not send or save the dialed number.
     const wsUrl =
       `${protocol}://${window.location.host}/ws/call` +
       `?caller_id=${encodeURIComponent(callerId)}`;
@@ -206,7 +293,6 @@ async function startCall() {
         setStatus("Recording error");
       };
 
-      // Send audio chunks every 500 ms
       mediaRecorder.start(500);
     };
 
@@ -215,13 +301,16 @@ async function startCall() {
         const data = JSON.parse(event.data);
 
         if (data.type === "session_started") {
-          sessionInfo.innerText =
-            `Session started: ${data.session_id}`;
+          if (sessionInfo) {
+            sessionInfo.innerText = `Session started: ${data.session_id}`;
+          }
         }
 
         if (data.type === "session_ended") {
-          sessionInfo.innerText =
-            `Session ended. Audio saved: ${data.session.audio_file_path}`;
+          if (sessionInfo) {
+            sessionInfo.innerText =
+              `Session ended. Audio saved: ${data.session.audio_file_path}`;
+          }
         }
       } catch (err) {
         console.log("Message:", event.data);
@@ -233,7 +322,9 @@ async function startCall() {
       setStatus("WebSocket error");
     };
 
-    websocket.onclose = () => {
+    websocket.onclose = (event) => {
+      console.log("WebSocket closed:", event.code, event.reason);
+
       setStatus("Ended");
       activeCall = false;
       stopTimer();
@@ -242,7 +333,7 @@ async function startCall() {
     };
 
   } catch (error) {
-    console.error(error);
+    console.error("Microphone error:", error);
     setStatus("Microphone error");
     alert("Could not access microphone. Please allow microphone permission.");
   }
