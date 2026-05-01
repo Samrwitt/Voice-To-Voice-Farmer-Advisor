@@ -258,8 +258,6 @@ async function startCall() {
 
     const protocol = window.location.protocol === "https:" ? "wss" : "ws";
 
-    // We do not send or save dialedNumber.
-    // It is only used to create the phone-call-like UI.
     const wsUrl =
       `${protocol}://${window.location.host}/ws/call` +
       `?caller_id=${encodeURIComponent(callerId)}` +
@@ -283,14 +281,7 @@ async function startCall() {
 
         if (data.type === "session_started") {
           if (sessionInfo) {
-            sessionInfo.innerText = `Session started: ${data.session_id}`;
-          }
-        }
-
-        if (data.type === "session_ended") {
-          if (sessionInfo) {
-            sessionInfo.innerText =
-              `Session ended. Audio saved: ${data.session.audio_file_path}`;
+            sessionInfo.innerText = `Session: ${data.session_id}`;
           }
         }
 
@@ -300,7 +291,12 @@ async function startCall() {
 
         if (data.event === "speech_ended") {
           setStatus("Listening...");
-          console.log("Utterance saved:", data.utterance_path);
+        }
+
+        if (data.type === "session_ended") {
+          if (sessionInfo) {
+            sessionInfo.innerText = "Call ended.";
+          }
         }
 
       } catch (err) {
@@ -310,12 +306,14 @@ async function startCall() {
 
     websocket.onerror = (error) => {
       console.error("WebSocket error:", error);
-      setStatus("WebSocket error");
+      setStatus("Connection error");
     };
 
     websocket.onclose = (event) => {
       console.log("WebSocket closed:", event.code, event.reason);
+
       cleanupAudio();
+
       setStatus("Ended");
       activeCall = false;
       stopTimer();
@@ -333,8 +331,6 @@ async function startPCMStreaming(stream) {
 
   sourceNode = audioContext.createMediaStreamSource(stream);
 
-  // ScriptProcessorNode is older but simple and works for this pilot.
-  // Later we can replace it with AudioWorklet for production.
   const bufferSize = 4096;
   processorNode = audioContext.createScriptProcessor(bufferSize, 1, 1);
 
@@ -382,11 +378,7 @@ function downsampleBuffer(buffer, inputSampleRate, outputSampleRate) {
     let accum = 0;
     let count = 0;
 
-    for (
-      let i = offsetBuffer;
-      i < nextOffsetBuffer && i < buffer.length;
-      i++
-    ) {
+    for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
       accum += buffer[i];
       count++;
     }

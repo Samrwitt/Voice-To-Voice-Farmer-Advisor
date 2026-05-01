@@ -4,18 +4,17 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 
-  <title>Phone Gateway</title>
+  <title>Voice Call</title>
 
   <link rel="stylesheet" href="/static/style.css" />
 </head>
-<body>
+<body class="caller-body">
   <div class="iphone">
 
     <div class="speaker"></div>
 
     <div class="phone-screen">
 
-      <!-- Caller Registration -->
       <div id="callerForm" class="caller-form">
         <h2>Caller Registration</h2>
         <p class="small-text">Enter your details once to continue</p>
@@ -26,7 +25,6 @@
         <button class="continue-btn" onclick="registerCaller()">Continue</button>
       </div>
 
-      <!-- Dialer -->
       <div id="dialer" class="hidden dialer-view">
 
         <div class="top-area">
