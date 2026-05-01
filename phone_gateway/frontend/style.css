@@ -2,7 +2,7 @@
   box-sizing: border-box;
 }
 
-body {
+body.caller-body {
   margin: 0;
   min-height: 100vh;
   background: radial-gradient(circle at top, #2d3748, #050505 70%);
@@ -13,7 +13,6 @@ body {
   color: white;
 }
 
-/* Phone body */
 .iphone {
   width: 375px;
   max-width: 94vw;
@@ -30,7 +29,6 @@ body {
   overflow: hidden;
 }
 
-/* Speaker */
 .speaker {
   width: 82px;
   height: 7px;
@@ -39,7 +37,6 @@ body {
   margin: 8px auto 12px;
 }
 
-/* Inner screen */
 .phone-screen {
   height: calc(100% - 50px);
   background: linear-gradient(180deg, #101010, #000);
@@ -55,7 +52,6 @@ body {
   display: none;
 }
 
-/* Home indicator */
 .home-bar {
   position: absolute;
   bottom: 13px;
@@ -68,7 +64,6 @@ body {
   opacity: 0.8;
 }
 
-/* Registration form */
 .caller-form {
   min-height: 100%;
   display: flex;
@@ -118,7 +113,6 @@ body {
   margin-top: 8px;
 }
 
-/* Dialer layout */
 .dialer-view {
   min-height: 100%;
   display: flex;
@@ -169,7 +163,6 @@ body {
   font-size: 24px;
 }
 
-/* Keypad */
 .keypad {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
@@ -190,7 +183,6 @@ body {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  transition: transform 0.08s ease, background 0.12s ease;
 }
 
 .keypad button:active {
@@ -201,7 +193,6 @@ body {
 .keypad button span {
   font-size: 30px;
   line-height: 28px;
-  font-weight: 400;
 }
 
 .keypad button small {
@@ -212,7 +203,6 @@ body {
   color: #cfcfcf;
 }
 
-/* Call controls */
 .call-row {
   display: grid;
   grid-template-columns: 1fr 1fr 1fr;
@@ -255,19 +245,6 @@ body {
   background: #ff3b30;
 }
 
-.call-btn:active,
-.end-btn:active,
-.delete-btn:active,
-.change-user:active {
-  transform: scale(0.96);
-}
-
-.phone-icon {
-  display: inline-block;
-  transform: translateY(-1px);
-}
-
-/* Change caller ID */
 .change-user {
   display: block;
   width: 100%;
@@ -282,10 +259,6 @@ body {
   cursor: pointer;
 }
 
-.change-user:hover {
-  background: #3a3a3c;
-}
-
 .session-info {
   margin-top: 10px;
   color: #8e8e93;
@@ -295,7 +268,6 @@ body {
   word-break: break-word;
 }
 
-/* Smaller screens */
 @media (max-height: 720px) {
   .iphone {
     height: 700px;
@@ -338,7 +310,6 @@ body {
   }
 }
 
-/* Must stay at the bottom */
 .hidden {
   display: none !important;
 }

@@ -43,12 +43,28 @@ async def vad_websocket(
 
     print(f"[VAD READY] session={session_id}, sample_rate={sample_rate}")
 
+
+    chunk_count = 0
+    total_audio_bytes = 0
+
     try:
         while True:
             message = await websocket.receive()
 
             if "bytes" in message:
                 pcm_chunk = message["bytes"]
+
+                if pcm_chunk:
+                    chunk_count += 1
+                    total_audio_bytes += len(pcm_chunk)
+
+                    if chunk_count % 20 == 0:
+                        print(
+                            f"[VAD AUDIO RECEIVED] session={session_id}, "
+                            f"chunks={chunk_count}, "
+                            f"bytes={total_audio_bytes}",
+                            flush=True
+                        )
 
                 events = vad.process_pcm_chunk(pcm_chunk)
 
@@ -85,6 +101,22 @@ async def vad_websocket(
                         })
 
                     elif data.get("event") == "end_session":
+                        utterance_path = vad.finalize()
+
+                        if utterance_path:
+                            await websocket.send_json({
+                                "event": "speech_ended",
+                                "session_id": session_id,
+                                "utterance_path": utterance_path,
+                                "duration_seconds": None,
+                                "message": "Final utterance saved on session end"
+                            })
+
+                            print(
+                                f"[SPEECH ENDED ON CLOSE] session={session_id}, "
+                                f"file={utterance_path}"
+                            )
+
                         break
 
                 except json.JSONDecodeError:
