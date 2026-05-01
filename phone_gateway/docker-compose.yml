@@ -18,9 +18,11 @@ services:
     container_name: phone_gateway_backend
     depends_on:
       - postgres
+      - vad-service
     environment:
       DATABASE_URL: postgresql://phone_user:phone_pass@postgres:5432/phone_gateway_db
       RECORDINGS_DIR: /app/recordings
+      VAD_WS_BASE_URL: ws://vad-service:8010/ws/vad
     ports:
       - "8000:8000"
     volumes:

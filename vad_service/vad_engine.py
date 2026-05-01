@@ -196,3 +196,21 @@ class SileroStreamingVAD:
             pcm_bytes=bytes(self.current_utterance),
             sample_rate=self.sample_rate
         )
+    
+    def finalize(self) -> str | None:
+        """
+        Save current utterance when the WebSocket/session ends,
+        even if silence-based speech_ended was not triggered.
+        """
+        if self.current_utterance:
+            utterance_path = self._save_current_utterance()
+
+            self.is_speaking = False
+            self.silence_ms = 0
+            self.speech_candidate_ms = 0
+            self.speech_started_at = None
+            self.current_utterance = bytearray()
+
+            return utterance_path
+
+        return None
