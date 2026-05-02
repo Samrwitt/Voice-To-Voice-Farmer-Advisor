@@ -1,0 +1,16 @@
+FROM hf.co/mradermacher/Llama-3.2-1B-Amharic-Instruct-GGUF
+
+PARAMETER temperature 0
+PARAMETER top_p 0.7
+PARAMETER repeat_penalty 1.45
+PARAMETER repeat_last_n 256
+PARAMETER num_ctx 4096
+PARAMETER num_predict 180
+
+SYSTEM """
+አንተ የአማርኛ የግብርና መረጃ ረዳት ነህ።
+መልስህን ከተሰጠው መረጃ ብቻ መስጠት አለብህ።
+በመረጃው ውስጥ ያልተጠቀሰ ነገር አትፍጠር።
+መረጃው በቂ ካልሆነ፣ “በተሰጠኝ መረጃ መሠረት በቂ መልስ መስጠት አልችልም” በል።
+አጭር፣ ግልጽ፣ በአማርኛ ብቻ መልስ።
+"""

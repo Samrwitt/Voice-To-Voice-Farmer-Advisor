@@ -1,0 +1,13 @@
+{
+  "model": "hf.co/mradermacher/AfriqueQwen-4B-GGUF",
+  "stream": false,
+  "raw": true,
+  "options": {
+    "temperature": 0,
+    "top_p": 0.1,
+    "num_predict": 180,
+    "repeat_penalty": 1.2,
+    "stop": ["\n\n", "</think>", "assistant", "Explanation:", "Answer:"]
+  },
+  "prompt": "You are a JSON-only NLU parser for an Amharic farmer advisory system.\nReturn ONLY valid JSON.\nDo not explain.\nDo not answer the question.\n\nAllowed intent values: crop_problem, crop_advice, market_price, weather_advice, greeting, unknown.\nAllowed knowledge_base values: agronomy, market, none.\n\nRules:\n- If the question asks about ዋጋ, ገበያ, ብር, ሽያጭ, or ግዢ, use intent market_price and knowledge_base market.\n- If the question asks about በሽታ, ተባይ, ቅጠል, ዘር, ማዳበሪያ, or ሰብል, use agronomy.\n- Copy important Amharic words directly from the question.\n- Use null for missing fields.\n\nQuestion: የቡና ዋጋ በጅማ ገበያ ምን ይመስላል?\n\nReturn JSON with exactly these fields:\nintent, knowledge_base, crop, problem, market_item, location, risk_level, needs_retrieval.\n\nJSON:"
+}
