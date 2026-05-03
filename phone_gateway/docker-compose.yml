@@ -46,12 +46,34 @@ services:
       context: ../vad_service
       dockerfile: Dockerfile
     container_name: vad_service
+    depends_on:
+      - asr-service
     ports:
       - "8010:8010"
+    environment:
+      ASR_HTTP_URL: http://asr-service:8001/transcribe-file
+      VAD_UTTERANCES_DIR: /app/utterances
+      MAX_CONCURRENT_ASR: 2
     volumes:
-      - ../vad_service/utterances:/app/utterances
+      - vad_utterances:/app/utterances
+
+  asr-service:
+    build:
+      context: ../asr_service
+      dockerfile: Dockerfile
+    container_name: asr_service
+    ports:
+      - "8001:8001"
+    environment:
+      ASR_ENGINE: mock
+      ASR_MODEL_PATH: /models/asr
+      SHARED_UTTERANCES_DIR: /shared/utterances
+    volumes:
+      - ./models/asr:/models/asr
+      - vad_utterances:/shared/utterances:ro
 
 volumes:
   postgres_data:
   call_recordings:
   pgadmin_data:
+  vad_utterances:

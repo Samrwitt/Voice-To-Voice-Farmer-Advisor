@@ -33,6 +33,7 @@ RUN pip install \
 COPY main.py /app/main.py
 COPY vad_engine.py /app/vad_engine.py
 COPY audio_utils.py /app/audio_utils.py
+COPY asr_client.py /app/asr_client.py
 
 RUN mkdir -p /app/utterances
 

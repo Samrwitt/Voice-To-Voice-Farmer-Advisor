@@ -1,4 +1,4 @@
 fastapi
 uvicorn[standard]
-numpy
-httpx
+python-multipart
+pydantic
