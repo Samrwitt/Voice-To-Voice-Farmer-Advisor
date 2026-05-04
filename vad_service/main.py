@@ -11,37 +11,69 @@ from asr_client import transcribe_utterance_file
 app = FastAPI(title="Silero VAD Service")
 
 
-# Maximum number of ASR tasks this VAD service will start at the same time.
-# This protects your ASR service later when the real model is added.
+# ============================================================
+# Configuration
+# ============================================================
+
 MAX_CONCURRENT_ASR = int(os.getenv("MAX_CONCURRENT_ASR", "2"))
 ASR_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_ASR)
 
+
+# ============================================================
+# Health Check
+# ============================================================
 
 @app.get("/health")
 def health_check():
     return {
         "status": "ok",
         "service": "silero-vad-service",
-        "max_concurrent_asr": MAX_CONCURRENT_ASR
+        "max_concurrent_asr": MAX_CONCURRENT_ASR,
     }
 
+
+# ============================================================
+# Safe WebSocket Send
+# ============================================================
 
 async def safe_send_json(
     websocket: WebSocket,
     send_lock: asyncio.Lock,
-    payload: dict
-):
+    payload: dict,
+) -> bool:
     """
+    Safely send JSON to the WebSocket.
+
     Multiple coroutines may send to the same WebSocket:
       1. the main VAD loop
       2. background ASR tasks
 
-    This lock prevents simultaneous websocket.send_json() calls.
+    The lock prevents simultaneous websocket.send_json() calls.
+
+    Returns:
+      True  -> message sent
+      False -> client disconnected / socket closed
     """
 
-    async with send_lock:
-        await websocket.send_json(payload)
+    try:
+        async with send_lock:
+            await websocket.send_json(payload)
+        return True
 
+    except WebSocketDisconnect:
+        return False
+
+    except RuntimeError:
+        return False
+
+    except Exception as e:
+        print(f"[WS SEND ERROR] {e}", flush=True)
+        return False
+
+
+# ============================================================
+# ASR Handling
+# ============================================================
 
 async def handle_completed_utterance(
     websocket: WebSocket,
@@ -52,69 +84,83 @@ async def handle_completed_utterance(
     """
     Runs ASR for one completed utterance.
 
-    This function is called using asyncio.create_task(...), so it does not
-    block the VAD loop. VAD can continue recording the next utterance while
-    this ASR request is running.
+    This is started with asyncio.create_task(...), so it does not block
+    the VAD loop. VAD can continue listening while ASR runs.
     """
 
     try:
-        await safe_send_json(
+        sent = await safe_send_json(
             websocket,
             send_lock,
             {
                 "event": "asr_started",
                 "session_id": session_id,
-                "utterance_path": utterance_path
-            }
+                "utterance_path": utterance_path,
+                "message": "ASR is transcribing the saved utterance",
+            },
+        )
+
+        if not sent:
+            print(
+                f"[ASR SKIPPED] WebSocket closed before ASR start event. "
+                f"session={session_id}, file={utterance_path}",
+                flush=True,
+            )
+            return
+
+        print(
+            f"[ASR STARTED] session={session_id}, file={utterance_path}",
+            flush=True,
         )
 
         async with ASR_SEMAPHORE:
             asr_result = await transcribe_utterance_file(
                 utterance_path=utterance_path,
-                language="am"
+                language="am",
             )
 
         await safe_send_json(
             websocket,
             send_lock,
             {
-                "event": "transcript_ready",
+                "event": "asr_transcript",
                 "session_id": session_id,
                 "utterance_path": utterance_path,
                 "transcript": asr_result.get("transcript"),
                 "confidence": asr_result.get("confidence"),
                 "engine": asr_result.get("engine"),
-                "audio_id": asr_result.get("audio_id")
-            }
+                "audio_id": asr_result.get("audio_id"),
+                "message": "ASR transcription completed",
+            },
         )
 
         print(
             f"[ASR DONE] session={session_id}, "
             f"file={utterance_path}, "
+            f"engine={asr_result.get('engine')}, "
+            f"confidence={asr_result.get('confidence')}, "
             f"transcript={asr_result.get('transcript')}",
-            flush=True
+            flush=True,
         )
 
     except Exception as e:
-        try:
-            await safe_send_json(
-                websocket,
-                send_lock,
-                {
-                    "event": "asr_error",
-                    "session_id": session_id,
-                    "utterance_path": utterance_path,
-                    "error": str(e)
-                }
-            )
-        except Exception:
-            pass
+        await safe_send_json(
+            websocket,
+            send_lock,
+            {
+                "event": "asr_error",
+                "session_id": session_id,
+                "utterance_path": utterance_path,
+                "error": str(e),
+                "message": "ASR transcription failed",
+            },
+        )
 
         print(
             f"[ASR ERROR] session={session_id}, "
             f"file={utterance_path}, "
             f"error={e}",
-            flush=True
+            flush=True,
         )
 
 
@@ -128,9 +174,8 @@ def start_asr_task(
     """
     Start ASR in the background.
 
-    Important:
-    Store the task in active_asr_tasks so the task remains referenced
-    until it completes.
+    The task is stored in active_asr_tasks so it remains referenced until
+    it completes.
     """
 
     task = asyncio.create_task(
@@ -152,13 +197,17 @@ def start_asr_task(
             if exc:
                 print(
                     f"[ASR TASK ERROR] session={session_id}, error={exc}",
-                    flush=True
+                    flush=True,
                 )
         except asyncio.CancelledError:
             pass
 
     task.add_done_callback(cleanup_task)
 
+
+# ============================================================
+# VAD WebSocket Endpoint
+# ============================================================
 
 @app.websocket("/ws/vad")
 async def vad_websocket(
@@ -180,7 +229,7 @@ async def vad_websocket(
         min_speech_start_ms=120,
         speech_end_silence_ms=900,
         speech_pad_ms=200,
-        output_dir=output_dir
+        output_dir=output_dir,
     )
 
     await safe_send_json(
@@ -190,15 +239,15 @@ async def vad_websocket(
             "event": "vad_ready",
             "session_id": session_id,
             "sample_rate": sample_rate,
-            "message": "Silero VAD is ready"
-        }
+            "message": "Silero VAD is ready",
+        },
     )
 
     print(
         f"[VAD READY] session={session_id}, "
         f"sample_rate={sample_rate}, "
         f"output_dir={output_dir}",
-        flush=True
+        flush=True,
     )
 
     chunk_count = 0
@@ -224,7 +273,7 @@ async def vad_websocket(
                             f"[VAD AUDIO RECEIVED] session={session_id}, "
                             f"chunks={chunk_count}, "
                             f"bytes={total_audio_bytes}",
-                            flush=True
+                            flush=True,
                         )
 
                 events = vad.process_pcm_chunk(pcm_chunk)
@@ -242,28 +291,24 @@ async def vad_websocket(
                             "timestamp": event.get("timestamp"),
                             "utterance_path": utterance_path,
                             "duration_seconds": event.get("duration_seconds"),
-                            "speech_probability": event.get("speech_probability")
-                        }
+                            "speech_probability": event.get("speech_probability"),
+                        },
                     )
 
                     if event_name == "speech_started":
                         print(
                             f"[SPEECH STARTED] session={session_id}",
-                            flush=True
+                            flush=True,
                         )
 
                     elif event_name == "speech_ended":
                         print(
                             f"[SPEECH ENDED] session={session_id}, "
                             f"file={utterance_path}",
-                            flush=True
+                            flush=True,
                         )
 
                         if utterance_path:
-                            # Important:
-                            # Do NOT await ASR here.
-                            # Start it in the background so VAD can keep
-                            # recording the next utterance.
                             start_asr_task(
                                 active_asr_tasks=active_asr_tasks,
                                 websocket=websocket,
@@ -290,8 +335,8 @@ async def vad_websocket(
                             send_lock,
                             {
                                 "event": "reset_done",
-                                "session_id": session_id
-                            }
+                                "session_id": session_id,
+                            },
                         )
 
                     elif data.get("event") == "end_session":
@@ -306,17 +351,15 @@ async def vad_websocket(
                                     "session_id": session_id,
                                     "utterance_path": utterance_path,
                                     "duration_seconds": None,
-                                    "message": (
-                                        "Final utterance saved on session end"
-                                    )
-                                }
+                                    "message": "Final utterance saved on session end",
+                                },
                             )
 
                             print(
                                 f"[SPEECH ENDED ON CLOSE] "
                                 f"session={session_id}, "
                                 f"file={utterance_path}",
-                                flush=True
+                                flush=True,
                             )
 
                             start_asr_task(
@@ -327,12 +370,10 @@ async def vad_websocket(
                                 utterance_path=utterance_path,
                             )
 
-                        # Since the session is ending, wait for remaining ASR
-                        # tasks so the last transcript can be sent.
                         if active_asr_tasks:
                             await asyncio.gather(
                                 *active_asr_tasks,
-                                return_exceptions=True
+                                return_exceptions=True,
                             )
 
                         break
@@ -350,10 +391,15 @@ async def vad_websocket(
                                     "session_id": session_id,
                                     "utterance_path": utterance_path,
                                     "duration_seconds": None,
-                                    "message": (
-                                        "Final utterance saved on END message"
-                                    )
-                                }
+                                    "message": "Final utterance saved on END message",
+                                },
+                            )
+
+                            print(
+                                f"[SPEECH ENDED ON END] "
+                                f"session={session_id}, "
+                                f"file={utterance_path}",
+                                flush=True,
                             )
 
                             start_asr_task(
@@ -367,7 +413,7 @@ async def vad_websocket(
                         if active_asr_tasks:
                             await asyncio.gather(
                                 *active_asr_tasks,
-                                return_exceptions=True
+                                return_exceptions=True,
                             )
 
                         break
@@ -376,8 +422,6 @@ async def vad_websocket(
         print(f"[VAD DISCONNECTED] session={session_id}", flush=True)
 
     finally:
-        # If the client disconnects unexpectedly, cancel ASR tasks because
-        # there is no active websocket to send the results back to.
         for task in list(active_asr_tasks):
             if not task.done():
                 task.cancel()
@@ -385,7 +429,7 @@ async def vad_websocket(
         if active_asr_tasks:
             await asyncio.gather(
                 *active_asr_tasks,
-                return_exceptions=True
+                return_exceptions=True,
             )
 
         try:

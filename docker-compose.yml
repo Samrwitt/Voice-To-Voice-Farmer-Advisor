@@ -68,6 +68,7 @@ services:
     volumes:
       - vad_utterances:/app/utterances
 
+
   asr-service:
     build:
       context: .
@@ -76,12 +77,10 @@ services:
     ports:
       - "8001:8001"
     environment:
-      ASR_ENGINE: speechbrain
+      ASR_ENGINE: mock
       ASR_MODEL_PATH: /models/asr
       SHARED_UTTERANCES_DIR: /shared/utterances
-      HF_TOKEN: 
     volumes:
-      - ./phone_gateway/models/asr:/models/asr
       - vad_utterances:/shared/utterances:ro
 
   tts-service:
