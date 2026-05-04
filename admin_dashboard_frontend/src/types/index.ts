@@ -1,11 +1,14 @@
 // ── Session / Auth ────────────────────────────────────────────────────────────
+export type UserRole = "admin" | "da" | "expert";
+
 export interface SessionData {
   token: string;
-  role: 'admin' | 'expert';
+  userId: string;
   username: string;
+  email: string;
+  role: UserRole;
   loginTime: number;
 }
-
 // ── Farmer —  /admin/farmers ──────────────────────────────────────────────────
 export interface FarmerProfile {
   // backend fields

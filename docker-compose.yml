@@ -30,6 +30,12 @@ services:
       DATABASE_URL: postgresql://phone_user:phone_pass@postgres:5432/phone_gateway_db
       RECORDINGS_DIR: /app/recordings
       VAD_WS_BASE_URL: ws://vad-service:8010/ws/vad
+
+      CREATE_DEFAULT_ADMIN: "true"
+      DEFAULT_ADMIN_NAME: "System Admin"
+      DEFAULT_ADMIN_EMAIL: "admin@example.com"
+      DEFAULT_ADMIN_PASSWORD: "admin123"
+      RESET_DEFAULT_ADMIN_PASSWORD: "false"
     ports:
       - "8000:8000"
     volumes:
@@ -92,7 +98,7 @@ services:
       base:
         condition: service_completed_successfully
     ports:
-      - "8002:8000"
+      - "8003:8000"
 
   admin-dashboard:
     build:
@@ -113,9 +119,28 @@ services:
       # For server-side requests inside the Docker network
       API_INTERNAL_URL: http://phone-gateway:8000
 
+  logic-service:
+    build:
+      context: .
+      dockerfile: logic_service/Dockerfile
+    container_name: logic_service
+    depends_on:
+      base:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_started
+    ports:
+      - "8002:8000"
+    environment:
+      DATABASE_URL: postgresql://phone_user:phone_pass@postgres:5432/phone_gateway_db
+      LOG_LEVEL: INFO
+    volumes:
+      - logic_data:/app/data
+
 
 volumes:
   postgres_data:
   call_recordings:
   pgadmin_data:
   vad_utterances:
+  logic_data:

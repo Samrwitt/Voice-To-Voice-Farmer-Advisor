@@ -6,6 +6,7 @@ from pathlib import Path
 
 import websockets
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -15,6 +16,7 @@ from backend.models import Caller
 from backend.sessions import create_session, end_session
 from backend.recorder import AudioRecorder
 from backend.callers import create_or_get_caller
+from backend.auth.routes import router as auth_router
 
 from backend.monitor_state import (
     start_call_monitor,
@@ -28,6 +30,7 @@ from backend.monitor_state import (
     get_monitor_events,
     get_recent_calls,
 )
+from backend.bootstrap import seed_default_admin
 
 
 # ============================================================
@@ -35,6 +38,7 @@ from backend.monitor_state import (
 # ============================================================
 
 Base.metadata.create_all(bind=engine)
+seed_default_admin()
 
 
 # ============================================================
@@ -42,6 +46,42 @@ Base.metadata.create_all(bind=engine)
 # ============================================================
 
 app = FastAPI(title="Phone Browser Telephony Gateway")
+
+# Auth routes:
+# POST /api/auth/login
+# GET  /api/auth/me
+# POST /api/auth/users
+# GET  /api/auth/users
+app.include_router(auth_router)
+
+
+# ============================================================
+# CORS
+# Needed because Next.js admin dashboard runs on localhost:3000
+# and backend runs on localhost:8000
+# ============================================================
+
+ADMIN_DASHBOARD_ORIGIN = os.getenv(
+    "ADMIN_DASHBOARD_ORIGIN",
+    "http://localhost:3000",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        ADMIN_DASHBOARD_ORIGIN,
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ============================================================
+# Static Frontend
+# ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 FRONTEND_DIR = BASE_DIR / "frontend"

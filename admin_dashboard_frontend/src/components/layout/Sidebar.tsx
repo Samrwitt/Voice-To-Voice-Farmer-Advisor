@@ -24,9 +24,11 @@ const allNavItems: NavItem[] = [
   { label: 'Alerts',          path: '/alerts',         icon: <Bell size={16} />, adminOnly: true },
 ];
 
-interface SidebarProps {
-  role: 'admin' | 'expert' | null;
-}
+import type { UserRole } from "@/types";
+
+type SidebarProps = {
+  role: UserRole | null;
+};
 
 export default function Sidebar({ role }: SidebarProps) {
   const pathname = usePathname();
