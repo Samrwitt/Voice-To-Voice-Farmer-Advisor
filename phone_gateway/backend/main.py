@@ -20,6 +20,7 @@ from backend.monitor_state import (
     update_audio_stats,
     update_vad_status,
     add_utterance,
+    update_utterance_transcript,
     end_call_monitor,
     add_event,
     get_monitor_state,
@@ -187,6 +188,44 @@ async def forward_vad_events_to_browser(vad_ws, browser_ws: WebSocket):
                     duration_seconds=data.get("duration_seconds"),
                     speech_probability=data.get("speech_probability"),
                 )
+
+            elif event_name == "transcript_ready":
+                transcript_text = data.get("transcript")
+                utterance_path = data.get("utterance_path")
+                confidence = data.get("confidence")
+                
+                # Update monitor UI state
+                update_utterance_transcript(utterance_path, transcript_text, confidence)
+                
+                # Save to database
+                session_id = data.get("session_id")
+                from backend.database import SessionLocal
+                from backend.models import ASRJob, Transcript
+                import uuid
+                
+                db = SessionLocal()
+                try:
+                    job = ASRJob(
+                        id=str(uuid.uuid4()),
+                        session_id=session_id,
+                        engine=data.get("engine"),
+                        status="completed"
+                    )
+                    db.add(job)
+                    db.flush()
+                    
+                    transcript_record = Transcript(
+                        id=str(uuid.uuid4()),
+                        asr_job_id=job.id,
+                        text=transcript_text,
+                        confidence=confidence
+                    )
+                    db.add(transcript_record)
+                    db.commit()
+                except Exception as db_err:
+                    print(f"DB Error saving transcript: {db_err}", flush=True)
+                finally:
+                    db.close()
 
             else:
                 add_event(event_name or "vad_event", data)

@@ -1,0 +1,14 @@
+{
+    "Servers": {
+        "1": {
+            "Name": "Voice Advisor DB",
+            "Group": "Servers",
+            "Host": "postgres",
+            "Port": 5432,
+            "MaintenanceDB": "phone_gateway_db",
+            "Username": "phone_user",
+            "Password": "phone_pass",
+            "SSLMode": "prefer"
+        }
+    }
+}

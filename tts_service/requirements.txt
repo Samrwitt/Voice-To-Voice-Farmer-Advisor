@@ -1,9 +1,5 @@
-fastapi
-uvicorn[standard]
-pydantic
 gTTS
 transformers
-torch
 soundfile
 librosa
 uroman

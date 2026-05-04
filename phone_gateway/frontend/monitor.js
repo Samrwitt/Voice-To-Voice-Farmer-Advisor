@@ -248,13 +248,17 @@ function renderUtterances(utterances) {
     const duration = u.duration_seconds ?? "unknown";
     const probability = u.speech_probability ?? "—";
     const path = safeText(u.utterance_path, "No path");
+    const transcriptText = u.transcript ? u.transcript : "<span style='color:#94a3b8;font-style:italic'>Transcribing...</span>";
 
     return `
       <div class="utterance-item">
         <strong>Utterance ${index}</strong>
         <span>Duration: ${duration} sec</span>
         <span>Probability: ${probability}</span>
-        <small>${path}</small>
+        <div style="margin-top: 8px; font-size: 1.1em; color: #fff; background: rgba(255,255,255,0.05); padding: 8px; border-radius: 4px; border-left: 2px solid #3b82f6;">
+          ${transcriptText}
+        </div>
+        <small style="display:block; margin-top: 4px;">${path}</small>
       </div>
     `;
   }).join("");

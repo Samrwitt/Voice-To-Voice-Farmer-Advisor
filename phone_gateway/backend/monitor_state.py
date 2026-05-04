@@ -114,6 +114,25 @@ def add_utterance(
     add_event("utterance_saved", utterance)
 
 
+def update_utterance_transcript(utterance_path: str, transcript: str, confidence: float):
+    utterance = None
+
+    with _lock:
+        active = monitor_state.get("active_call")
+        if not active:
+            return
+
+        for u in active.get("utterances", []):
+            if u.get("utterance_path") == utterance_path:
+                u["transcript"] = transcript
+                u["confidence"] = confidence
+                utterance = u
+                break
+
+    if utterance:
+        add_event("transcript_saved", utterance)
+
+
 def end_call_monitor(audio_file_path: str | None = None):
     with _lock:
         active = monitor_state.get("active_call")
