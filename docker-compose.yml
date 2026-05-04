@@ -94,6 +94,25 @@ services:
     ports:
       - "8002:8000"
 
+  admin-dashboard:
+    build:
+      context: ./admin_dashboard_frontend
+      dockerfile: Dockerfile
+    container_name: admin_dashboard
+    depends_on:
+      - phone-gateway
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+      NEXT_TELEMETRY_DISABLED: 1
+
+      # For browser-side requests from Next.js pages/components
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+
+      # For server-side requests inside the Docker network
+      API_INTERNAL_URL: http://phone-gateway:8000
+
 
 volumes:
   postgres_data:
