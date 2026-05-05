@@ -83,11 +83,34 @@ services:
     ports:
       - "8001:8001"
     environment:
-      ASR_ENGINE: mock
-      ASR_MODEL_PATH: /models/asr
+      ASR_ENGINE: whisper_local
+      ASR_MODEL_PATH: /models/asr/whisper-small-amharic-bdu-8khz-aug-ct2-fp16
       SHARED_UTTERANCES_DIR: /shared/utterances
+      ASR_USE_OLLAMA: "true"
+      OLLAMA_URL: http://ollama:11434
+      OLLAMA_MODEL: qwen2.5:7b
+    depends_on:
+      - ollama
     volumes:
       - vad_utterances:/shared/utterances:ro
+      - ./models/asr:/models/asr:ro
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama_service
+    ports:
+      - "11435:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+
 
   tts-service:
     build:
@@ -169,4 +192,6 @@ volumes:
   call_recordings:
   pgadmin_data:
   vad_utterances:
+  ollama_data:
+
   logic_data:
