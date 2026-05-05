@@ -101,25 +101,27 @@ services:
       - "8003:8000"
 
   admin-dashboard:
+    image: farmer-advisor-admin-dashboard
     build:
       context: ./admin_dashboard_frontend
       dockerfile: Dockerfile
     container_name: admin_dashboard
     depends_on:
-      - phone-gateway
+      - logic-service
     ports:
       - "3000:3000"
     environment:
       NODE_ENV: production
       NEXT_TELEMETRY_DISABLED: 1
 
-      # For browser-side requests from Next.js pages/components
+      # Server-side proxy: Next.js API routes forward /api/admin/* here
+      LOGIC_SERVICE_URL: http://logic-service:8002
+
+      # Kept for any remaining browser-side references (login redirect, etc.)
       NEXT_PUBLIC_API_URL: http://localhost:8000
 
-      # For server-side requests inside the Docker network
-      API_INTERNAL_URL: http://phone-gateway:8000
-
   logic-service:
+    image: farmer-advisor-logic-service
     build:
       context: .
       dockerfile: logic_service/Dockerfile
@@ -130,10 +132,29 @@ services:
       postgres:
         condition: service_started
     ports:
-      - "8002:8000"
+      - "8002:8002"
     environment:
       DATABASE_URL: postgresql://phone_user:phone_pass@postgres:5432/phone_gateway_db
       LOG_LEVEL: INFO
+
+      # Shared with phone-gateway so JWTs are mutually verifiable
+      JWT_SECRET_KEY: "change-this-secret-key-in-production"
+      ACCESS_TOKEN_EXPIRE_MINUTES: "1440"
+
+      # Default admin seeded into shared dashboard_users table
+      CREATE_DEFAULT_ADMIN: "true"
+      DEFAULT_ADMIN_NAME: "System Admin"
+      DEFAULT_ADMIN_EMAIL: "admin@example.com"
+      DEFAULT_ADMIN_PASSWORD: "admin123"
+      RESET_DEFAULT_ADMIN_PASSWORD: "false"
+
+      # Service health probes used by /admin/system-status
+      VAD_HEALTH_URL: "http://vad-service:8010/health"
+      ASR_HEALTH_URL: "http://asr-service:8001/docs"
+      TTS_HEALTH_URL: "http://tts-service:8000/docs"
+      PHONE_GATEWAY_URL: "http://phone-gateway:8000/health"
+
+      DATA_DIR: "/app/data"
     volumes:
       - logic_data:/app/data
 

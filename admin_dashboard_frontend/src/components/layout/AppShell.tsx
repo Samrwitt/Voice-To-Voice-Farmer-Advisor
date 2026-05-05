@@ -101,10 +101,16 @@ function getPageTitle(pathname: string) {
     "/farmers": "Farmer Profiles",
     "/calls": "Call Logs",
     "/knowledge-base": "Knowledge Base",
+    "/kb-documents": "Knowledge Documents",
     "/helpdesk": "Helpdesk",
     "/market-prices": "Market Prices",
     "/alerts": "Alerts & Forecasts",
+    "/monitoring": "System Monitoring",
+    "/analytics": "Analytics & Reports",
   };
 
-  return map[pathname] ?? "Admin Panel";
+  if (map[pathname]) return map[pathname];
+  if (pathname.startsWith("/farmers/")) return "Farmer Detail";
+  if (pathname.startsWith("/calls/")) return "Call Session";
+  return "Admin Panel";
 }

@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 FROM farmer-advisor-base
 WORKDIR /app
 

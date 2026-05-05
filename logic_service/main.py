@@ -1,4 +1,6 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional
 import os
@@ -7,17 +9,73 @@ import logging
 import requests
 import base64
 import time
+import traceback
 from database import (
     collection, add_to_escalation, log_conversation,
     get_conversation_history, get_market_price, register_farmer,
     get_farmer_profile, get_alerts_for_region, set_session_state,
-    get_session_state, insert_call_record
+    get_session_state, insert_call_record,
+    init_db, seed_default_admin,
 )
+from migrate_sqlite import migrate_sqlite_to_postgres
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("logic_service")
 
 app = FastAPI()
+
+# Allow the admin dashboard (any origin in dev; tighten for prod)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.on_event("startup")
+def _startup_db():
+    """Bootstrap Postgres schema, migrate any legacy SQLite data, and seed admin."""
+    try:
+        init_db()
+        migrate_sqlite_to_postgres()
+        seed_default_admin()
+        logger.info("Postgres initialized for logic_service.")
+    except Exception as exc:
+        logger.error("Database bootstrap failed: %s", exc)
+
+
+@app.exception_handler(Exception)
+async def _service_error_handler(request: Request, exc: Exception):
+    """Capture unhandled errors into the service_errors table for monitoring."""
+    try:
+        from db import SessionLocal
+        from models import ServiceError
+
+        db = SessionLocal()
+        try:
+            db.add(
+                ServiceError(
+                    service="logic_service",
+                    endpoint=str(request.url.path),
+                    method=request.method,
+                    status_code=500,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
+    except Exception as log_exc:
+        logger.error("Failed to log service error: %s", log_exc)
+
+    logger.error("Unhandled error on %s: %s\n%s", request.url.path, exc, traceback.format_exc())
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error"},
+    )
+
 
 # Mount admin REST API (used by the frontend microservice)
 from admin_api import router as admin_router
@@ -363,11 +421,10 @@ async def system_check():
     results = {}
 
     try:
-        import sqlite3
-        from database import DB_PATH
-        conn = sqlite3.connect(DB_PATH)
-        conn.cursor().execute("SELECT 1")
-        conn.close()
+        from sqlalchemy import text
+        from db import engine
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
         results["database"] = "ok"
     except Exception as e:
         results["database"] = f"error: {e}"

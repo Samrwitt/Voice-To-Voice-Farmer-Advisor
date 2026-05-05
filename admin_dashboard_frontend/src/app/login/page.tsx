@@ -7,7 +7,6 @@ import { loginUser } from "@/lib/auth";
 export default function Login() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
 
@@ -15,22 +14,18 @@ export default function Login() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-
     setError("");
     setLoading(true);
 
     try {
-      const session = await loginUser({
-        email,
-        password,
-      });
+      const session = await loginUser({ email, password });
 
       if (session.role === "admin") {
         router.push("/");
       } else if (session.role === "da") {
-        router.push("/da");
+        router.push("/");
       } else if (session.role === "expert") {
-        router.push("/expert");
+        router.push("/helpdesk");
       } else {
         router.push("/");
       }
@@ -45,14 +40,12 @@ export default function Login() {
     <div className="min-h-screen flex items-center justify-center bg-slate-50 p-4">
       <div className="w-full max-w-md bg-white rounded-xl shadow-sm border border-slate-200 p-8 sm:p-10">
         <div className="mb-8 text-center">
-          <div className="w-12 h-12 bg-green-100 rounded-xl flex items-center justify-center mx-auto mb-4">
-            <span className="text-2xl">🌾</span>
+          <div className="w-14 h-14 bg-green-100 rounded-2xl flex items-center justify-center mx-auto mb-4">
+            <span className="text-3xl">🌾</span>
           </div>
-
           <h1 className="text-2xl font-semibold text-slate-900 mb-1">
             Farmer Advisor Admin
           </h1>
-
           <p className="text-sm text-slate-500">
             Sign in to access the dashboard
           </p>
@@ -66,7 +59,6 @@ export default function Login() {
             >
               Email
             </label>
-
             <input
               id="email"
               type="email"
@@ -86,7 +78,6 @@ export default function Login() {
             >
               Password
             </label>
-
             <input
               id="password"
               type="password"
@@ -113,6 +104,10 @@ export default function Login() {
             {loading ? "Signing in…" : "Sign In"}
           </button>
         </form>
+
+        <p className="mt-6 text-center text-xs text-slate-400">
+          Default admin: <span className="font-mono text-slate-500">admin@example.com</span>
+        </p>
       </div>
     </div>
   );

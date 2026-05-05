@@ -1,27 +1,75 @@
 """
-Admin REST API — all dashboard endpoints for the frontend microservice.
-Uses in-memory Bearer token sessions backed by bcrypt auth against admin_users DB table.
-"""
-import secrets
-import sqlite3
-import uuid
-import bcrypt
-from fastapi import APIRouter, Depends, Header, HTTPException
-from pydantic import BaseModel
-from typing import Optional
+Admin REST API for the dashboard frontend.
 
-from database import DB_PATH, collection
+All endpoints live under /admin and are protected by JWT bearer tokens issued
+by `auth.py`. Roles enforced:
+    admin  - full access
+    da     - read farmers/calls, manage escalations and field reports
+    expert - work assigned escalations, review/approve KB docs
+"""
+import csv
+import io
+import os
+import uuid
+from datetime import datetime, timedelta
+from typing import List, Optional
+
+import requests
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, EmailStr
+from sqlalchemy import case, desc, func
+from sqlalchemy.orm import Session
+
+from auth import (
+    create_access_token,
+    get_current_user,
+    hash_password,
+    require_roles,
+    verify_password,
+    ACCESS_TOKEN_EXPIRE_MINUTES,
+)
+from database import collection
+from db import get_db
+from kb_indexing import index_document, remove_document_from_chroma
+from models import (
+    Alert,
+    CallRecord,
+    ConversationMessage,
+    DashboardUser,
+    Escalation,
+    FarmerKB,
+    KBDocument,
+    MarketPrice,
+    ServiceError,
+)
+
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
-# ── In-memory session store  {token: {username, role}} ──────────────────────
-_sessions: dict[str, dict] = {}
 
-
-# ── Auth helpers ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Schemas
+# ──────────────────────────────────────────────────────────────────────────────
 class LoginRequest(BaseModel):
-    username: str
+    email: Optional[EmailStr] = None
+    username: Optional[str] = None  # legacy alias
     password: str
+
+
+class CreateUserRequest(BaseModel):
+    full_name: str
+    email: EmailStr
+    password: str
+    role: str  # admin | da | expert
+    is_active: bool = True
+
+
+class UpdateUserRequest(BaseModel):
+    full_name: Optional[str] = None
+    role: Optional[str] = None
+    is_active: Optional[bool] = None
+    password: Optional[str] = None
 
 
 class MarketPriceRequest(BaseModel):
@@ -35,6 +83,8 @@ class AlertRequest(BaseModel):
     target_region: str
     alert_message: str
     severity: str = "warning"
+    category: Optional[str] = None
+    scheduled_at: Optional[datetime] = None
 
 
 class KBRequest(BaseModel):
@@ -42,81 +92,137 @@ class KBRequest(BaseModel):
     response: str
 
 
-def _get_session(authorization: Optional[str] = Header(None)) -> dict:
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Authentication required")
-    token = authorization.split(" ", 1)[1]
-    session = _sessions.get(token)
-    if not session:
-        raise HTTPException(status_code=401, detail="Invalid or expired session")
-    return session
+class AssignEscalationRequest(BaseModel):
+    user_id: str
 
 
-def _require_admin(session: dict = Depends(_get_session)) -> dict:
-    if session.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Admin role required")
-    return session
+class EscalationResponseRequest(BaseModel):
+    answer: str
 
 
-# ── Auth endpoints ────────────────────────────────────────────────────────────
+class KBDocumentUpdate(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    topic: Optional[str] = None
+    crop: Optional[str] = None
+    region: Optional[str] = None
+    category: Optional[str] = None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Serialisers
+# ──────────────────────────────────────────────────────────────────────────────
+def _user_dict(u: DashboardUser) -> dict:
+    return {
+        "user_id": u.user_id,
+        "full_name": u.full_name,
+        "email": u.email,
+        "role": u.role,
+        "is_active": u.is_active,
+        "created_at": u.created_at.isoformat() if u.created_at else None,
+        "last_login_at": u.last_login_at.isoformat() if u.last_login_at else None,
+    }
+
+
+def _isoformat(dt: Optional[datetime]) -> Optional[str]:
+    return dt.isoformat() if dt else None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Auth
+# ──────────────────────────────────────────────────────────────────────────────
 @router.post("/login")
-def login(req: LoginRequest):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT password_hash, role FROM admin_users WHERE username=?", (req.username,))
-    row = c.fetchone()
-    conn.close()
+def login(req: LoginRequest, db: Session = Depends(get_db)):
+    email = req.email or req.username
+    if not email:
+        raise HTTPException(status_code=400, detail="Email is required")
 
-    if not row or not bcrypt.checkpw(req.password.encode(), row[0].encode()):
-        raise HTTPException(status_code=401, detail="Invalid username or password")
+    user = db.query(DashboardUser).filter(DashboardUser.email == email).first()
+    if not user or not verify_password(req.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="User account is disabled")
 
-    token = secrets.token_hex(32)
-    _sessions[token] = {"username": req.username, "role": row[1]}
-    return {"token": token, "role": row[1], "username": req.username}
+    user.last_login_at = datetime.utcnow()
+    db.commit()
+
+    token = create_access_token({
+        "sub": user.user_id,
+        "email": user.email,
+        "role": user.role,
+    })
+
+    return {
+        "token": token,
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        "role": user.role,
+        "username": user.email,
+        "email": user.email,
+        "user_id": user.user_id,
+        "full_name": user.full_name,
+    }
 
 
 @router.post("/logout")
-def logout(authorization: Optional[str] = Header(None)):
-    if authorization and authorization.startswith("Bearer "):
-        _sessions.pop(authorization.split(" ", 1)[1], None)
+def logout(user: DashboardUser = Depends(get_current_user)):
+    # Stateless JWT: client just discards token. Kept for API compatibility.
     return {"status": "ok"}
 
 
-# ── Dashboard stats ───────────────────────────────────────────────────────────
+@router.get("/me")
+def me(user: DashboardUser = Depends(get_current_user)):
+    return _user_dict(user)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Dashboard stats
+# ──────────────────────────────────────────────────────────────────────────────
 @router.get("/stats")
-def get_stats(session: dict = Depends(_get_session)):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
+def get_stats(
+    user: DashboardUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    total_farmers = db.query(func.count(FarmerKB.id)).scalar() or 0
+    total_calls = db.query(func.count(CallRecord.id)).scalar() or 0
+    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    calls_today = (
+        db.query(func.count(CallRecord.id))
+        .filter(CallRecord.timestamp >= today_start)
+        .scalar()
+        or 0
+    )
+    pending_escalations = (
+        db.query(func.count(Escalation.id)).filter(Escalation.status == "pending").scalar() or 0
+    )
+    total_alerts = db.query(func.count(Alert.id)).scalar() or 0
 
-    c.execute("SELECT COUNT(*) FROM farmers")
-    total_farmers = c.fetchone()[0]
+    seven_days_ago = datetime.utcnow() - timedelta(days=7)
+    rows = (
+        db.query(
+            func.date_trunc("day", CallRecord.timestamp).label("day"),
+            func.count(CallRecord.id),
+        )
+        .filter(CallRecord.timestamp >= seven_days_ago)
+        .group_by("day")
+        .order_by("day")
+        .all()
+    )
+    calls_per_day = [
+        {"date": (r[0].date().isoformat() if r[0] else ""), "count": r[1]} for r in rows
+    ]
 
-    c.execute("SELECT COUNT(*) FROM call_records WHERE date(timestamp) = date('now')")
-    calls_today = c.fetchone()[0]
+    breakdown_rows = (
+        db.query(Escalation.status, func.count(Escalation.id)).group_by(Escalation.status).all()
+    )
+    esc_breakdown = {r[0]: r[1] for r in breakdown_rows}
 
-    c.execute("SELECT COUNT(*) FROM call_records")
-    total_calls = c.fetchone()[0]
+    try:
+        kb_count = collection.count()
+    except Exception:
+        kb_count = 0
 
-    c.execute("SELECT COUNT(*) FROM escalated_queries WHERE status='pending'")
-    pending_escalations = c.fetchone()[0]
-
-    c.execute("SELECT COUNT(*) FROM alerts")
-    total_alerts = c.fetchone()[0]
-
-    # Calls per day — last 7 days
-    c.execute("""
-        SELECT date(timestamp) as day, COUNT(*) as count
-        FROM call_records
-        WHERE timestamp >= datetime('now', '-7 days')
-        GROUP BY day ORDER BY day
-    """)
-    calls_per_day = [{"date": r[0], "count": r[1]} for r in c.fetchall()]
-
-    # Escalation breakdown by status
-    c.execute("SELECT status, COUNT(*) FROM escalated_queries GROUP BY status")
-    esc_breakdown = {r[0]: r[1] for r in c.fetchall()}
-
-    conn.close()
     return {
         "total_farmers": total_farmers,
         "calls_today": calls_today,
@@ -125,141 +231,503 @@ def get_stats(session: dict = Depends(_get_session)):
         "total_alerts": total_alerts,
         "calls_per_day": calls_per_day,
         "escalation_breakdown": esc_breakdown,
-        "kb_count": collection.count(),
+        "kb_count": kb_count,
     }
 
 
-# ── Farmers ───────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Users (admin only)
+# ──────────────────────────────────────────────────────────────────────────────
+@router.get("/users")
+def list_users(
+    _: DashboardUser = Depends(require_roles("admin")),
+    db: Session = Depends(get_db),
+):
+    rows = db.query(DashboardUser).order_by(desc(DashboardUser.created_at)).all()
+    return [_user_dict(u) for u in rows]
+
+
+@router.post("/users")
+def create_user(
+    req: CreateUserRequest,
+    creator: DashboardUser = Depends(require_roles("admin")),
+    db: Session = Depends(get_db),
+):
+    if req.role not in ("admin", "da", "expert"):
+        raise HTTPException(status_code=400, detail="Invalid role")
+
+    if db.query(DashboardUser).filter(DashboardUser.email == req.email).first():
+        raise HTTPException(status_code=400, detail="A user with this email already exists")
+
+    new_user = DashboardUser(
+        full_name=req.full_name,
+        email=req.email,
+        password_hash=hash_password(req.password),
+        role=req.role,
+        is_active=req.is_active,
+    )
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+    return _user_dict(new_user)
+
+
+@router.put("/users/{user_id}")
+def update_user(
+    user_id: str,
+    req: UpdateUserRequest,
+    actor: DashboardUser = Depends(require_roles("admin")),
+    db: Session = Depends(get_db),
+):
+    target = db.query(DashboardUser).filter(DashboardUser.user_id == user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if req.full_name is not None:
+        target.full_name = req.full_name
+    if req.role is not None:
+        if req.role not in ("admin", "da", "expert"):
+            raise HTTPException(status_code=400, detail="Invalid role")
+        target.role = req.role
+    if req.is_active is not None:
+        if target.user_id == actor.user_id and not req.is_active:
+            raise HTTPException(status_code=400, detail="You cannot deactivate your own account")
+        target.is_active = req.is_active
+    if req.password:
+        target.password_hash = hash_password(req.password)
+
+    target.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(target)
+    return _user_dict(target)
+
+
+@router.delete("/users/{user_id}")
+def deactivate_user(
+    user_id: str,
+    actor: DashboardUser = Depends(require_roles("admin")),
+    db: Session = Depends(get_db),
+):
+    target = db.query(DashboardUser).filter(DashboardUser.user_id == user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    if target.user_id == actor.user_id:
+        raise HTTPException(status_code=400, detail="You cannot deactivate your own account")
+    target.is_active = False
+    target.updated_at = datetime.utcnow()
+    db.commit()
+    return {"status": "ok"}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Farmers
+# ──────────────────────────────────────────────────────────────────────────────
 @router.get("/farmers")
-def list_farmers(session: dict = Depends(_get_session)):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        SELECT id, phone_number, name, location, preferred_language, registered_at
-        FROM farmers ORDER BY registered_at DESC
-    """)
-    rows = c.fetchall()
-    conn.close()
+def list_farmers(
+    _: DashboardUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    rows = db.query(FarmerKB).order_by(desc(FarmerKB.registered_at)).all()
     return [
-        {"id": r[0], "phone_number": r[1], "name": r[2],
-         "location": r[3], "language": r[4], "registered_at": r[5]}
+        {
+            "id": r.id,
+            "phone_number": r.phone_number,
+            "name": r.name,
+            "location": r.location,
+            "language": r.preferred_language,
+            "registered_at": _isoformat(r.registered_at),
+        }
         for r in rows
     ]
 
 
-# ── Call Logs ─────────────────────────────────────────────────────────────────
+@router.get("/farmers/{phone_number}")
+def get_farmer(
+    phone_number: str,
+    _: DashboardUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    row = db.query(FarmerKB).filter(FarmerKB.phone_number == phone_number).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Farmer not found")
+    return {
+        "id": row.id,
+        "phone_number": row.phone_number,
+        "name": row.name,
+        "location": row.location,
+        "language": row.preferred_language,
+        "crops": row.crops,
+        "farm_size": row.farm_size,
+        "notes": row.notes,
+        "registered_at": _isoformat(row.registered_at),
+    }
+
+
+@router.get("/farmers/{phone_number}/calls")
+def get_farmer_calls(
+    phone_number: str,
+    _: DashboardUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    rows = (
+        db.query(CallRecord)
+        .filter(CallRecord.phone_number == phone_number)
+        .order_by(desc(CallRecord.timestamp))
+        .all()
+    )
+    return [
+        {
+            "id": r.id,
+            "session_id": r.session_id,
+            "phone_number": r.phone_number,
+            "duration": r.duration,
+            "timestamp": _isoformat(r.timestamp),
+            "recording_path": r.recording_path,
+        }
+        for r in rows
+    ]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Calls
+# ──────────────────────────────────────────────────────────────────────────────
 @router.get("/calls")
-def list_calls(session: dict = Depends(_get_session)):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        SELECT c.id, c.session_id, c.phone_number, f.name,
-               c.duration, c.timestamp, c.recording_path
-        FROM call_records c
-        LEFT JOIN farmers f ON c.phone_number = f.phone_number
-        ORDER BY c.timestamp DESC LIMIT 100
-    """)
-    rows = c.fetchall()
-    conn.close()
+def list_calls(
+    limit: int = Query(default=100, le=500),
+    _: DashboardUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    rows = (
+        db.query(CallRecord, FarmerKB.name)
+        .outerjoin(FarmerKB, FarmerKB.phone_number == CallRecord.phone_number)
+        .order_by(desc(CallRecord.timestamp))
+        .limit(limit)
+        .all()
+    )
     return [
-        {"id": r[0], "session_id": r[1], "phone_number": r[2], "farmer_name": r[3],
-         "duration": r[4], "timestamp": r[5], "recording_path": r[6]}
-        for r in rows
+        {
+            "id": cr.id,
+            "session_id": cr.session_id,
+            "phone_number": cr.phone_number,
+            "farmer_name": name,
+            "duration": cr.duration,
+            "timestamp": _isoformat(cr.timestamp),
+            "recording_path": cr.recording_path,
+        }
+        for cr, name in rows
     ]
 
 
-# ── Escalation Queue ──────────────────────────────────────────────────────────
+@router.get("/calls/{session_id}")
+def get_call_detail(
+    session_id: str,
+    _: DashboardUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    record = db.query(CallRecord).filter(CallRecord.session_id == session_id).first()
+    farmer = None
+    if record:
+        farmer = (
+            db.query(FarmerKB).filter(FarmerKB.phone_number == record.phone_number).first()
+        )
+    transcript_rows = (
+        db.query(ConversationMessage)
+        .filter(ConversationMessage.session_id == session_id)
+        .order_by(ConversationMessage.timestamp.asc())
+        .all()
+    )
+
+    if not record and not transcript_rows:
+        raise HTTPException(status_code=404, detail="Call not found")
+
+    return {
+        "session_id": session_id,
+        "record": (
+            {
+                "id": record.id,
+                "phone_number": record.phone_number,
+                "duration": record.duration,
+                "timestamp": _isoformat(record.timestamp),
+                "recording_path": record.recording_path,
+            }
+            if record
+            else None
+        ),
+        "farmer": (
+            {
+                "phone_number": farmer.phone_number,
+                "name": farmer.name,
+                "location": farmer.location,
+                "language": farmer.preferred_language,
+            }
+            if farmer
+            else None
+        ),
+        "transcript": [
+            {
+                "role": m.role,
+                "message": m.message,
+                "timestamp": _isoformat(m.timestamp),
+            }
+            for m in transcript_rows
+        ],
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Escalations
+# ──────────────────────────────────────────────────────────────────────────────
+def _escalation_dict(e: Escalation, db: Session) -> dict:
+    assignee = None
+    if e.assigned_to_user_id:
+        u = db.query(DashboardUser).filter(DashboardUser.user_id == e.assigned_to_user_id).first()
+        if u:
+            assignee = {"user_id": u.user_id, "full_name": u.full_name, "email": u.email}
+    return {
+        "id": e.id,
+        "query": e.query,
+        "context": e.context,
+        "phone_number": e.phone_number,
+        "session_id": e.session_id,
+        "status": e.status,
+        "assigned_to": assignee,
+        "assigned_at": _isoformat(e.assigned_at),
+        "expert_response": e.expert_response,
+        "answered_at": _isoformat(e.answered_at),
+        "closed_at": _isoformat(e.closed_at),
+        "timestamp": _isoformat(e.created_at),
+    }
+
+
 @router.get("/escalations")
-def list_escalations(session: dict = Depends(_get_session)):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        SELECT id, query, context, status, timestamp
-        FROM escalated_queries ORDER BY timestamp DESC
-    """)
-    rows = c.fetchall()
-    conn.close()
-    return [
-        {"id": r[0], "query": r[1], "context": r[2], "status": r[3], "timestamp": r[4]}
-        for r in rows
-    ]
+def list_escalations(
+    status: Optional[str] = None,
+    user: DashboardUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    q = db.query(Escalation)
+    if status:
+        q = q.filter(Escalation.status == status)
+    if user.role == "expert":
+        # Experts see escalations assigned to them or unassigned awaiting pickup
+        q = q.filter(
+            (Escalation.assigned_to_user_id == user.user_id)
+            | (Escalation.status == "pending")
+        )
+    rows = q.order_by(desc(Escalation.created_at)).all()
+    return [_escalation_dict(r, db) for r in rows]
 
 
+@router.get("/escalations/mine")
+def list_my_escalations(
+    user: DashboardUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    rows = (
+        db.query(Escalation)
+        .filter(Escalation.assigned_to_user_id == user.user_id)
+        .order_by(desc(Escalation.created_at))
+        .all()
+    )
+    return [_escalation_dict(r, db) for r in rows]
+
+
+@router.post("/escalations/{ticket_id}/assign")
+def assign_escalation(
+    ticket_id: int,
+    req: AssignEscalationRequest,
+    user: DashboardUser = Depends(require_roles("admin", "da")),
+    db: Session = Depends(get_db),
+):
+    esc = db.query(Escalation).filter(Escalation.id == ticket_id).first()
+    if not esc:
+        raise HTTPException(status_code=404, detail="Escalation not found")
+    target = db.query(DashboardUser).filter(DashboardUser.user_id == req.user_id).first()
+    if not target or target.role != "expert":
+        raise HTTPException(status_code=400, detail="Target user must be an active expert")
+    if not target.is_active:
+        raise HTTPException(status_code=400, detail="Target expert is deactivated")
+
+    esc.assigned_to_user_id = target.user_id
+    esc.assigned_at = datetime.utcnow()
+    esc.status = "assigned"
+    esc.updated_at = datetime.utcnow()
+    db.commit()
+    return _escalation_dict(esc, db)
+
+
+@router.post("/escalations/{ticket_id}/response")
+def respond_escalation(
+    ticket_id: int,
+    req: EscalationResponseRequest,
+    user: DashboardUser = Depends(require_roles("expert", "admin")),
+    db: Session = Depends(get_db),
+):
+    esc = db.query(Escalation).filter(Escalation.id == ticket_id).first()
+    if not esc:
+        raise HTTPException(status_code=404, detail="Escalation not found")
+    if user.role == "expert" and esc.assigned_to_user_id != user.user_id:
+        raise HTTPException(status_code=403, detail="This case is not assigned to you")
+
+    esc.expert_response = req.answer
+    esc.answered_at = datetime.utcnow()
+    esc.status = "answered"
+    esc.updated_at = datetime.utcnow()
+    db.commit()
+    return _escalation_dict(esc, db)
+
+
+@router.post("/escalations/{ticket_id}/close")
+def close_escalation(
+    ticket_id: int,
+    user: DashboardUser = Depends(require_roles("admin", "da")),
+    db: Session = Depends(get_db),
+):
+    esc = db.query(Escalation).filter(Escalation.id == ticket_id).first()
+    if not esc:
+        raise HTTPException(status_code=404, detail="Escalation not found")
+    esc.status = "closed"
+    esc.closed_at = datetime.utcnow()
+    esc.updated_at = datetime.utcnow()
+    db.commit()
+    return _escalation_dict(esc, db)
+
+
+# Backwards-compat shortcut used by the existing /helpdesk page
 @router.put("/escalations/{ticket_id}/resolve")
-def resolve_escalation(ticket_id: int, session: dict = Depends(_get_session)):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("UPDATE escalated_queries SET status='resolved' WHERE id=?", (ticket_id,))
-    conn.commit()
-    conn.close()
+def resolve_escalation(
+    ticket_id: int,
+    user: DashboardUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    esc = db.query(Escalation).filter(Escalation.id == ticket_id).first()
+    if not esc:
+        raise HTTPException(status_code=404, detail="Escalation not found")
+    esc.status = "closed" if esc.status != "answered" else "closed"
+    esc.closed_at = datetime.utcnow()
+    esc.updated_at = datetime.utcnow()
+    db.commit()
     return {"status": "ok", "ticket_id": ticket_id}
 
 
-# ── Market Prices ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Market prices
+# ──────────────────────────────────────────────────────────────────────────────
 @router.get("/market-prices")
-def list_market_prices(session: dict = Depends(_get_session)):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        SELECT id, crop_name, region, price, unit, updated_at
-        FROM market_prices ORDER BY updated_at DESC
-    """)
-    rows = c.fetchall()
-    conn.close()
+def list_market_prices(
+    _: DashboardUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    rows = db.query(MarketPrice).order_by(desc(MarketPrice.updated_at)).all()
     return [
-        {"id": r[0], "crop_name": r[1], "region": r[2],
-         "price": r[3], "unit": r[4], "updated_at": r[5]}
+        {
+            "id": r.id,
+            "crop_name": r.crop_name,
+            "region": r.region,
+            "price": r.price,
+            "unit": r.unit,
+            "updated_at": _isoformat(r.updated_at),
+        }
         for r in rows
     ]
 
 
 @router.post("/market-prices")
-def add_market_price(req: MarketPriceRequest, session: dict = Depends(_require_admin)):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO market_prices (crop_name, region, price, unit) VALUES (?, ?, ?, ?)",
-        (req.crop_name, req.region, req.price, req.unit)
+def add_market_price(
+    req: MarketPriceRequest,
+    _: DashboardUser = Depends(require_roles("admin", "da")),
+    db: Session = Depends(get_db),
+):
+    db.add(
+        MarketPrice(
+            crop_name=req.crop_name,
+            region=req.region,
+            price=req.price,
+            unit=req.unit,
+        )
     )
-    conn.commit()
-    conn.close()
+    db.commit()
     return {"status": "ok"}
 
 
-# ── Alerts ────────────────────────────────────────────────────────────────────
+@router.delete("/market-prices/{price_id}")
+def delete_market_price(
+    price_id: int,
+    _: DashboardUser = Depends(require_roles("admin")),
+    db: Session = Depends(get_db),
+):
+    row = db.query(MarketPrice).filter(MarketPrice.id == price_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Market price not found")
+    db.delete(row)
+    db.commit()
+    return {"status": "ok"}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Alerts
+# ──────────────────────────────────────────────────────────────────────────────
 @router.get("/alerts")
-def list_alerts(session: dict = Depends(_get_session)):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        SELECT id, target_region, alert_message, severity, created_at
-        FROM alerts ORDER BY created_at DESC LIMIT 50
-    """)
-    rows = c.fetchall()
-    conn.close()
+def list_alerts(
+    _: DashboardUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    rows = db.query(Alert).order_by(desc(Alert.created_at)).limit(200).all()
     return [
-        {"id": r[0], "target_region": r[1], "alert_message": r[2],
-         "severity": r[3], "created_at": r[4]}
+        {
+            "id": r.id,
+            "target_region": r.target_region,
+            "alert_message": r.alert_message,
+            "severity": r.severity,
+            "category": r.category,
+            "scheduled_at": _isoformat(r.scheduled_at),
+            "published_at": _isoformat(r.published_at),
+            "created_at": _isoformat(r.created_at),
+        }
         for r in rows
     ]
 
 
 @router.post("/alerts")
-def create_alert(req: AlertRequest, session: dict = Depends(_require_admin)):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO alerts (target_region, alert_message, severity) VALUES (?, ?, ?)",
-        (req.target_region, req.alert_message, req.severity)
+def create_alert_endpoint(
+    req: AlertRequest,
+    user: DashboardUser = Depends(require_roles("admin", "da")),
+    db: Session = Depends(get_db),
+):
+    db.add(
+        Alert(
+            target_region=req.target_region,
+            alert_message=req.alert_message,
+            severity=req.severity,
+            category=req.category,
+            scheduled_at=req.scheduled_at,
+            published_at=datetime.utcnow() if not req.scheduled_at else None,
+            created_by=user.user_id,
+        )
     )
-    conn.commit()
-    conn.close()
+    db.commit()
     return {"status": "ok"}
 
 
-# ── Knowledge Base ────────────────────────────────────────────────────────────
+@router.delete("/alerts/{alert_id}")
+def delete_alert(
+    alert_id: int,
+    _: DashboardUser = Depends(require_roles("admin")),
+    db: Session = Depends(get_db),
+):
+    row = db.query(Alert).filter(Alert.id == alert_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    db.delete(row)
+    db.commit()
+    return {"status": "ok"}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Knowledge Base — raw Chroma intents (legacy)
+# ──────────────────────────────────────────────────────────────────────────────
 @router.get("/kb")
-def list_kb(session: dict = Depends(_get_session)):
+def list_kb(_: DashboardUser = Depends(get_current_user)):
     if collection.count() == 0:
         return []
     result = collection.get(include=["documents", "metadatas"])
@@ -272,20 +740,555 @@ def list_kb(session: dict = Depends(_get_session)):
 
 
 @router.post("/kb")
-def add_kb(req: KBRequest, session: dict = Depends(_require_admin)):
+def add_kb(
+    req: KBRequest,
+    _: DashboardUser = Depends(require_roles("admin")),
+):
     doc_id = f"kb_{uuid.uuid4()}"
     collection.add(
         documents=[req.response],
         metadatas=[{"intent": req.intent}],
-        ids=[doc_id]
+        ids=[doc_id],
     )
     return {"status": "ok", "id": doc_id}
 
 
 @router.delete("/kb/{entry_id}")
-def delete_kb(entry_id: str, session: dict = Depends(_require_admin)):
+def delete_kb(
+    entry_id: str,
+    _: DashboardUser = Depends(require_roles("admin")),
+):
     try:
         collection.delete(ids=[entry_id])
         return {"status": "ok"}
     except Exception as e:
         raise HTTPException(status_code=404, detail=str(e))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Knowledge Base — uploaded documents
+# ──────────────────────────────────────────────────────────────────────────────
+KB_UPLOAD_DIR = os.path.join(os.environ.get("DATA_DIR", "/data"), "kb_uploads")
+os.makedirs(KB_UPLOAD_DIR, exist_ok=True)
+
+
+def _kb_doc_dict(d: KBDocument) -> dict:
+    return {
+        "id": d.id,
+        "filename": d.filename,
+        "title": d.title,
+        "description": d.description,
+        "topic": d.topic,
+        "crop": d.crop,
+        "region": d.region,
+        "category": d.category,
+        "status": d.status,
+        "indexing_status": d.indexing_status,
+        "indexing_error": d.indexing_error,
+        "chroma_doc_count": d.chroma_doc_count,
+        "uploaded_at": _isoformat(d.uploaded_at),
+        "approved_at": _isoformat(d.approved_at),
+        "last_indexed_at": _isoformat(d.last_indexed_at),
+    }
+
+
+@router.get("/kb/documents")
+def list_kb_documents(
+    _: DashboardUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    rows = db.query(KBDocument).order_by(desc(KBDocument.uploaded_at)).all()
+    return [_kb_doc_dict(d) for d in rows]
+
+
+@router.post("/kb/documents")
+async def upload_kb_document(
+    file: UploadFile = File(...),
+    title: Optional[str] = Form(None),
+    description: Optional[str] = Form(None),
+    topic: Optional[str] = Form(None),
+    crop: Optional[str] = Form(None),
+    region: Optional[str] = Form(None),
+    category: Optional[str] = Form(None),
+    user: DashboardUser = Depends(require_roles("admin", "expert")),
+    db: Session = Depends(get_db),
+):
+    doc_id = str(uuid.uuid4())
+    safe_name = file.filename or f"{doc_id}.bin"
+    storage_path = os.path.join(KB_UPLOAD_DIR, f"{doc_id}_{safe_name}")
+    with open(storage_path, "wb") as out:
+        out.write(await file.read())
+
+    record = KBDocument(
+        id=doc_id,
+        filename=safe_name,
+        storage_path=storage_path,
+        mime_type=file.content_type,
+        title=title or safe_name,
+        description=description,
+        topic=topic,
+        crop=crop,
+        region=region,
+        category=category,
+        status="uploaded",
+        uploaded_by=user.user_id,
+    )
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    return _kb_doc_dict(record)
+
+
+@router.put("/kb/documents/{doc_id}")
+def update_kb_document(
+    doc_id: str,
+    req: KBDocumentUpdate,
+    _: DashboardUser = Depends(require_roles("admin", "expert")),
+    db: Session = Depends(get_db),
+):
+    doc = db.query(KBDocument).filter(KBDocument.id == doc_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    for field, value in req.dict(exclude_unset=True).items():
+        setattr(doc, field, value)
+    db.commit()
+    return _kb_doc_dict(doc)
+
+
+@router.post("/kb/documents/{doc_id}/approve")
+def approve_kb_document(
+    doc_id: str,
+    user: DashboardUser = Depends(require_roles("admin", "expert")),
+    db: Session = Depends(get_db),
+):
+    doc = db.query(KBDocument).filter(KBDocument.id == doc_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    doc.status = "approved"
+    doc.approved_by = user.user_id
+    doc.approved_at = datetime.utcnow()
+    db.commit()
+    try:
+        index_document(db, doc)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Indexing failed: {exc}")
+    return _kb_doc_dict(doc)
+
+
+@router.post("/kb/documents/{doc_id}/reject")
+def reject_kb_document(
+    doc_id: str,
+    user: DashboardUser = Depends(require_roles("admin", "expert")),
+    db: Session = Depends(get_db),
+):
+    doc = db.query(KBDocument).filter(KBDocument.id == doc_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    remove_document_from_chroma(db, doc)
+    doc.status = "rejected"
+    doc.approved_by = user.user_id
+    doc.approved_at = datetime.utcnow()
+    doc.indexing_status = "pending"
+    doc.chroma_doc_count = 0
+    db.commit()
+    return _kb_doc_dict(doc)
+
+
+@router.post("/kb/documents/{doc_id}/reindex")
+def reindex_kb_document(
+    doc_id: str,
+    _: DashboardUser = Depends(require_roles("admin", "expert")),
+    db: Session = Depends(get_db),
+):
+    doc = db.query(KBDocument).filter(KBDocument.id == doc_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    try:
+        index_document(db, doc)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Reindex failed: {exc}")
+    return _kb_doc_dict(doc)
+
+
+@router.delete("/kb/documents/{doc_id}")
+def delete_kb_document(
+    doc_id: str,
+    _: DashboardUser = Depends(require_roles("admin")),
+    db: Session = Depends(get_db),
+):
+    doc = db.query(KBDocument).filter(KBDocument.id == doc_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    remove_document_from_chroma(db, doc)
+    if doc.storage_path and os.path.exists(doc.storage_path):
+        try:
+            os.remove(doc.storage_path)
+        except OSError:
+            pass
+    db.delete(doc)
+    db.commit()
+    return {"status": "ok"}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Monitoring
+# ──────────────────────────────────────────────────────────────────────────────
+def _probe(url: str, timeout: float = 3.0) -> dict:
+    try:
+        r = requests.get(url, timeout=timeout)
+        return {
+            "url": url,
+            "status": "online" if r.status_code < 500 else "degraded",
+            "http_status": r.status_code,
+        }
+    except Exception as exc:
+        return {"url": url, "status": "down", "error": str(exc)}
+
+
+@router.get("/system-status")
+def system_status(
+    _: DashboardUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    services = {
+        "vad": os.getenv("VAD_HEALTH_URL", "http://vad-service:8010/health"),
+        "asr": os.getenv("ASR_HEALTH_URL", "http://asr-service:8001/docs"),
+        "tts": os.getenv("TTS_HEALTH_URL", "http://tts-service:8000/docs"),
+        "phone_gateway": os.getenv("PHONE_GATEWAY_URL", "http://phone-gateway:8000/health"),
+    }
+    probed = {name: _probe(url) for name, url in services.items()}
+
+    # Internal checks
+    db_status = "ok"
+    try:
+        from sqlalchemy import text
+        from db import engine
+
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+    except Exception as exc:
+        db_status = f"error: {exc}"
+
+    chroma_status = "ok"
+    chroma_count = 0
+    try:
+        chroma_count = collection.count()
+    except Exception as exc:
+        chroma_status = f"error: {exc}"
+
+    rag_status = {
+        "status": "online" if db_status == "ok" else "degraded",
+        "chroma_docs": chroma_count,
+        "chroma_status": chroma_status,
+    }
+
+    recent_errors = (
+        db.query(ServiceError).order_by(desc(ServiceError.created_at)).limit(20).all()
+    )
+    errors = [
+        {
+            "id": e.id,
+            "service": e.service,
+            "endpoint": e.endpoint,
+            "method": e.method,
+            "status_code": e.status_code,
+            "error": e.error,
+            "created_at": _isoformat(e.created_at),
+        }
+        for e in recent_errors
+    ]
+
+    return {
+        "services": {
+            "vad": probed["vad"],
+            "asr": probed["asr"],
+            "tts": probed["tts"],
+            "phone_gateway": probed["phone_gateway"],
+            "logic_service": {"status": "online", "url": "self"},
+            "rag": rag_status,
+            "database": {"status": db_status},
+        },
+        "recent_errors": errors,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Analytics
+# ──────────────────────────────────────────────────────────────────────────────
+@router.get("/analytics/summary")
+def analytics_summary(
+    _: DashboardUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+    total_calls = db.query(func.count(CallRecord.id)).scalar() or 0
+    calls_30d = (
+        db.query(func.count(CallRecord.id))
+        .filter(CallRecord.timestamp >= thirty_days_ago)
+        .scalar()
+        or 0
+    )
+    total_farmers = db.query(func.count(FarmerKB.id)).scalar() or 0
+    new_farmers_30d = (
+        db.query(func.count(FarmerKB.id))
+        .filter(FarmerKB.registered_at >= thirty_days_ago)
+        .scalar()
+        or 0
+    )
+    open_escalations = (
+        db.query(func.count(Escalation.id))
+        .filter(Escalation.status.in_(("pending", "assigned")))
+        .scalar()
+        or 0
+    )
+    answered_escalations = (
+        db.query(func.count(Escalation.id))
+        .filter(Escalation.status.in_(("answered", "closed")))
+        .scalar()
+        or 0
+    )
+    return {
+        "total_calls": total_calls,
+        "calls_30d": calls_30d,
+        "total_farmers": total_farmers,
+        "new_farmers_30d": new_farmers_30d,
+        "open_escalations": open_escalations,
+        "answered_escalations": answered_escalations,
+    }
+
+
+@router.get("/analytics/common-questions")
+def common_questions(
+    limit: int = Query(default=10, le=100),
+    _: DashboardUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    rows = (
+        db.query(ConversationMessage.message, func.count(ConversationMessage.id))
+        .filter(ConversationMessage.role == "user")
+        .group_by(ConversationMessage.message)
+        .order_by(desc(func.count(ConversationMessage.id)))
+        .limit(limit)
+        .all()
+    )
+    return [{"question": r[0], "count": r[1]} for r in rows]
+
+
+@router.get("/analytics/calls-breakdown")
+def calls_breakdown(
+    by: str = Query(default="date"),
+    _: DashboardUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if by == "language":
+        rows = (
+            db.query(FarmerKB.preferred_language, func.count(CallRecord.id))
+            .join(CallRecord, CallRecord.phone_number == FarmerKB.phone_number)
+            .group_by(FarmerKB.preferred_language)
+            .order_by(desc(func.count(CallRecord.id)))
+            .all()
+        )
+        return [{"key": r[0] or "unknown", "count": r[1]} for r in rows]
+
+    if by == "region":
+        rows = (
+            db.query(FarmerKB.location, func.count(CallRecord.id))
+            .join(CallRecord, CallRecord.phone_number == FarmerKB.phone_number)
+            .group_by(FarmerKB.location)
+            .order_by(desc(func.count(CallRecord.id)))
+            .all()
+        )
+        return [{"key": r[0] or "unknown", "count": r[1]} for r in rows]
+
+    # default: by date (last 30 days)
+    thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+    rows = (
+        db.query(
+            func.date_trunc("day", CallRecord.timestamp).label("day"),
+            func.count(CallRecord.id),
+        )
+        .filter(CallRecord.timestamp >= thirty_days_ago)
+        .group_by("day")
+        .order_by("day")
+        .all()
+    )
+    return [
+        {"key": (r[0].date().isoformat() if r[0] else ""), "count": r[1]} for r in rows
+    ]
+
+
+@router.get("/analytics/expert-performance")
+def expert_performance(
+    _: DashboardUser = Depends(require_roles("admin", "da")),
+    db: Session = Depends(get_db),
+):
+    rows = (
+        db.query(
+            DashboardUser.user_id,
+            DashboardUser.full_name,
+            DashboardUser.email,
+            func.count(Escalation.id).label("assigned_count"),
+            func.sum(
+                case((Escalation.status.in_(("answered", "closed")), 1), else_=0)
+            ).label("resolved_count"),
+        )
+        .join(Escalation, Escalation.assigned_to_user_id == DashboardUser.user_id)
+        .filter(DashboardUser.role == "expert")
+        .group_by(DashboardUser.user_id, DashboardUser.full_name, DashboardUser.email)
+        .all()
+    )
+    return [
+        {
+            "user_id": r[0],
+            "full_name": r[1],
+            "email": r[2],
+            "assigned": int(r[3] or 0),
+            "resolved": int(r[4] or 0),
+        }
+        for r in rows
+    ]
+
+
+@router.get("/analytics/da-performance")
+def da_performance(
+    _: DashboardUser = Depends(require_roles("admin")),
+    db: Session = Depends(get_db),
+):
+    rows = (
+        db.query(
+            DashboardUser.user_id,
+            DashboardUser.full_name,
+            DashboardUser.email,
+            func.count(Alert.id).label("alerts_created"),
+        )
+        .outerjoin(Alert, Alert.created_by == DashboardUser.user_id)
+        .filter(DashboardUser.role == "da")
+        .group_by(DashboardUser.user_id, DashboardUser.full_name, DashboardUser.email)
+        .all()
+    )
+    return [
+        {
+            "user_id": r[0],
+            "full_name": r[1],
+            "email": r[2],
+            "alerts_created": int(r[3] or 0),
+        }
+        for r in rows
+    ]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CSV exports
+# ──────────────────────────────────────────────────────────────────────────────
+EXPORT_RESOURCES = ("calls", "farmers", "escalations", "market-prices", "alerts")
+
+
+def _csv_response(rows: List[dict], filename: str) -> StreamingResponse:
+    if not rows:
+        # Still return a header row when there are no rows; fall back to an empty file.
+        buf = io.StringIO()
+        buf.write("\n")
+        buf.seek(0)
+        return StreamingResponse(
+            iter([buf.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    fieldnames = list(rows[0].keys())
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=fieldnames)
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({k: ("" if v is None else v) for k, v in row.items()})
+    buf.seek(0)
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/export/{resource}.csv")
+def export_csv(
+    resource: str,
+    _: DashboardUser = Depends(require_roles("admin", "da")),
+    db: Session = Depends(get_db),
+):
+    if resource not in EXPORT_RESOURCES:
+        raise HTTPException(status_code=400, detail=f"Unknown resource: {resource}")
+
+    if resource == "calls":
+        rows = db.query(CallRecord).order_by(desc(CallRecord.timestamp)).all()
+        data = [
+            {
+                "id": r.id,
+                "session_id": r.session_id,
+                "phone_number": r.phone_number,
+                "duration": r.duration,
+                "timestamp": _isoformat(r.timestamp),
+                "recording_path": r.recording_path,
+            }
+            for r in rows
+        ]
+    elif resource == "farmers":
+        rows = db.query(FarmerKB).order_by(desc(FarmerKB.registered_at)).all()
+        data = [
+            {
+                "id": r.id,
+                "phone_number": r.phone_number,
+                "name": r.name,
+                "location": r.location,
+                "language": r.preferred_language,
+                "registered_at": _isoformat(r.registered_at),
+            }
+            for r in rows
+        ]
+    elif resource == "escalations":
+        rows = db.query(Escalation).order_by(desc(Escalation.created_at)).all()
+        data = [
+            {
+                "id": r.id,
+                "query": r.query,
+                "context": r.context,
+                "status": r.status,
+                "phone_number": r.phone_number,
+                "session_id": r.session_id,
+                "assigned_to_user_id": r.assigned_to_user_id,
+                "expert_response": r.expert_response,
+                "created_at": _isoformat(r.created_at),
+                "answered_at": _isoformat(r.answered_at),
+                "closed_at": _isoformat(r.closed_at),
+            }
+            for r in rows
+        ]
+    elif resource == "market-prices":
+        rows = db.query(MarketPrice).order_by(desc(MarketPrice.updated_at)).all()
+        data = [
+            {
+                "id": r.id,
+                "crop_name": r.crop_name,
+                "region": r.region,
+                "price": r.price,
+                "unit": r.unit,
+                "updated_at": _isoformat(r.updated_at),
+            }
+            for r in rows
+        ]
+    else:  # alerts
+        rows = db.query(Alert).order_by(desc(Alert.created_at)).all()
+        data = [
+            {
+                "id": r.id,
+                "target_region": r.target_region,
+                "alert_message": r.alert_message,
+                "severity": r.severity,
+                "category": r.category,
+                "scheduled_at": _isoformat(r.scheduled_at),
+                "published_at": _isoformat(r.published_at),
+                "created_at": _isoformat(r.created_at),
+            }
+            for r in rows
+        ]
+
+    return _csv_response(data, f"{resource}.csv")
