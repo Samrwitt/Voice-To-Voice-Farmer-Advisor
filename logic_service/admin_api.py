@@ -1132,17 +1132,19 @@ def analytics_summary(
     db: Session = Depends(get_db),
 ):
     thirty_days_ago = datetime.utcnow() - timedelta(days=30)
-    total_calls = db.query(func.count(CallRecord.id)).scalar() or 0
+    # Use phone_gateway's canonical tables (call_sessions/callers) so dashboard
+    # reflects actual telephony activity.
+    total_calls = db.query(func.count(CallSessionPG.session_id)).scalar() or 0
     calls_30d = (
-        db.query(func.count(CallRecord.id))
-        .filter(CallRecord.timestamp >= thirty_days_ago)
+        db.query(func.count(CallSessionPG.session_id))
+        .filter(CallSessionPG.start_time >= thirty_days_ago)
         .scalar()
         or 0
     )
-    total_farmers = db.query(func.count(FarmerKB.id)).scalar() or 0
+    total_farmers = db.query(func.count(Caller.caller_id)).scalar() or 0
     new_farmers_30d = (
-        db.query(func.count(FarmerKB.id))
-        .filter(FarmerKB.registered_at >= thirty_days_ago)
+        db.query(func.count(Caller.caller_id))
+        .filter(Caller.created_at >= thirty_days_ago)
         .scalar()
         or 0
     )
@@ -1193,20 +1195,28 @@ def calls_breakdown(
 ):
     if by == "language":
         rows = (
-            db.query(FarmerKB.preferred_language, func.count(CallRecord.id))
-            .join(CallRecord, CallRecord.phone_number == FarmerKB.phone_number)
-            .group_by(FarmerKB.preferred_language)
-            .order_by(desc(func.count(CallRecord.id)))
+            db.query(
+                func.coalesce(FarmerProfilePG.primary_language, "unknown").label("lang"),
+                func.count(CallSessionPG.session_id),
+            )
+            .join(Caller, Caller.caller_id == CallSessionPG.caller_id)
+            .outerjoin(FarmerProfilePG, FarmerProfilePG.caller_id == Caller.caller_id)
+            .group_by("lang")
+            .order_by(desc(func.count(CallSessionPG.session_id)))
             .all()
         )
         return [{"key": r[0] or "unknown", "count": r[1]} for r in rows]
 
     if by == "region":
         rows = (
-            db.query(FarmerKB.location, func.count(CallRecord.id))
-            .join(CallRecord, CallRecord.phone_number == FarmerKB.phone_number)
-            .group_by(FarmerKB.location)
-            .order_by(desc(func.count(CallRecord.id)))
+            db.query(
+                func.coalesce(FarmerProfilePG.location, "unknown").label("region"),
+                func.count(CallSessionPG.session_id),
+            )
+            .join(Caller, Caller.caller_id == CallSessionPG.caller_id)
+            .outerjoin(FarmerProfilePG, FarmerProfilePG.caller_id == Caller.caller_id)
+            .group_by("region")
+            .order_by(desc(func.count(CallSessionPG.session_id)))
             .all()
         )
         return [{"key": r[0] or "unknown", "count": r[1]} for r in rows]
@@ -1215,10 +1225,10 @@ def calls_breakdown(
     thirty_days_ago = datetime.utcnow() - timedelta(days=30)
     rows = (
         db.query(
-            func.date_trunc("day", CallRecord.timestamp).label("day"),
-            func.count(CallRecord.id),
+            func.date_trunc("day", CallSessionPG.start_time).label("day"),
+            func.count(CallSessionPG.session_id),
         )
-        .filter(CallRecord.timestamp >= thirty_days_ago)
+        .filter(CallSessionPG.start_time >= thirty_days_ago)
         .group_by("day")
         .order_by("day")
         .all()

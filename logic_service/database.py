@@ -31,17 +31,56 @@ from auth import hash_password
 # ── Chroma (RAG vector DB) ────────────────────────────────────────────────────
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 chroma_client = chromadb.PersistentClient(path=os.path.join(DATA_DIR, "chroma_db"))
-sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
-    model_name="paraphrase-multilingual-MiniLM-L12-v2",
-)
-collection = chroma_client.get_or_create_collection(
-    name="agronomy_kb",
-    embedding_function=sentence_transformer_ef,
-)
+
+_collection = None
+
+
+def get_kb_collection():
+    """
+    Lazily initialize the Chroma collection.
+
+    This avoids blocking service startup on HuggingFace downloads in constrained
+    environments; if embedding init fails, we still let the API boot so admin
+    endpoints work.
+    """
+    global _collection
+    if _collection is not None:
+        return _collection
+
+    try:
+        ef = embedding_functions.SentenceTransformerEmbeddingFunction(
+            model_name=os.getenv(
+                "CHROMA_EMBEDDING_MODEL",
+                "paraphrase-multilingual-MiniLM-L12-v2",
+            ),
+        )
+        _collection = chroma_client.get_or_create_collection(
+            name="agronomy_kb",
+            embedding_function=ef,
+        )
+    except Exception as exc:
+        # Create the collection without an embedding function; RAG operations
+        # requiring embeddings will fail later with a clearer error, but the
+        # admin dashboard stays usable.
+        print(f"[KB] Embedding init failed; starting without embeddings: {exc}")
+        _collection = chroma_client.get_or_create_collection(name="agronomy_kb")
+
+    return _collection
+
+
+class _LazyCollectionProxy:
+    def __getattr__(self, item):
+        return getattr(get_kb_collection(), item)
+
+
+# Backwards-compatible import for existing modules:
+#   from database import collection
+collection = _LazyCollectionProxy()
 
 
 def init_kb():
     """Seed the Chroma collection from mock_kb.json on first boot."""
+    collection = get_kb_collection()
     if collection.count() == 0:
         if os.path.exists("mock_kb.json"):
             with open("mock_kb.json", "r", encoding="utf-8") as f:
