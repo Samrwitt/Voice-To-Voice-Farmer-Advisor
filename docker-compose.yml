@@ -137,6 +137,11 @@ services:
       DATABASE_URL: postgresql://phone_user:phone_pass@postgres:5432/phone_gateway_db
       LOG_LEVEL: INFO
 
+      HF_HOME: /models/huggingface
+      HF_HUB_CACHE: /models/huggingface/hub
+      SENTENCE_TRANSFORMERS_HOME: /models/sentence_transformers
+
+
       # Shared with phone-gateway so JWTs are mutually verifiable
       JWT_SECRET_KEY: "change-this-secret-key-in-production"
       ACCESS_TOKEN_EXPIRE_MINUTES: "1440"

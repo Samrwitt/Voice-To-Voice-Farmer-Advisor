@@ -73,6 +73,30 @@ class FarmerKB(Base):
     updated_at = Column(DateTime, default=datetime.utcnow)
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Read-only mirrors of phone_gateway tables (to show caller data in dashboard)
+# ──────────────────────────────────────────────────────────────────────────────
+class Caller(Base):
+    __tablename__ = "callers"
+
+    caller_id = Column(String, primary_key=True, index=True)
+    full_name = Column(String, nullable=False)
+    phone_number = Column(String, unique=True, nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    last_seen_at = Column(DateTime, default=datetime.utcnow)
+
+
+class FarmerProfilePG(Base):
+    __tablename__ = "farmer_profiles"
+
+    id = Column(String, primary_key=True, index=True)
+    caller_id = Column(String, ForeignKey("callers.caller_id"), unique=True)
+    location = Column(String, nullable=True)
+    primary_language = Column(String, default="am")
+    farm_size = Column(Float, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 class CallRecord(Base):
     __tablename__ = "call_records"
 

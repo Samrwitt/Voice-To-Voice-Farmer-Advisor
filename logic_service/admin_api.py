@@ -36,9 +36,11 @@ from models import (
     Alert,
     CallRecord,
     ConversationMessage,
+    Caller,
     DashboardUser,
     Escalation,
     FarmerKB,
+    FarmerProfilePG,
     KBDocument,
     MarketPrice,
     ServiceError,
@@ -194,7 +196,10 @@ def get_stats(
         or 0
     )
     pending_escalations = (
-        db.query(func.count(Escalation.id)).filter(Escalation.status == "pending").scalar() or 0
+        db.query(func.count(Escalation.id))
+        .filter(Escalation.status.in_(("pending", "assigned")))
+        .scalar()
+        or 0
     )
     total_alerts = db.query(func.count(Alert.id)).scalar() or 0
 
@@ -327,18 +332,64 @@ def list_farmers(
     _: DashboardUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    rows = db.query(FarmerKB).order_by(desc(FarmerKB.registered_at)).all()
-    return [
-        {
-            "id": r.id,
-            "phone_number": r.phone_number,
-            "name": r.name,
-            "location": r.location,
-            "language": r.preferred_language,
-            "registered_at": _isoformat(r.registered_at),
-        }
-        for r in rows
-    ]
+    # Prefer phone_gateway callers as the primary list (these exist even if
+    # the RAG flow hasn't created a FarmerKB row yet).
+    caller_rows = (
+        db.query(Caller, FarmerProfilePG)
+        .outerjoin(FarmerProfilePG, FarmerProfilePG.caller_id == Caller.caller_id)
+        .order_by(desc(Caller.last_seen_at))
+        .all()
+    )
+
+    # Map FarmerKB by phone number (optional enrichment).
+    kb_rows = db.query(FarmerKB).all()
+    kb_by_phone = {r.phone_number: r for r in kb_rows}
+
+    results: list[dict] = []
+    seen = set()
+
+    for caller, profile in caller_rows:
+        kb = kb_by_phone.get(caller.phone_number)
+        results.append(
+            {
+                # keep numeric id optional; UI already tolerates missing
+                "id": kb.id if kb else None,
+                "phone_number": caller.phone_number,
+                "name": (kb.name if kb and kb.name else caller.full_name),
+                "location": (
+                    (kb.location if kb and kb.location else None)
+                    or (profile.location if profile else None)
+                ),
+                "language": (
+                    (kb.preferred_language if kb and kb.preferred_language else None)
+                    or (profile.primary_language if profile else None)
+                    or "am"
+                ),
+                "registered_at": _isoformat(
+                    (kb.registered_at if kb else None)
+                    or (profile.created_at if profile else None)
+                    or caller.created_at
+                ),
+            }
+        )
+        seen.add(caller.phone_number)
+
+    # Include any FarmerKB rows that don't have a matching caller record
+    for kb in kb_rows:
+        if kb.phone_number in seen:
+            continue
+        results.append(
+            {
+                "id": kb.id,
+                "phone_number": kb.phone_number,
+                "name": kb.name,
+                "location": kb.location,
+                "language": kb.preferred_language,
+                "registered_at": _isoformat(kb.registered_at),
+            }
+        )
+
+    return results
 
 
 @router.get("/farmers/{phone_number}")
@@ -347,19 +398,43 @@ def get_farmer(
     _: DashboardUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    row = db.query(FarmerKB).filter(FarmerKB.phone_number == phone_number).first()
-    if not row:
+    kb = db.query(FarmerKB).filter(FarmerKB.phone_number == phone_number).first()
+
+    caller = db.query(Caller).filter(Caller.phone_number == phone_number).first()
+    profile = None
+    if caller:
+        profile = (
+            db.query(FarmerProfilePG)
+            .filter(FarmerProfilePG.caller_id == caller.caller_id)
+            .first()
+        )
+
+    if not kb and not caller and not profile:
         raise HTTPException(status_code=404, detail="Farmer not found")
+
     return {
-        "id": row.id,
-        "phone_number": row.phone_number,
-        "name": row.name,
-        "location": row.location,
-        "language": row.preferred_language,
-        "crops": row.crops,
-        "farm_size": row.farm_size,
-        "notes": row.notes,
-        "registered_at": _isoformat(row.registered_at),
+        "id": kb.id if kb else None,
+        "phone_number": phone_number,
+        "name": (kb.name if kb and kb.name else (caller.full_name if caller else None)),
+        "location": (
+            (kb.location if kb and kb.location else None)
+            or (profile.location if profile else None)
+        ),
+        "language": (
+            (kb.preferred_language if kb and kb.preferred_language else None)
+            or (profile.primary_language if profile else None)
+            or "am"
+        ),
+        "crops": kb.crops if kb else None,
+        "farm_size": (
+            kb.farm_size if kb and kb.farm_size is not None else (profile.farm_size if profile else None)
+        ),
+        "notes": kb.notes if kb else None,
+        "registered_at": _isoformat(
+            (kb.registered_at if kb else None)
+            or (profile.created_at if profile else None)
+            or (caller.created_at if caller else None)
+        ),
     }
 
 
