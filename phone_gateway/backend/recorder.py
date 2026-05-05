@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+import wave
 
 
 class AudioRecorder:
@@ -22,4 +23,16 @@ class AudioRecorder:
         if not self.file.closed:
             self.file.close()
 
-        return str(self.file_path)
+        # Convert raw PCM16 mono -> WAV so browsers can play it.
+        wav_path = self.recordings_dir / f"{self.session_id}.wav"
+        try:
+            pcm_bytes = self.file_path.read_bytes()
+            with wave.open(str(wav_path), "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)  # PCM16
+                wf.setframerate(16000)
+                wf.writeframes(pcm_bytes)
+            return str(wav_path)
+        except Exception:
+            # Fallback to raw PCM if conversion fails.
+            return str(self.file_path)

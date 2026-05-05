@@ -3,6 +3,7 @@ import uuid
 
 from backend.database import SessionLocal
 from backend.models import CallSession
+from backend.s3_client import is_enabled as s3_enabled, upload_file
 
 
 def create_session(caller_id: str | None = None) -> dict:
@@ -49,7 +50,17 @@ def end_session(session_id: str, audio_file: str | None = None) -> dict:
 
         call_session.end_time = end_time
         call_session.duration_seconds = round(duration, 2)
-        call_session.audio_file_path = audio_file
+        # Upload audio to S3/MinIO if configured.
+        final_audio_ref = audio_file
+        if audio_file and s3_enabled():
+            key = f"calls/{session_id}.wav" if audio_file.endswith(".wav") else f"calls/{session_id}"
+            try:
+                final_audio_ref = upload_file(audio_file, key, content_type="audio/wav")
+            except Exception:
+                # Keep local path if upload fails.
+                final_audio_ref = audio_file
+
+        call_session.audio_file_path = final_audio_ref
         call_session.status = "ended"
 
         db.commit()

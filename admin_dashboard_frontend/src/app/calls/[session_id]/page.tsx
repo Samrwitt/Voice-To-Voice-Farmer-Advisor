@@ -107,9 +107,11 @@ export default function CallSessionPage() {
               </div>
               <audio
                 controls
-                src={`/api/audio?path=${encodeURIComponent(
-                  detail.record.recording_path,
-                )}`}
+                src={
+                  detail.record.recording_path.startsWith('s3://')
+                    ? `/api/admin/calls/${encodeURIComponent(detail.session_id)}/audio`
+                    : `/api/audio?path=${encodeURIComponent(detail.record.recording_path)}`
+                }
                 className="w-full h-10"
               />
             </div>

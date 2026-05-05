@@ -116,7 +116,11 @@ export default function CallLogs() {
                             <audio
                               controls
                               autoPlay
-                              src={`/api/audio?path=${encodeURIComponent(c.recording_path)}`}
+                              src={
+                                c.recording_path.startsWith('s3://') && c.session_id
+                                  ? `/api/admin/calls/${encodeURIComponent(c.session_id)}/audio`
+                                  : `/api/audio?path=${encodeURIComponent(c.recording_path)}`
+                              }
                               className="flex-1 h-9"
                             />
                           </div>

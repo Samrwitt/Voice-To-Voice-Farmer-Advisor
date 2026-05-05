@@ -32,9 +32,11 @@ from auth import (
 from database import collection
 from db import get_db
 from kb_indexing import index_document, remove_document_from_chroma
+from s3_client import is_enabled as s3_enabled, presign_get_url
 from models import (
     Alert,
     CallRecord,
+    CallSessionPG,
     ConversationMessage,
     Caller,
     DashboardUser,
@@ -186,12 +188,15 @@ def get_stats(
     user: DashboardUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    total_farmers = db.query(func.count(FarmerKB.id)).scalar() or 0
-    total_calls = db.query(func.count(CallRecord.id)).scalar() or 0
+    # Farmers: prefer callers table (system-of-record)
+    total_farmers = db.query(func.count(Caller.caller_id)).scalar() or 0
+
+    # Calls: use phone_gateway call_sessions table (system-of-record)
+    total_calls = db.query(func.count(CallSessionPG.session_id)).scalar() or 0
     today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
     calls_today = (
-        db.query(func.count(CallRecord.id))
-        .filter(CallRecord.timestamp >= today_start)
+        db.query(func.count(CallSessionPG.session_id))
+        .filter(CallSessionPG.start_time >= today_start)
         .scalar()
         or 0
     )
@@ -206,10 +211,10 @@ def get_stats(
     seven_days_ago = datetime.utcnow() - timedelta(days=7)
     rows = (
         db.query(
-            func.date_trunc("day", CallRecord.timestamp).label("day"),
-            func.count(CallRecord.id),
+            func.date_trunc("day", CallSessionPG.start_time).label("day"),
+            func.count(CallSessionPG.session_id),
         )
-        .filter(CallRecord.timestamp >= seven_days_ago)
+        .filter(CallSessionPG.start_time >= seven_days_ago)
         .group_by("day")
         .order_by("day")
         .all()
@@ -444,20 +449,23 @@ def get_farmer_calls(
     _: DashboardUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    caller = db.query(Caller).filter(Caller.phone_number == phone_number).first()
+    if not caller:
+        return []
     rows = (
-        db.query(CallRecord)
-        .filter(CallRecord.phone_number == phone_number)
-        .order_by(desc(CallRecord.timestamp))
+        db.query(CallSessionPG)
+        .filter(CallSessionPG.caller_id == caller.caller_id)
+        .order_by(desc(CallSessionPG.start_time))
         .all()
     )
     return [
         {
-            "id": r.id,
+            "id": r.session_id,
             "session_id": r.session_id,
-            "phone_number": r.phone_number,
-            "duration": r.duration,
-            "timestamp": _isoformat(r.timestamp),
-            "recording_path": r.recording_path,
+            "phone_number": phone_number,
+            "duration": int(r.duration_seconds) if r.duration_seconds is not None else None,
+            "timestamp": _isoformat(r.start_time),
+            "recording_path": r.audio_file_path,
         }
         for r in rows
     ]
@@ -473,23 +481,23 @@ def list_calls(
     db: Session = Depends(get_db),
 ):
     rows = (
-        db.query(CallRecord, FarmerKB.name)
-        .outerjoin(FarmerKB, FarmerKB.phone_number == CallRecord.phone_number)
-        .order_by(desc(CallRecord.timestamp))
+        db.query(CallSessionPG, Caller)
+        .outerjoin(Caller, Caller.caller_id == CallSessionPG.caller_id)
+        .order_by(desc(CallSessionPG.start_time))
         .limit(limit)
         .all()
     )
     return [
         {
-            "id": cr.id,
-            "session_id": cr.session_id,
-            "phone_number": cr.phone_number,
-            "farmer_name": name,
-            "duration": cr.duration,
-            "timestamp": _isoformat(cr.timestamp),
-            "recording_path": cr.recording_path,
+            "id": cs.session_id,
+            "session_id": cs.session_id,
+            "phone_number": caller.phone_number if caller else None,
+            "farmer_name": caller.full_name if caller else None,
+            "duration": int(cs.duration_seconds) if cs.duration_seconds is not None else None,
+            "timestamp": _isoformat(cs.start_time),
+            "recording_path": cs.audio_file_path,
         }
-        for cr, name in rows
+        for cs, caller in rows
     ]
 
 
@@ -499,12 +507,16 @@ def get_call_detail(
     _: DashboardUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    record = db.query(CallRecord).filter(CallRecord.session_id == session_id).first()
-    farmer = None
-    if record:
-        farmer = (
-            db.query(FarmerKB).filter(FarmerKB.phone_number == record.phone_number).first()
-        )
+    # Primary: call session from phone_gateway
+    cs = db.query(CallSessionPG).filter(CallSessionPG.session_id == session_id).first()
+    caller = None
+    if cs and cs.caller_id:
+        caller = db.query(Caller).filter(Caller.caller_id == cs.caller_id).first()
+
+    # Overlay: farmer_kb for extra fields if present
+    farmer_kb = None
+    if caller and caller.phone_number:
+        farmer_kb = db.query(FarmerKB).filter(FarmerKB.phone_number == caller.phone_number).first()
     transcript_rows = (
         db.query(ConversationMessage)
         .filter(ConversationMessage.session_id == session_id)
@@ -512,30 +524,30 @@ def get_call_detail(
         .all()
     )
 
-    if not record and not transcript_rows:
+    if not cs and not transcript_rows:
         raise HTTPException(status_code=404, detail="Call not found")
 
     return {
         "session_id": session_id,
         "record": (
             {
-                "id": record.id,
-                "phone_number": record.phone_number,
-                "duration": record.duration,
-                "timestamp": _isoformat(record.timestamp),
-                "recording_path": record.recording_path,
+                "id": session_id,
+                "phone_number": caller.phone_number if caller else None,
+                "duration": int(cs.duration_seconds) if cs and cs.duration_seconds is not None else None,
+                "timestamp": _isoformat(cs.start_time) if cs else None,
+                "recording_path": cs.audio_file_path if cs else None,
             }
-            if record
+            if cs or caller
             else None
         ),
         "farmer": (
             {
-                "phone_number": farmer.phone_number,
-                "name": farmer.name,
-                "location": farmer.location,
-                "language": farmer.preferred_language,
+                "phone_number": caller.phone_number,
+                "name": (farmer_kb.name if farmer_kb and farmer_kb.name else caller.full_name),
+                "location": farmer_kb.location if farmer_kb else None,
+                "language": farmer_kb.preferred_language if farmer_kb else "am",
             }
-            if farmer
+            if caller
             else None
         ),
         "transcript": [
@@ -547,6 +559,30 @@ def get_call_detail(
             for m in transcript_rows
         ],
     }
+
+
+@router.get("/calls/{session_id}/audio")
+def get_call_audio_url(
+    session_id: str,
+    _: DashboardUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Returns a presigned URL for the call audio stored in S3/MinIO.
+    The CallSessionPG.audio_file_path is expected to be an s3://bucket/key reference.
+    """
+    cs = db.query(CallSessionPG).filter(CallSessionPG.session_id == session_id).first()
+    if not cs or not cs.audio_file_path:
+        raise HTTPException(status_code=404, detail="Audio not found")
+    if not s3_enabled():
+        raise HTTPException(status_code=503, detail="S3 is not configured")
+
+    url = presign_get_url(cs.audio_file_path, expires_seconds=900)
+    if not url:
+        raise HTTPException(status_code=404, detail="Audio reference is not in S3")
+
+    # Redirect so the browser audio tag can stream it directly.
+    return Response(status_code=302, headers={"Location": url})
 
 
 # ──────────────────────────────────────────────────────────────────────────────

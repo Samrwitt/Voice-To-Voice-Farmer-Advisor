@@ -18,6 +18,19 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
+  minio:
+    image: minio/minio:latest
+    container_name: farmer_advisor_minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+
   phone-gateway:
     build:
       context: .
@@ -30,6 +43,11 @@ services:
       DATABASE_URL: postgresql://phone_user:phone_pass@postgres:5432/phone_gateway_db
       RECORDINGS_DIR: /app/recordings
       VAD_WS_BASE_URL: ws://vad-service:8010/ws/vad
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_REGION: us-east-1
+      S3_ACCESS_KEY_ID: minioadmin
+      S3_SECRET_ACCESS_KEY: minioadmin
+      S3_BUCKET: farmer-advisor-media
 
       CREATE_DEFAULT_ADMIN: "true"
       DEFAULT_ADMIN_NAME: "System Admin"
@@ -181,6 +199,10 @@ services:
       ASR_HEALTH_URL: "http://asr-service:8001/docs"
       TTS_HEALTH_URL: "http://tts-service:8000/docs"
       PHONE_GATEWAY_URL: "http://phone-gateway:8000/health"
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_REGION: us-east-1
+      S3_ACCESS_KEY_ID: minioadmin
+      S3_SECRET_ACCESS_KEY: minioadmin
 
       DATA_DIR: "/app/data"
     volumes:
@@ -195,3 +217,4 @@ volumes:
   ollama_data:
 
   logic_data:
+  minio_data:
