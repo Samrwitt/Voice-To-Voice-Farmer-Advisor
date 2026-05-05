@@ -38,6 +38,10 @@ DB_PATH = os.path.join(DATA_DIR, "advisor.db")
 
 # Initialize SQLite for all entities
 def init_db():
+    # Ensure the parent directory exists (important for RAG-only/local modes)
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     

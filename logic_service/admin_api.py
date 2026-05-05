@@ -12,6 +12,11 @@ from typing import Optional
 
 from database import DB_PATH, collection
 
+try:
+    import rag_pg as _rag_pg
+except ImportError:
+    _rag_pg = None
+
 router = APIRouter(prefix="/admin", tags=["admin"])
 
 # ── In-memory session store  {token: {username, role}} ──────────────────────
@@ -117,6 +122,14 @@ def get_stats(session: dict = Depends(_get_session)):
     esc_breakdown = {r[0]: r[1] for r in c.fetchall()}
 
     conn.close()
+    kb_pg_chunks = None
+    if _rag_pg and _rag_pg.kb_pg_enabled():
+        try:
+            _rag_pg.init_pg_schema()
+            kb_pg_chunks = _rag_pg.count_approved_chunks()
+        except Exception:
+            kb_pg_chunks = None
+
     return {
         "total_farmers": total_farmers,
         "calls_today": calls_today,
@@ -126,6 +139,7 @@ def get_stats(session: dict = Depends(_get_session)):
         "calls_per_day": calls_per_day,
         "escalation_breakdown": esc_breakdown,
         "kb_count": collection.count(),
+        "kb_pg_chunks": kb_pg_chunks,
     }
 
 
