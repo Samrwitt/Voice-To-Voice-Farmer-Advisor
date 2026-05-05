@@ -77,11 +77,34 @@ services:
     ports:
       - "8001:8001"
     environment:
-      ASR_ENGINE: mock
-      ASR_MODEL_PATH: /models/asr
+      ASR_ENGINE: whisper_local
+      ASR_MODEL_PATH: /models/asr/whisper-small-amharic-bdu-8khz-aug-ct2-fp16
       SHARED_UTTERANCES_DIR: /shared/utterances
+      ASR_USE_OLLAMA: "true"
+      OLLAMA_URL: http://ollama:11434
+      OLLAMA_MODEL: qwen2.5:7b
+    depends_on:
+      - ollama
     volumes:
       - vad_utterances:/shared/utterances:ro
+      - ./models/asr:/models/asr:ro
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama_service
+    ports:
+      - "11435:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+
 
   tts-service:
     build:
@@ -94,24 +117,24 @@ services:
     ports:
       - "8002:8000"
 
-  admin-dashboard:
-    build:
-      context: ./admin_dashboard_frontend
-      dockerfile: Dockerfile
-    container_name: admin_dashboard
-    depends_on:
-      - phone-gateway
-    ports:
-      - "3000:3000"
-    environment:
-      NODE_ENV: production
-      NEXT_TELEMETRY_DISABLED: 1
+  # admin-dashboard:
+  #   build:
+  #     context: ./admin_dashboard_frontend
+  #     dockerfile: Dockerfile
+  #   container_name: admin_dashboard
+  #   depends_on:
+  #     - phone-gateway
+  #   ports:
+  #     - "3000:3000"
+  #   environment:
+  #     NODE_ENV: production
+  #     NEXT_TELEMETRY_DISABLED: 1
 
-      # For browser-side requests from Next.js pages/components
-      NEXT_PUBLIC_API_URL: http://localhost:8000
+  #     # For browser-side requests from Next.js pages/components
+  #     NEXT_PUBLIC_API_URL: http://localhost:8000
 
-      # For server-side requests inside the Docker network
-      API_INTERNAL_URL: http://phone-gateway:8000
+  #     # For server-side requests inside the Docker network
+  #     API_INTERNAL_URL: http://phone-gateway:8000
 
 
 volumes:
@@ -119,3 +142,5 @@ volumes:
   call_recordings:
   pgadmin_data:
   vad_utterances:
+  ollama_data:
+

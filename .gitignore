@@ -1,7 +1,6 @@
 srs_text.txt
 extract_pdf.py
 Compiled SRS.pdf
-srs_microservice_audit.md.resolved
 setup_dev.ps1
 start_dev.ps1
 dev_requirements.txt
@@ -13,3 +12,6 @@ __pycache__/
 *.pyo
 *.wav
 data/
+models/asr/
+*.bin
+*.safetensors
