@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import { fetchAlerts, createAlert } from '@/lib/api';
-import { isAdmin } from '@/lib/auth';
+import { hasRole } from '@/lib/auth';
 import type { Alert } from '@/types';
 
 const REGIONS = ['all', 'Addis Ababa', 'Oromia', 'Amhara', 'SNNPR', 'Tigray', 'Sidama', 'Afar'];
@@ -20,7 +20,7 @@ export default function AlertsPage() {
   const [error, setError]         = useState('');
   const [toast, setToast]         = useState('');
   const [broadcasting, setBroadcasting] = useState(false);
-  const admin = typeof window !== 'undefined' ? isAdmin() : false;
+  const canBroadcast = typeof window !== 'undefined' ? hasRole('admin', 'da') : false;
 
   // Form state
   const [targetRegion, setTargetRegion]   = useState('all');
@@ -76,7 +76,7 @@ export default function AlertsPage() {
           <div className="px-8 py-6 border-b border-slate-100">
             <h3 className="text-base font-medium text-slate-800">📢 Broadcast New Alert</h3>
           </div>
-          {admin ? (
+          {canBroadcast ? (
             <form onSubmit={handleBroadcast} className="p-8 space-y-4">
               <div className="space-y-1.5">
                 <label htmlFor="al-region" className="text-sm font-medium text-slate-700">Target Region</label>
@@ -132,8 +132,8 @@ export default function AlertsPage() {
           ) : (
             <div className="p-8 text-center py-12">
               <span className="text-3xl block mb-3">🔒</span>
-              <p className="text-sm font-medium text-slate-700">Admin Only</p>
-              <p className="text-sm text-slate-500 mt-1">Only administrators can broadcast alerts.</p>
+              <p className="text-sm font-medium text-slate-700">Read-only</p>
+              <p className="text-sm text-slate-500 mt-1">Only admins or DAs can broadcast alerts.</p>
             </div>
           )}
         </div>

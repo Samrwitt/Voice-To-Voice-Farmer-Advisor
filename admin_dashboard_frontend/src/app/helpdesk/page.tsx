@@ -1,22 +1,42 @@
 "use client";
 
 import { useEffect, useState } from 'react';
-import { fetchEscalations, resolveEscalation } from '@/lib/api';
-import { getRole } from '@/lib/auth';
-import type { EscalationCase } from '@/types';
+import {
+  assignEscalation,
+  closeEscalation,
+  fetchEscalations,
+  fetchUsers,
+  respondEscalation,
+} from '@/lib/api';
+import { getRole, getUserId, hasRole } from '@/lib/auth';
+import type { DashboardUser, EscalationCase } from '@/types';
 import Badge from '@/components/ui/Badge';
 
-function statusLabel(s: string) { return s === 'pending' ? 'Open' : 'Resolved'; }
-function statusVariant(s: string): 'warning' | 'success' { return s === 'pending' ? 'warning' : 'success'; }
+function statusLabel(s: string) {
+  if (s === 'pending') return 'Pending';
+  if (s === 'assigned') return 'Assigned';
+  if (s === 'answered') return 'Answered';
+  if (s === 'closed' || s === 'resolved') return 'Closed';
+  return s;
+}
+function statusVariant(s: string): 'warning' | 'success' | 'info' | 'neutral' {
+  if (s === 'pending') return 'warning';
+  if (s === 'assigned') return 'info';
+  if (s === 'answered') return 'success';
+  if (s === 'closed' || s === 'resolved') return 'neutral';
+  return 'neutral';
+}
 
 export default function Helpdesk() {
   const [cases, setCases]         = useState<EscalationCase[]>([]);
   const [selected, setSelected]   = useState<EscalationCase | null>(null);
   const [loading, setLoading]     = useState(true);
   const [error, setError]         = useState('');
-  const [resolving, setResolving] = useState(false);
+  const [experts, setExperts]     = useState<DashboardUser[]>([]);
+  const [busy, setBusy]           = useState(false);
   const [toast, setToast]         = useState('');
   const role = typeof window !== 'undefined' ? getRole() : null;
+  const myUserId = typeof window !== 'undefined' ? getUserId() : null;
 
   const load = () => {
     setLoading(true);
@@ -35,21 +55,57 @@ export default function Helpdesk() {
 
   useEffect(() => { load(); }, []); // eslint-disable-line
 
-  const openCount     = cases.filter(c => c.status === 'pending').length;
-  const resolvedCount = cases.filter(c => c.status === 'resolved').length;
+  useEffect(() => {
+    if (!hasRole('admin', 'da')) return;
+    fetchUsers()
+      .then((users) => setExperts(users.filter((u) => u.role === 'expert' && u.is_active)))
+      .catch(() => setExperts([]));
+  }, []);
 
-  const handleResolve = async () => {
+  const openCount     = cases.filter(c => c.status === 'pending' || c.status === 'assigned').length;
+  const resolvedCount = cases.filter(c => c.status === 'answered' || c.status === 'closed' || c.status === 'resolved').length;
+
+  const showToast = (msg: string) => { setToast(msg); setTimeout(() => setToast(''), 3000); };
+
+  const handleAssign = async (expertUserId: string) => {
     if (!selected || selected.id == null) return;
-    setResolving(true);
+    setBusy(true);
     try {
-      await resolveEscalation(selected.id);
-      setToast(`Ticket #${selected.id} resolved ✓`);
-      setTimeout(() => setToast(''), 3000);
+      await assignEscalation(selected.id, expertUserId);
+      showToast(`Ticket #${selected.id} assigned ✓`);
       load();
     } catch (e) {
-      setToast(e instanceof Error ? e.message : 'Failed to resolve');
+      showToast(e instanceof Error ? e.message : 'Failed to assign');
     } finally {
-      setResolving(false);
+      setBusy(false);
+    }
+  };
+
+  const handleRespond = async (answer: string) => {
+    if (!selected || selected.id == null) return;
+    setBusy(true);
+    try {
+      await respondEscalation(selected.id, answer);
+      showToast(`Ticket #${selected.id} answered ✓`);
+      load();
+    } catch (e) {
+      showToast(e instanceof Error ? e.message : 'Failed to respond');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleClose = async () => {
+    if (!selected || selected.id == null) return;
+    setBusy(true);
+    try {
+      await closeEscalation(selected.id);
+      showToast(`Ticket #${selected.id} closed ✓`);
+      load();
+    } catch (e) {
+      showToast(e instanceof Error ? e.message : 'Failed to close');
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -158,17 +214,56 @@ export default function Helpdesk() {
                     </div>
                   )}
 
-                  {/* Resolve action (any authenticated user) */}
-                  {selected.status === 'pending' && (
-                    <div className="pt-4 border-t border-slate-100">
-                      <button
-                        onClick={handleResolve}
-                        disabled={resolving}
-                        className="w-full h-10 bg-green-600 hover:bg-green-700 disabled:opacity-50 text-white text-sm font-medium rounded-md transition-colors"
-                      >
-                        {resolving ? 'Resolving…' : '✅ Mark as Resolved'}
-                      </button>
+                  {/* Assignment (admin/da) */}
+                  {hasRole('admin', 'da') && (
+                    <div className="pt-4 border-t border-slate-100 space-y-3">
+                      <span className="block text-xs font-semibold text-slate-500 uppercase tracking-wide">
+                        Assignment
+                      </span>
+                      <div className="flex gap-2">
+                        <select
+                          defaultValue={selected.assigned_to?.user_id ?? ''}
+                          onChange={(e) => {
+                            const v = e.target.value;
+                            if (v) handleAssign(v);
+                          }}
+                          className="flex-1 h-10 px-3 rounded-md border border-slate-300 text-sm focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-green-500 bg-white"
+                          disabled={busy}
+                        >
+                          <option value="">Assign to expert…</option>
+                          {experts.map((u) => (
+                            <option key={u.user_id} value={u.user_id}>
+                              {u.full_name} ({u.email})
+                            </option>
+                          ))}
+                        </select>
+                        <button
+                          onClick={handleClose}
+                          disabled={busy}
+                          className="h-10 px-4 rounded-md bg-slate-900 hover:bg-slate-800 disabled:opacity-50 text-white text-sm font-medium transition-colors"
+                        >
+                          Close
+                        </button>
+                      </div>
+                      <p className="text-xs text-slate-400">
+                        Current: {selected.assigned_to ? `${selected.assigned_to.full_name}` : 'Unassigned'}
+                      </p>
                     </div>
+                  )}
+
+                  {/* Expert response */}
+                  {hasRole('expert', 'admin') && (
+                    <ExpertResponsePanel
+                      caseItem={selected}
+                      canRespond={
+                        role === 'admin' ||
+                        (role === 'expert' &&
+                          !!myUserId &&
+                          selected.assigned_to?.user_id === myUserId)
+                      }
+                      busy={busy}
+                      onRespond={handleRespond}
+                    />
                   )}
                 </div>
               </div>
@@ -181,6 +276,52 @@ export default function Helpdesk() {
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+function ExpertResponsePanel({
+  caseItem,
+  canRespond,
+  busy,
+  onRespond,
+}: {
+  caseItem: EscalationCase;
+  canRespond: boolean;
+  busy: boolean;
+  onRespond: (answer: string) => void;
+}) {
+  const [answer, setAnswer] = useState('');
+
+  useEffect(() => {
+    setAnswer(caseItem.expert_response ?? '');
+  }, [caseItem.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  return (
+    <div className="pt-4 border-t border-slate-100 space-y-3">
+      <span className="block text-xs font-semibold text-slate-500 uppercase tracking-wide">
+        Expert response
+      </span>
+      {!canRespond && (
+        <div className="bg-amber-50 border border-amber-200 rounded-md p-3 text-sm text-amber-800">
+          This case must be assigned to you before you can answer.
+        </div>
+      )}
+      <textarea
+        value={answer}
+        onChange={(e) => setAnswer(e.target.value)}
+        rows={5}
+        className="w-full p-3 rounded-md border border-slate-300 text-sm focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-green-500 resize-none"
+        placeholder="Write the expert answer here…"
+        disabled={!canRespond || busy}
+      />
+      <button
+        onClick={() => onRespond(answer.trim())}
+        disabled={!canRespond || busy || !answer.trim()}
+        className="w-full h-10 bg-green-600 hover:bg-green-700 disabled:opacity-50 text-white text-sm font-medium rounded-md transition-colors"
+      >
+        Submit answer
+      </button>
     </div>
   );
 }

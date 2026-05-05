@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from 'react';
+import Link from 'next/link';
 import { fetchCalls } from '@/lib/api';
 import type { CallLog } from '@/types';
 
@@ -59,6 +60,7 @@ export default function CallLogs() {
                   <th className="py-4 px-8 text-xs font-semibold text-slate-500 uppercase tracking-wide">Duration</th>
                   <th className="py-4 px-8 text-xs font-semibold text-slate-500 uppercase tracking-wide">Timestamp</th>
                   <th className="py-4 px-8 text-xs font-semibold text-slate-500 uppercase tracking-wide">Audio</th>
+                  <th className="py-4 px-8 text-xs font-semibold text-slate-500 uppercase tracking-wide text-right">Transcript</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
@@ -93,10 +95,22 @@ export default function CallLogs() {
                           <span className="text-xs text-slate-300">No recording</span>
                         )}
                       </td>
+                      <td className="py-4 px-8 text-right">
+                        {c.session_id ? (
+                          <Link
+                            href={`/calls/${encodeURIComponent(c.session_id)}`}
+                            className="text-sm font-medium text-blue-600 hover:text-blue-700"
+                          >
+                            Open →
+                          </Link>
+                        ) : (
+                          <span className="text-xs text-slate-300">—</span>
+                        )}
+                      </td>
                     </tr>
                     {playingId === c.id && c.recording_path && (
                       <tr key={`audio-${c.id}`}>
-                        <td colSpan={6} className="px-8 py-4 bg-slate-50 border-b border-slate-100">
+                        <td colSpan={7} className="px-8 py-4 bg-slate-50 border-b border-slate-100">
                           <div className="flex items-center gap-4">
                             <span className="text-xs text-slate-500 font-medium">Recording:</span>
                             <audio
@@ -112,7 +126,7 @@ export default function CallLogs() {
                   </>
                 )) : (
                   <tr>
-                    <td colSpan={6} className="py-16 text-center text-sm text-slate-400">
+                    <td colSpan={7} className="py-16 text-center text-sm text-slate-400">
                       {search ? 'No calls match your search.' : 'No call records found.'}
                     </td>
                   </tr>
