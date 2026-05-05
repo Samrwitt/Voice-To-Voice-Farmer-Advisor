@@ -1,6 +1,7 @@
 srs_text.txt
 extract_pdf.py
 Compiled SRS.pdf
+Compiled SDS.pdf
 setup_dev.ps1
 start_dev.ps1
 dev_requirements.txt
@@ -15,3 +16,5 @@ data/
 models/asr/
 *.bin
 *.safetensors
+Revised G8 Project Proposal.pdf
+bdu_rtx4060_8khz_augmented.ipynb

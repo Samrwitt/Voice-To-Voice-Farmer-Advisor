@@ -95,6 +95,7 @@ class ASREngine:
             "domain_corrected_transcript": processed["domain_corrected"],
             "final_transcript": processed["final"],
             "transcript": processed["final"],
+            "text": processed["final"],
             "confidence": float(info.language_probability), # Proxy for confidence
             "engine": "whisper_local",
             "audio_id": Path(audio_path).stem,
