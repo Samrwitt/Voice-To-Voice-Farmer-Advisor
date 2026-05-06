@@ -38,7 +38,7 @@ except Exception as e:
 print("\n3. Sending RAG output to TTS Service...")
 tts_payload = {"text": response_text}
 try:
-    tts_response = requests.post("http://localhost:8003/synthesize", json=tts_payload)
+    tts_response = requests.post("http://localhost:8002/synthesize", json=tts_payload)
     if tts_response.status_code == 200:
         with open("final_advisor_response.mp3", "wb") as f:
             f.write(tts_response.content)

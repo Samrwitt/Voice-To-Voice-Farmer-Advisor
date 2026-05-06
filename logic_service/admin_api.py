@@ -51,6 +51,8 @@ from models import (
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
+RAG_SERVICE_URL = os.getenv("RAG_SERVICE_URL", "http://rag-service:8000").rstrip("/")
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Schemas
@@ -983,6 +985,24 @@ def approve_kb_document(
         index_document(db, doc)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Indexing failed: {exc}")
+
+    # Best-effort: also ingest into the RAG service (pgvector static KB).
+    try:
+        if doc.storage_path and os.path.exists(doc.storage_path):
+            with open(doc.storage_path, "rb") as f:
+                files = {"file": (doc.filename, f, doc.mime_type or "application/octet-stream")}
+                data = {
+                    "external_document_id": doc.id,
+                    "title": doc.title or doc.filename,
+                    "source_org": "admin_dashboard",
+                    "source_url": "",
+                    "language": "am",
+                    "status": "approved",
+                }
+                requests.post(f"{RAG_SERVICE_URL}/kb/ingest", files=files, data=data, timeout=120)
+    except Exception:
+        # Don't block approval if RAG service is offline.
+        pass
     return _kb_doc_dict(doc)
 
 
@@ -1018,6 +1038,23 @@ def reindex_kb_document(
         index_document(db, doc)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Reindex failed: {exc}")
+
+    # Best-effort: update the RAG service index as well.
+    try:
+        if doc.storage_path and os.path.exists(doc.storage_path):
+            with open(doc.storage_path, "rb") as f:
+                files = {"file": (doc.filename, f, doc.mime_type or "application/octet-stream")}
+                data = {
+                    "external_document_id": doc.id,
+                    "title": doc.title or doc.filename,
+                    "source_org": "admin_dashboard",
+                    "source_url": "",
+                    "language": "am",
+                    "status": "approved" if doc.status == "approved" else doc.status,
+                }
+                requests.post(f"{RAG_SERVICE_URL}/kb/ingest", files=files, data=data, timeout=120)
+    except Exception:
+        pass
     return _kb_doc_dict(doc)
 
 

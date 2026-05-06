@@ -1,6 +1,1 @@
 gTTS
-transformers
-soundfile
-librosa
-uroman
-sentencepiece

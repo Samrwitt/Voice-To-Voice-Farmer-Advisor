@@ -7,6 +7,8 @@ services:
     command: ["echo", "Base image built"]
 
   postgres:
+    # pgvector-enabled Postgres (required for fast KB retrieval)
+    # image: pgvector/pgvector:pg16
     image: postgres:16
     container_name: phone_gateway_postgres
     environment:
@@ -30,6 +32,33 @@ services:
       - "9001:9001"
     volumes:
       - minio_data:/data
+
+  rag-service:
+    build:
+      context: rag_service
+      dockerfile: Dockerfile
+    container_name: rag_service
+    depends_on:
+      postgres:
+        condition: service_started
+    ports:
+      - "8004:8000"
+    environment:
+      POSTGRES_URL: postgresql://phone_user:phone_pass@postgres:5432/phone_gateway_db
+      RAG_PG_MAX_L2_DISTANCE: "1.35"
+      TTS_URL: http://tts-service:8000/synthesize
+      AUTO_INGEST_KB_DIR: /app/kb_documents/amharic
+      AUTO_INGEST_ON_STARTUP: "true"
+      AUTO_INGEST_MAX_FILES: "20"
+      EMBED_BATCH_SIZE: "8"
+      HF_TOKEN: ${HF_TOKEN}
+      HF_HOME: /models/huggingface
+      HF_HUB_CACHE: /models/huggingface/hub
+      SENTENCE_TRANSFORMERS_HOME: /models/sentence_transformers
+      # If embeddings need a different model, override KB_EMBEDDING_MODEL.
+    volumes:
+      - ./kb_documents:/app/kb_documents:ro
+      - rag_models:/models
 
   phone-gateway:
     build:
@@ -139,7 +168,7 @@ services:
       base:
         condition: service_completed_successfully
     ports:
-      - "8003:8000"
+      - "8002:8002"
 
   admin-dashboard:
     image: farmer-advisor-admin-dashboard
@@ -177,10 +206,12 @@ services:
     environment:
       DATABASE_URL: postgresql://phone_user:phone_pass@postgres:5432/phone_gateway_db
       LOG_LEVEL: INFO
+      TTS_URL: http://tts-service:8000/synthesize
 
       HF_HOME: /models/huggingface
       HF_HUB_CACHE: /models/huggingface/hub
       SENTENCE_TRANSFORMERS_HOME: /models/sentence_transformers
+      HF_TOKEN: ${HF_TOKEN}
 
 
       # Shared with phone-gateway so JWTs are mutually verifiable
@@ -199,6 +230,7 @@ services:
       ASR_HEALTH_URL: "http://asr-service:8001/docs"
       TTS_HEALTH_URL: "http://tts-service:8000/docs"
       PHONE_GATEWAY_URL: "http://phone-gateway:8000/health"
+      RAG_SERVICE_URL: "http://rag-service:8000"
       S3_ENDPOINT_URL: http://minio:9000
       S3_REGION: us-east-1
       S3_ACCESS_KEY_ID: minioadmin
@@ -218,3 +250,4 @@ volumes:
 
   logic_data:
   minio_data:
+  rag_models:
