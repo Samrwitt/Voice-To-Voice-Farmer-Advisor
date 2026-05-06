@@ -4,8 +4,40 @@ Rule-based MVP — no training on your PDFs; more documents improve retrieval co
 """
 from __future__ import annotations
 
+import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Optional
+
+# Conservative folding so NLU keywords match common OCR/font spelling variants.
+_ETHIOPIC_CHAR_FOLD: dict[str, str] = {
+    "ሃ": "ሀ",
+    "ኅ": "ሀ",
+    "ኃ": "ሀ",
+    "ሐ": "ሀ",
+    "ሓ": "ሀ",
+    "ኻ": "ሀ",
+    "ሗ": "ኋ",
+    "ዐ": "አ",
+    "ዓ": "አ",
+    "ዕ": "እ",
+    "ጸ": "ፀ",
+    "ጹ": "ፁ",
+    "ጺ": "ፂ",
+    "ጻ": "ፃ",
+    "ጼ": "ፄ",
+    "ጽ": "ፅ",
+    "ጾ": "ፆ",
+}
+
+
+def normalize_ethiopic_input(text: str) -> str:
+    t = unicodedata.normalize("NFKC", text or "")
+    for old, new in _ETHIOPIC_CHAR_FOLD.items():
+        t = t.replace(old, new)
+    for z in ("\u200b", "\u200c", "\u200d", "\ufeff"):
+        t = t.replace(z, "")
+    return t
 
 # Crop / commodity mentions → English key used by market_prices table
 CROP_KEYWORDS: dict[str, str] = {
@@ -75,15 +107,25 @@ _TOPIC_RULES: list[tuple[str, list[str]]] = [
         [
             "post-harvest",
             "postharvest",
+            "phl",
             "ከመከር",
             "አከማችት",
             "አከማቻ",
             "ማከማቻ",
+            "ሲከማች",
+            "በጎተራ",
             "ድራር",
             "ማደስ",
             "እንዴት ይቆማል",
             "storage",
             "loss",
+            "ጎተራ",
+            "ኪሳራ",
+            "እህል",
+            "የእህል",
+            "ማጠባበቅ",
+            "የድህረ ምርት",
+            "የድረ ምርት",
         ],
     ),
     (
@@ -187,6 +229,61 @@ _RETRIEVAL_HINTS: dict[str, str] = {
 }
 
 
+_TOKEN_RE = re.compile(r"[\u1200-\u137F]+|[A-Za-z]+")
+
+
+def _tokens(text: str) -> list[str]:
+    """Ethiopic tokens + ASCII letter tokens (avoid substring false-positives)."""
+    return _TOKEN_RE.findall(text or "")
+
+
+def _keyword_matches_text(text: str, kw: str) -> bool:
+    """
+    Match keywords without substring collisions.
+
+    Examples:
+    - Must NOT match \"መስኖ\" inside \"መመሪያ\".
+    - ASCII keywords use word-boundary regex on lowered text.
+    - Multi-word phrases match as contiguous substring on normalized whitespace.
+    """
+    if not kw:
+        return False
+    if len(kw) < 2:
+        return False
+
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+
+    # Multi-token English phrases like \"soil and water\"
+    if " " in kw.strip():
+        norm_text = re.sub(r"\s+", " ", stripped.lower())
+        return kw.lower() in norm_text
+
+    # ASCII token-ish keywords → word boundaries
+    if re.fullmatch(r"[A-Za-z][A-Za-z\-]*", kw):
+        return re.search(rf"(?<!\w){re.escape(kw.lower())}(?!\w)", stripped.lower()) is not None
+
+    # Ethiopic keyword → token match with light suffix tolerance.
+    # This avoids substring collisions (e.g. መስኖ inside መመሪያ), but still matches
+    # common Amharic affixes like "ው/ዋ/ን/ዎች".
+    if re.search(r"[\u1200-\u137F]", kw):
+        toks = _tokens(stripped)
+        # Tighter affix budget for short stems (e.g. prevent ብር matching ብርሃን).
+        suffix_budget = 2 if len(kw) <= 4 else 3
+        for tok in toks:
+            if tok == kw:
+                return True
+            # Common suffixes: መመሪያ + ው → መመሪያው
+            if tok.startswith(kw) and len(tok) <= len(kw) + suffix_budget:
+                return True
+        return False
+
+    # Fallback: substring match for mixed/unusual keywords
+    lower = stripped.lower()
+    return kw.lower() in lower or kw in stripped
+
+
 @dataclass
 class NLUResult:
     primary_intent: str
@@ -204,9 +301,8 @@ class NLUResult:
 
 def _extract_crop_entities(text: str) -> dict[str, Any]:
     out: dict[str, Any] = {}
-    lower = text.lower()
     for kw, crop_en in CROP_KEYWORDS.items():
-        if kw in lower or kw in text:
+        if _keyword_matches_text(text, kw):
             out["crop_en"] = crop_en
             out["crop_keyword"] = kw
             break
@@ -218,15 +314,14 @@ def analyze_intent(text: str) -> NLUResult:
     Classify farmer question intent and build a retrieval query
     (original question + optional Amharic topic hint for embedding).
     """
-    stripped = (text or "").strip()
+    stripped = normalize_ethiopic_input((text or "").strip())
     if not stripped:
         return NLUResult("unknown", 0.0, {}, "")
 
     entities = _extract_crop_entities(stripped)
-    lower = stripped.lower()
 
     # Market price (separate data path in main)
-    if any(k in lower for k in MARKET_KEYWORDS) or any(k in stripped for k in MARKET_KEYWORDS):
+    if any(_keyword_matches_text(stripped, k) for k in MARKET_KEYWORDS):
         conf = 0.88 if entities.get("crop_en") else 0.72
         return NLUResult("market_price", conf, entities, stripped)
 
@@ -235,9 +330,7 @@ def analyze_intent(text: str) -> NLUResult:
     for intent_id, keywords in _TOPIC_RULES:
         score = 0
         for kw in keywords:
-            if len(kw) <= 2:
-                continue
-            if kw in lower or kw in stripped:
+            if _keyword_matches_text(stripped, kw):
                 score += 1
         if score > best_score:
             best_score = score
@@ -245,10 +338,7 @@ def analyze_intent(text: str) -> NLUResult:
 
     if best_score == 0:
         # Weak agr signal → unknown vs general
-        has_agri = any(
-            k in lower or k in stripped
-            for k in AGRI_INTENT_KEYWORDS
-        )
+        has_agri = any(_keyword_matches_text(stripped, k) for k in AGRI_INTENT_KEYWORDS)
         if has_agri:
             best_intent = "general_agronomy"
             best_score = 1
@@ -284,6 +374,10 @@ def needs_slot_filling(text: str, session_state: Optional[dict], nlu: NLUResult)
     if nlu.primary_intent == "market_price":
         return None
 
+    # Manual/extension/policy questions rarely need a crop entity.
+    if nlu.primary_intent in {"extension_advisory", "land_characterization", "post_harvest"}:
+        return None
+
     # Only ask for crop on intents where crop is usually required to give safe/specific advice.
     # Post-harvest and general info can often be answered generically.
     intents_requiring_crop = {
@@ -295,9 +389,8 @@ def needs_slot_filling(text: str, session_state: Optional[dict], nlu: NLUResult)
     if nlu.primary_intent not in intents_requiring_crop:
         return None
 
-    lower = text.lower()
-    has_agri = any(k in lower or k in text for k in AGRI_INTENT_KEYWORDS)
-    has_crop = any(k in lower or k in text for k in CROP_ENTITY_WORDS)
+    has_agri = any(_keyword_matches_text(text, k) for k in AGRI_INTENT_KEYWORDS)
+    has_crop = any(_keyword_matches_text(text, k) for k in CROP_ENTITY_WORDS)
 
     if has_agri and not has_crop:
         return "ለምን ሰብል ነው ጥያቄዎ? (ስንዴ፣ ጤፍ፣ ቦሎቄ፣ ወዘተ.)"

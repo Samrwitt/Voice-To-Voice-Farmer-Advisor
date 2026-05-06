@@ -29,12 +29,15 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(LOGIC_ROOT) not in sys.path:
     sys.path.insert(0, str(LOGIC_ROOT))
 
+from nlu import normalize_ethiopic_input
+
 
 KB_FILE_EXTENSIONS = (".pdf", ".docx", ".txt", ".md")
 
 
 def clean_extracted_text(text: str) -> str:
-    text = text.replace("\x00", " ").replace("\ufeff", "")
+    text = text.replace("\x00", " ")
+    text = normalize_ethiopic_input(text)
     text = re.sub(r"[ \t]+\n", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()

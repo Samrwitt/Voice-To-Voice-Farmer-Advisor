@@ -7,13 +7,14 @@ import logging
 import requests
 import base64
 import time
+from typing import Optional
 from database import (
     collection, add_to_escalation, log_conversation,
     get_conversation_history, get_market_price, register_farmer,
     get_farmer_profile, get_alerts_for_region, set_session_state,
     get_session_state, insert_call_record,
 )
-from nlu import analyze_intent, needs_slot_filling
+from nlu import analyze_intent, needs_slot_filling, normalize_ethiopic_input
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("logic_service")
@@ -40,21 +41,140 @@ RAG_DISTANCE_THRESHOLD = float(os.environ.get("RAG_DISTANCE_THRESHOLD", "1.2"))
 RAG_PG_MAX_L2_DISTANCE = float(os.environ.get("RAG_PG_MAX_L2_DISTANCE", "1.35"))
 TTS_URL = os.environ.get("TTS_URL", "http://tts_service:8002/synthesize")
 STT_URL = os.environ.get("STT_URL", "http://stt_service:8000/transcribe")
+RAG_PG_CANDIDATE_K = int(os.environ.get("RAG_PG_CANDIDATE_K", "16"))
+RAG_PG_FINAL_K = int(os.environ.get("RAG_PG_FINAL_K", "4"))
 
-# ── LLM Initialization ───────────────────────────────────────────────────────
-from langchain_community.llms import LlamaCpp
-
-llm = None
+# ── LLM Initialization (optional) ────────────────────────────────────────────
+#
+# Best Amharic quality: use OpenAI-compatible chat models (e.g. gpt-4o-mini).
+# Offline option: local GGUF via llama.cpp if you mount a model under DATA_DIR/models/.
+#
+# Env:
+#   LLM_PROVIDER=none|openai|llama_cpp
+#   OPENAI_API_KEY=...
+#   OPENAI_MODEL=gpt-4o-mini
+#   OPENAI_BASE_URL=... (optional; for compatible gateways)
+#   LLAMA_GGUF_PATH=/data/models/<model>.gguf (optional; defaults to llama-2-7b-chat path)
+LLM_PROVIDER = (os.environ.get("LLM_PROVIDER") or "none").strip().lower()
+llm = None  # llama.cpp callable (prompt: str) -> str
+llm_provider_active = "none"
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
-model_path = os.path.join(DATA_DIR, "models/llama-2-7b-chat.Q4_K_M.gguf")
-if os.path.exists(model_path):
-    logger.info("Initializing LLaMA-2 model for RAG generation...")
-    llm = LlamaCpp(
-        model_path=model_path,
-        temperature=0.1, max_tokens=256, top_p=1, n_ctx=2048
+_default_llama_path = os.path.join(DATA_DIR, "models/llama-2-7b-chat.Q4_K_M.gguf")
+LLAMA_GGUF_PATH = (os.environ.get("LLAMA_GGUF_PATH") or _default_llama_path).strip()
+
+
+def _init_llama_cpp() -> Optional[object]:
+    global llm_provider_active
+    if not LLAMA_GGUF_PATH or not os.path.exists(LLAMA_GGUF_PATH):
+        return None
+    try:
+        from langchain_community.llms import LlamaCpp
+    except Exception as exc:
+        logger.warning("llama.cpp unavailable (langchain_community LlamaCpp import failed): %s", exc)
+        return None
+
+    logger.info("Initializing local GGUF model for RAG generation: %s", LLAMA_GGUF_PATH)
+    llm_provider_active = "llama_cpp"
+    return LlamaCpp(
+        model_path=LLAMA_GGUF_PATH,
+        temperature=0.1,
+        max_tokens=320,
+        top_p=0.95,
+        n_ctx=2048,
     )
-else:
-    logger.warning("LLaMA-2 model not found at /data/models/. Falling back to direct KB extraction.")
+
+
+def _openai_client():
+    try:
+        from openai import OpenAI
+    except Exception:
+        return None
+    api_key = (os.environ.get("OPENAI_API_KEY") or "").strip()
+    if not api_key:
+        return None
+    base_url = (os.environ.get("OPENAI_BASE_URL") or "").strip() or None
+    return OpenAI(api_key=api_key, base_url=base_url)
+
+
+OPENAI_MODEL = (os.environ.get("OPENAI_MODEL") or "gpt-4o-mini").strip()
+
+
+def generate_amharic_answer_llm(
+    query_text: str,
+    context: str,
+    history_str: str,
+    user_context: str,
+) -> Optional[str]:
+    """
+    Returns a short, human-readable Amharic answer grounded in `context`.
+    Returns None if no LLM provider is configured/available.
+    """
+    global llm_provider_active
+    provider = (LLM_PROVIDER or "none").strip().lower()
+
+    # Prefer hosted models for best Amharic fluency.
+    if provider == "openai":
+        client = _openai_client()
+        if not client:
+            logger.warning("LLM_PROVIDER=openai but OPENAI_API_KEY is missing/unavailable.")
+        else:
+            llm_provider_active = f"openai:{OPENAI_MODEL}"
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an agricultural advisory assistant for farmers in Ethiopia.\n"
+                        "You MUST answer in Amharic only.\n"
+                        "Use ONLY the provided context. Do not add outside facts.\n"
+                        "If the context is insufficient, say you don't have enough information and ask a short clarifying question.\n"
+                        "Keep the answer short, practical, and easy to understand."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Context:\n{user_context}{context}\n\n"
+                        f"Conversation history:\n{history_str}\n\n"
+                        f"Question:\n{query_text}\n\n"
+                        "Answer in Amharic only."
+                    ),
+                },
+            ]
+            try:
+                resp = client.chat.completions.create(
+                    model=OPENAI_MODEL,
+                    messages=messages,
+                    temperature=0.2,
+                    max_tokens=420,
+                )
+                out = (resp.choices[0].message.content or "").strip()
+                return out or None
+            except Exception as exc:
+                logger.warning("OpenAI LLM call failed, falling back. Error: %s", exc)
+
+    # Offline fallback: llama.cpp if present.
+    if provider in ("llama_cpp", "llama", "gguf"):
+        global llm
+        if llm is None:
+            llm = _init_llama_cpp()
+        if not llm:
+            logger.warning("LLM_PROVIDER=llama_cpp but GGUF model not found/usable.")
+        else:
+            prompt = (
+                "መመሪያ: ከታች ያለው መረጃ ብቻ ተጠቅመህ መልስ ስጥ፤ ከውጭ እውቀት አትጨምር።\n"
+                "መልስህ በአማርኛ ብቻ ይሁን፣ አጭር እና ተግባራዊ ይሁን።\n\n"
+                f"Context:\n{user_context}{context}\n\n"
+                f"ታሪክ:\n{history_str}\n\n"
+                f"ጥያቄ:\n{query_text}\n\n"
+                "መልስ (በአማርኛ ብቻ):"
+            )
+            try:
+                out = (llm(prompt) or "").strip()
+                return out or None
+            except Exception as exc:
+                logger.warning("llama.cpp generation failed: %s", exc)
+
+    return None
 
 
 # ── Pydantic Models ──────────────────────────────────────────────────────────
@@ -135,11 +255,12 @@ def generate_rag_response(query_text: str, phone_number: str, session_id: str):
     - intent: outcome label for routing (often same as NLU primary_intent for KB turns).
     - nlu_dict: { primary_intent, confidence, entities } from analyze_intent.
     """
+    query_text = normalize_ethiopic_input((query_text or "").strip())
     logger.info(f"Processing query for session={session_id} phone={phone_number}: '{query_text}'")
     log_conversation(phone_number, session_id, "user", query_text)
 
     # ── Language Check ────────────────────────────────────────────────────────
-    if query_text.strip() and not is_amharic(query_text):
+    if query_text and not is_amharic(query_text):
         resp = "እባክዎ ጥያቄዎን በአማርኛ ይናገሩ።"  # Please ask your question in Amharic.
         log_conversation(phone_number, session_id, "assistant", resp)
         return resp, "non_amharic", [], {}
@@ -243,57 +364,367 @@ def generate_rag_response(query_text: str, phone_number: str, session_id: str):
             "መሆን",
         }
         scored = 0
+
+        def _amharic_stems(tok: str) -> list[str]:
+            # Very small stemmer: remove common suffixes for matching (MVP).
+            # Helps tokens like "ኪሳራዎች" match chunks containing "ኪሳራ".
+            if not tok:
+                return []
+            out = {tok}
+            for suf in ("ዎች", "ዎ", "ው", "ዋ", "ን", "ም", "ች"):
+                if tok.endswith(suf) and len(tok) > len(suf) + 2:
+                    out.add(tok[: -len(suf)])
+            # also try dropping one char (often punctuation/affix artifacts)
+            if len(tok) >= 5:
+                out.add(tok[:-1])
+            return sorted(out, key=len, reverse=True)
+
         for tok in tokens:
             if len(tok) < 3:
                 continue
             if tok in stop:
                 continue
-            # Exact substring match is fine for Amharic morphology MVP
-            if tok in t:
-                scored += 2
+            if re.search(r"[\u1200-\u137F]", tok):
+                if any(stem in t for stem in _amharic_stems(tok) if len(stem) >= 3):
+                    scored += 2
+            else:
+                if tok in t:
+                    scored += 2
         return scored
+
+    def _extension_chunk_phrase_boost(user_q: str, title: str, original_filename: str | None, content: str) -> int:
+        """
+        Heavy lexical boosts for the GIZ extension-materials manual (001): embeddings often pick
+        wrong PDFs when queries share generic tokens (መመሪያ፣ ቁሳቁስ፣ ደረጃ/ርዕስ confusion).
+        """
+        if not _is_extension_manual_doc(title or "", original_filename):
+            return 0
+        u = (user_q or "").strip()
+        body = ((content or "") + "\n" + (title or "")).strip()
+        bonus = 0
+        # Two bundles — intro section wording
+        if "ጥቅል" in u and ("አንድ" in u or "ሁለት" in u):
+            if any(
+                p in body
+                for p in (
+                    "ጥቅል 1",
+                    "ጥቅል 2",
+                    "የአፈር እና የውሃ ጥበቃ",
+                    "በዝቅተኛ አካባቢዎች የሰብል ምርት",
+                )
+            ):
+                bonus += 40
+        # Field visit + materials list
+        if "መስክ ጉብኝት" in u and ("ቁሳቁስ" in u or "ቁሳቁሶች" in u):
+            if any(p in body for p in ("የመስክ ጉብኝቶች", "ከጥቅል 1", "ከጥቅል 2")):
+                bonus += 35
+        # Discussion group duration (manual uses ASCII 1.5)
+        if "ውይይት ቡድን" in u or "ውይይት ቡድኖች" in u:
+            if any(p in body for p in ("ውይይት ቡድን", "የውይይት ቡድን", "የውይይት ቡድኖች")):
+                bonus += 25
+            if ("ሰዓት" in u or "ስንት" in u) and ("1.5" in body or "ለ1.5" in body.replace(" ", "")):
+                bonus += 50
+        return bonus
+
+    def _narrow_extension_manual_candidates(
+        candidates: list[dict], intent: str, user_q: str
+    ) -> list[dict]:
+        """
+        When the question clearly targets the extension-materials playbook (001), drop other PDFs
+        from the candidate pool so reranking cannot mix in irrigation / PH strategy chunks.
+        """
+        if intent != "extension_advisory" or not candidates:
+            return candidates
+        u = user_q or ""
+        signals = (
+            "ማስፋፊያ ቁሳቁሶች" in u
+            or ("ጥቅል" in u and ("አንድ" in u or "ሁለት" in u))
+            or "ውይይት ቡድን" in u
+            or ("መስክ ጉብኝት" in u and ("ቁሳቁስ" in u or "ቁሳቁሶች" in u))
+            or ("ፍሊፕ" in u and "መጽሐፍ" in u)
+        )
+        if not signals:
+            return candidates
+        ext_only = [
+            h
+            for h in candidates
+            if _is_extension_manual_doc(h.get("title") or "", h.get("original_filename"))
+        ]
+        return ext_only if ext_only else candidates
+
+    def _doc_blob(title: str, original_filename: str | None) -> str:
+        return ((original_filename or "") + " " + (title or "")).lower()
+
+    def _is_landpks_doc(title: str, original_filename: str | None) -> bool:
+        b = _doc_blob(title, original_filename)
+        return "landpks" in b or "006_landpks" in b.replace(" ", "_")
+
+    def _is_extension_manual_doc(title: str, original_filename: str | None) -> bool:
+        raw_fn = (original_filename or "").lower()
+        if "use-of-extension" in raw_fn or "extension-materials" in raw_fn.replace("_", "-"):
+            return True
+        blob = _doc_blob(title, original_filename)
+        if "use of extension" in blob or "extension materials" in blob:
+            return True
+        return "001" in blob and "extension" in blob
+
+    def _filter_extension_candidates(candidates: list[dict], intent: str) -> list[dict]:
+        """Drop LandPKS chunks when extension-materials chunks exist in the same candidate pool."""
+        if intent != "extension_advisory" or not candidates:
+            return candidates
+        if not any(
+            _is_extension_manual_doc(h.get("title") or "", h.get("original_filename"))
+            for h in candidates
+        ):
+            return candidates
+        filtered = [
+            h
+            for h in candidates
+            if not _is_landpks_doc(h.get("title") or "", h.get("original_filename"))
+        ]
+        return filtered if filtered else candidates
+
+    def _keyword_query_for_rerank(user_q: str, intent: str) -> str:
+        extras = {
+            "extension_advisory": "ቁሳቁስ እንፖስተር የውይይት ቡድን የመስክ ጉብኝት ማራዘም ቅያት አጠቃቀም",
+            "post_harvest": "እህል ጎተራ ማከማቻ ኪሳራ ድህረ ምርት ማጠባበቅ መቀነስ",
+            "land_characterization": "LandPKS መተግበሪያ አፈር ቀለም",
+        }
+        extra = extras.get(intent, "")
+        return (user_q + "\n" + extra).strip() if extra else user_q
+
+    def _doc_bias_for_intent(intent: str, title: str, original_filename: str | None = None) -> int:
+        """
+        Nudge ranking toward the right PDF family when embeddings tie on generic words
+        like \"መመሪያ\" (LandPKS manuals vs extension materials). Uses original_filename
+        because ingest replaces hyphens in titles (\"use-of-extension\" → \"use of extension\").
+        """
+        if not intent:
+            return 0
+        if intent == "extension_advisory":
+            bias = 0
+            if _is_landpks_doc(title, original_filename):
+                bias -= 24
+            if _is_extension_manual_doc(title, original_filename):
+                bias += 16
+            elif (
+                "extension" in _doc_blob(title, original_filename)
+                and not _is_landpks_doc(title, original_filename)
+            ):
+                bias += 6
+            return bias
+        if intent == "land_characterization":
+            return 10 if _is_landpks_doc(title, original_filename) else -3
+        if intent == "post_harvest":
+            b = _doc_blob(title, original_filename)
+            if any(x in b for x in ("010", "fao", "post-harvest-manual", "post harvest manual")):
+                return 14
+            if any(x in b for x in ("011", "phm-strategy", "postharvest management strategy")):
+                return 6
+            return 0
+        return 0
+
+    def _build_retrieval_queries(user_q: str, nlu_obj) -> list[str]:
+        """
+        Multi-query retrieval improves recall for Amharic phrasing variance.
+        We keep queries short and grounded (no hallucinated expansions).
+        """
+        q = (user_q or "").strip()
+        if not q:
+            return []
+
+        queries: list[str] = []
+
+        # 1) Raw user query (highest priority)
+        queries.append(q)
+
+        intent_early = (getattr(nlu_obj, "primary_intent", "") or "").strip()
+        # 2) Standalone semantic queries — pulls the right PDF family into the merged pool when
+        # the user question is dominated by generic words (e.g. መመሪያ) that match many manuals.
+        if intent_early == "extension_advisory":
+            queries.append(
+                "የማራዘም ቅያት ቁሳቁስ እንፖስተር የመስክ ጉብኝት የውይይት ቡድን አጠቃቀም ማስተር ዕቅድ"
+            )
+            if "ጥቅል" in q and ("አንድ" in q or "ሁለት" in q):
+                queries.append(
+                    "ጥቅል 1 የአፈር እና የውሃ ጥበቃ ጥቅል 2 በዝቅተኛ አካባቢዎች የሰብል ምርት የማስፋፊያ ቁሳቁሶች"
+                )
+            if "መስክ ጉብኝት" in q:
+                queries.append(
+                    "የመስክ ጉብኝቶች ከጥቅል 1 ከጥቅል 2 የሚገኙ ቁሳቁሶች ፍሊፕ ፖስተር"
+                )
+            if "ውይይት ቡድን" in q:
+                queries.append("የውይይት ቡድኖች ስብሰባ ሰዓት 1.5 አመቻች")
+        elif intent_early == "post_harvest":
+            queries.append(
+                "እህል ጎተራ ማከማቻ ኪሳራ የድህረ ምርት ማጠባበቅ መንስኤ መፍትሄ"
+            )
+
+        # 3) NLU retrieval query (adds a short topic hint for embedding search)
+        rq = (getattr(nlu_obj, "retrieval_query", "") or "").strip()
+        if rq and rq != q:
+            queries.append(rq)
+
+        # 4) Light normalization: collapse whitespace/punctuation
+        q_norm = re.sub(r"\s+", " ", re.sub(r"[“”\"'’]", "", q)).strip()
+        if q_norm and q_norm != q:
+            queries.append(q_norm)
+
+        # 5) Intent-aware “title bias” tokens (helps pick the right manual/plan)
+        # NOTE: These tokens are appended only for retrieval; not shown to user.
+        intent = intent_early
+        if intent == "land_characterization":
+            queries.append(q + "\nLandPKS መመሪያ መተግበሪያ")
+        elif intent == "extension_advisory":
+            queries.append(
+                q + "\nየማራዘም ቅያት ቁሳቁስ እንፖስተር ወረቀት የመስክ ጉብኝት የውይይት ቡድን"
+            )
+        elif intent == "pest_disease":
+            queries.append(q + "\nተባይ በሽታ አስተዳደር ዕቅድ plan")
+        elif intent == "post_harvest":
+            queries.append(q + "\nድህረ ምርት እህል ጎተራ ማከማቻ ኪሳራ መቀነስ")
+        elif intent == "crop_production":
+            queries.append(q + "\nመስኖ ሰብል ምርት ቴክኒክ")
+
+        # Dedup while preserving order
+        seen: set[str] = set()
+        out: list[str] = []
+        for item in queries:
+            key = item.strip()
+            if not key:
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(key)
+        return out
+
+    def _rerank_hits(
+        keyword_query: str,
+        candidates: list[dict],
+        intent: str = "",
+        raw_user_q: str = "",
+    ) -> list[dict]:
+        """
+        Hybrid rerank:
+          - keyword overlap against title+content (query + intent discriminators)
+          - document-family bias using title + original_filename
+          - extension-manual phrase boosts (001 section targeting)
+          - lower vector distance
+        """
+        rq = raw_user_q or keyword_query
+
+        def _score(h: dict) -> float:
+            blob = (h.get("title") or "") + "\n" + (h.get("content") or "")
+            return (
+                _keyword_overlap_score(keyword_query, blob)
+                + _doc_bias_for_intent(
+                    intent,
+                    (h.get("title") or ""),
+                    h.get("original_filename"),
+                )
+                + _extension_chunk_phrase_boost(
+                    rq,
+                    (h.get("title") or ""),
+                    h.get("original_filename"),
+                    (h.get("content") or ""),
+                )
+            )
+
+        return sorted(
+            candidates,
+            key=lambda h: (-_score(h), float(h.get("distance") or 999.0)),
+        )
+
+    def _should_escalate_pg(best_distance: float, best_kw: int) -> bool:
+        """
+        Avoid over-escalating. Distance alone can be high for Amharic OCR/manuals.
+        Escalate when distance is too high AND we have no strong lexical match.
+        """
+        if best_distance <= RAG_PG_MAX_L2_DISTANCE:
+            return False
+        # If we have a decent keyword overlap, prefer answering with caveats over escalation.
+        return best_kw < 2
 
     references: list = []
     context: str | None = None
     hits: list[dict] = []
     closest_distance = 999.0
     use_pg = rag_pg.kb_pg_enabled() and rag_pg.count_approved_chunks() > 0
-    retrieval_query = nlu.retrieval_query or query_text
+    retrieval_queries = _build_retrieval_queries(query_text, nlu)
 
     if use_pg:
-        # Pull more candidates then rerank with keyword overlap.
-        hits, closest_distance = rag_pg.retrieve_for_query(
-            retrieval_query, top_k=12, max_l2_distance=RAG_PG_MAX_L2_DISTANCE
+        # Multi-query retrieval (merge by chunk_id, keep best distance)
+        merged: dict[str, dict] = {}
+        best_distance = 999.0
+        for rq in (retrieval_queries or [query_text]):
+            cand, cand_best = rag_pg.retrieve_for_query(rq, top_k=RAG_PG_CANDIDATE_K)
+            if cand_best < best_distance:
+                best_distance = cand_best
+            for h in cand:
+                cid = h.get("chunk_id")
+                if not cid:
+                    continue
+                prev = merged.get(cid)
+                if not prev or float(h.get("distance") or 999.0) < float(prev.get("distance") or 999.0):
+                    merged[cid] = h
+
+        intent_s = (nlu.primary_intent or "").strip()
+        candidates = _filter_extension_candidates(list(merged.values()), intent_s)
+        candidates = _narrow_extension_manual_candidates(candidates, intent_s, query_text)
+        if not candidates:
+            closest_distance = 999.0
+        else:
+            closest_distance = min(float(h.get("distance") or 999.0) for h in candidates)
+
+        kw_q = _keyword_query_for_rerank(query_text, intent_s)
+        ranked = _rerank_hits(kw_q, candidates, intent_s, raw_user_q=query_text)
+        hits = ranked[: max(1, RAG_PG_FINAL_K)]
+
+        # Decide escalation more carefully (distance + lexical confidence)
+        best_kw = (
+            (
+                _keyword_overlap_score(
+                    kw_q,
+                    (hits[0].get("title") or "") + "\n" + (hits[0].get("content") or ""),
+                )
+                + _doc_bias_for_intent(
+                    intent_s,
+                    (hits[0].get("title") or ""),
+                    hits[0].get("original_filename"),
+                )
+                + _extension_chunk_phrase_boost(
+                    query_text,
+                    (hits[0].get("title") or ""),
+                    hits[0].get("original_filename"),
+                    (hits[0].get("content") or ""),
+                )
+            )
+            if hits
+            else 0
         )
-        if not hits:
+        if _should_escalate_pg(best_distance if best_distance != 999.0 else closest_distance, best_kw):
             logger.warning(
-                "Postgres RAG: no chunk within L2 distance %.3f (best was %.3f). Escalating.",
+                "Postgres RAG escalation: best_distance=%.3f max=%.3f best_kw=%s",
+                (best_distance if best_distance != 999.0 else closest_distance),
                 RAG_PG_MAX_L2_DISTANCE,
-                closest_distance,
+                best_kw,
             )
             add_to_escalation(
                 query_text,
-                f"PG RAG: no chunk within L2 {RAG_PG_MAX_L2_DISTANCE} (best={closest_distance:.3f}).",
+                f"PG RAG escalation: best_distance={(best_distance if best_distance != 999.0 else closest_distance):.3f} "
+                f"max={RAG_PG_MAX_L2_DISTANCE:.3f} kw={best_kw}",
             )
-            resp = "ይቅርታ፣ ይህንን ጥያቄ ሙሉ በሙሉ ልመልስ አልቻልኩም። ለባለሙያ አስተላልፌዋለሁ።"
+            resp = "ይቅርታ፣ ይህንን ጥያቄ በግልጽ መልኩ ለመመለስ በቂ መረጃ አላገኘሁም። ትንሽ ተጨማሪ መረጃ ይስጡ ወይም ለባለሙያ እልካለሁ።"
             log_conversation(phone_number, session_id, "assistant", resp)
             return resp, "escalated", [], nlu.to_dict()
-
-        # Hybrid rerank (keyword overlap) then keep the best 4
-        hits = sorted(
-            hits,
-            key=lambda h: (
-                -_keyword_overlap_score(query_text, (h.get("title") or "") + "\n" + (h.get("content") or "")),
-                float(h.get("distance") or 999.0),
-            ),
-        )
-        hits = hits[:4]
 
         references = [
             {
                 "chunk_id": h["chunk_id"],
                 "document_id": h["document_id"],
                 "title": h["title"],
+                "original_filename": h.get("original_filename"),
                 "source_org": h["source_org"],
                 "source_url": h["source_url"],
                 "distance": h["distance"],
@@ -309,6 +740,8 @@ def generate_rag_response(query_text: str, phone_number: str, session_id: str):
             log_conversation(phone_number, session_id, "assistant", resp)
             return resp, "kb_unavailable", [], nlu.to_dict()
 
+        # Keep Chroma behavior unchanged; just use retrieval hint if available.
+        retrieval_query = (retrieval_queries[0] if retrieval_queries else (nlu.retrieval_query or query_text))
         results = collection.query(query_texts=[retrieval_query], n_results=2)
 
         if not results["documents"] or not results["documents"][0]:
@@ -340,17 +773,11 @@ def generate_rag_response(query_text: str, phone_number: str, session_id: str):
     history_str = "\n".join([f"{h[0]}: {h[1]}" for h in history])
 
     # ── LLM or Direct KB Response ─────────────────────────────────────────────
-    if llm:
-        logger.info("Invoking LLM for grounded response...")
-        prompt = (
-            f"መመሪያ: ከታች ያለው መረጃ በአማርኛ ነው። ከዚያ ብቻ መልስ ስጥ፤ ከውጭ እውቀት አትጨምር።\n"
-            f"Context:\n{user_context}{context}\n\n"
-            f"ታሪክ:\n{history_str}\n\n"
-            f"ጥያቄ:\n{query_text}\n\n"
-            f"መልስ (በአማርኛ ብቻ፣ አጫጫን ያለህ ከሆነ አጭር አድርግ)፦"
-        )
-        response_text = llm(prompt)
-    else:
+    response_text = None
+    if context:
+        response_text = generate_amharic_answer_llm(query_text, context, history_str, user_context)
+
+    if not response_text:
         if use_pg and hits:
             response_text = compose_grounded_answer_no_llm(query_text, hits)
         else:
@@ -515,7 +942,7 @@ async def system_check():
         results["tts_service"] = f"error: {e}"
 
     results["rag_threshold"] = RAG_DISTANCE_THRESHOLD
-    results["llm_loaded"] = llm is not None
+    results["llm_provider"] = llm_provider_active
 
     try:
         import rag_pg

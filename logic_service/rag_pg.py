@@ -1,7 +1,17 @@
 """
 Postgres + pgvector retrieval for the agronomy KB (SRS FR08/FR10).
-Uses the same embedding space as the legacy Chroma path:
-`paraphrase-multilingual-MiniLM-L12-v2` (384-dim, multilingual / Amharic-friendly).
+Default embedder: paraphrase-multilingual-MiniLM-L12-v2 (384-d). It is not Amharic-specialized
+but works reasonably for short queries vs OCR/manual text; weaknesses show up as high L2
+distance and wrong-doc ties—address with retrieval hints, reranking, and (optionally) a
+stronger multilingual retriever after full re-ingest.
+
+Upgrade path (same 384-d, requires wipe + re-ingest + matching env at query time):
+  KB_EMBEDDING_MODEL=intfloat/multilingual-e5-small
+  KB_EMBEDDING_QUERY_PREFIX=query:
+  KB_EMBEDDING_PASSAGE_PREFIX=passage:
+  KB_EMBEDDING_NORMALIZE=true
+
+Do not change embedding model/normalization on an existing kb_chunks table without re-embedding.
 """
 from __future__ import annotations
 
@@ -19,6 +29,17 @@ EMBEDDING_MODEL_NAME = os.environ.get(
     "paraphrase-multilingual-MiniLM-L12-v2",
 )
 EMBEDDING_DIM = 384
+# Optional: intfloat/multilingual-e5-small is also 384-d but needs prefixes + full re-ingest.
+#   KB_EMBEDDING_QUERY_PREFIX="query: "
+#   KB_EMBEDDING_PASSAGE_PREFIX="passage: "
+#   KB_EMBEDDING_NORMALIZE=true
+KB_EMBEDDING_QUERY_PREFIX = (os.environ.get("KB_EMBEDDING_QUERY_PREFIX") or "").strip()
+KB_EMBEDDING_PASSAGE_PREFIX = (os.environ.get("KB_EMBEDDING_PASSAGE_PREFIX") or "").strip()
+KB_EMBEDDING_NORMALIZE = os.environ.get("KB_EMBEDDING_NORMALIZE", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 _psycopg = None
 _schema_ready = False
@@ -57,11 +78,14 @@ def _get_embedder():
     return _embedder
 
 
-def embed_texts(texts: list[str]) -> list[list[float]]:
+def embed_texts(texts: list[str], *, for_query: bool = False) -> list[list[float]]:
     model = _get_embedder()
+    prefix = KB_EMBEDDING_QUERY_PREFIX if for_query else KB_EMBEDDING_PASSAGE_PREFIX
+    if prefix:
+        texts = [prefix + (t or "") for t in texts]
     vectors = model.encode(
         texts,
-        normalize_embeddings=False,
+        normalize_embeddings=KB_EMBEDDING_NORMALIZE,
         show_progress_bar=False,
     )
     return [v.tolist() for v in vectors]
@@ -172,7 +196,7 @@ def retrieve_for_query(
     if not kb_pg_enabled():
         return [], 999.0
     init_pg_schema()
-    qvec = embed_texts([query_text])[0]
+    qvec = embed_texts([query_text], for_query=True)[0]
     lit = _vector_literal(qvec)
 
     psycopg = _load_psycopg()
@@ -191,7 +215,8 @@ def retrieve_for_query(
                     d.title,
                     d.source_org,
                     d.source_url,
-                    d.language
+                    d.language,
+                    d.original_filename
                 FROM kb_chunks c
                 INNER JOIN kb_documents d ON d.id = c.document_id
                 WHERE d.status = 'approved'
@@ -218,15 +243,15 @@ def retrieve_for_query(
                 "source_org": row[5],
                 "source_url": row[6],
                 "language": row[7],
+                "original_filename": row[8],
             }
         )
 
     return hits, (best if hits else 999.0)
 
 
-def chunk_amharic_text(text: str, chunk_size: int = 1600, overlap: int = 200) -> list[str]:
-    """Character-window chunking (works well for Amharic prose without English sentence rules)."""
-    text = re.sub(r"\s+", " ", text.strip())
+def _char_window_chunks(text: str, chunk_size: int, overlap: int) -> list[str]:
+    text = text.strip()
     if not text:
         return []
     chunks: list[str] = []
@@ -241,3 +266,36 @@ def chunk_amharic_text(text: str, chunk_size: int = 1600, overlap: int = 200) ->
             break
         start = max(0, end - overlap)
     return chunks
+
+
+def chunk_amharic_text(text: str, chunk_size: int = 1600, overlap: int = 200) -> list[str]:
+    """
+    Chunk Amharic PDF text using Ethiopic sentence ends (። ፧ ፨) and Latin . ? !
+    before falling back to fixed character windows. Reduces mid-thought cuts.
+    """
+    text = re.sub(r"\s+", " ", (text or "").strip())
+    if not text:
+        return []
+    parts = re.split(r"(?<=[።፧፨.!?])\s+", text)
+    units = [p.strip() for p in parts if p.strip()]
+    if not units:
+        return _char_window_chunks(text, chunk_size, overlap)
+    chunks: list[str] = []
+    buf = ""
+    for u in units:
+        if len(u) > chunk_size:
+            if buf:
+                chunks.append(buf.strip())
+                buf = ""
+            chunks.extend(_char_window_chunks(u, chunk_size, overlap))
+            continue
+        candidate = (buf + " " + u).strip() if buf else u
+        if len(candidate) <= chunk_size:
+            buf = candidate
+        else:
+            if buf:
+                chunks.append(buf.strip())
+            buf = u
+    if buf:
+        chunks.append(buf.strip())
+    return [c for c in chunks if c]
