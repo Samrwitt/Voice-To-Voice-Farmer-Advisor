@@ -26,9 +26,9 @@ POSTGRES_URL = os.environ.get("POSTGRES_URL", "").strip()
 RAG_PG_MAX_L2_DISTANCE = float(os.environ.get("RAG_PG_MAX_L2_DISTANCE", "1.35"))
 EMBEDDING_MODEL_NAME = os.environ.get(
     "KB_EMBEDDING_MODEL",
-    "paraphrase-multilingual-MiniLM-L12-v2",
+    "rasyosef/roberta-amharic-text-embedding-base",
 )
-EMBEDDING_DIM = 384
+EMBEDDING_DIM = 768
 # Optional: intfloat/multilingual-e5-small is also 384-d but needs prefixes + full re-ingest.
 #   KB_EMBEDDING_QUERY_PREFIX="query: "
 #   KB_EMBEDDING_PASSAGE_PREFIX="passage: "
@@ -44,6 +44,43 @@ KB_EMBEDDING_NORMALIZE = os.environ.get("KB_EMBEDDING_NORMALIZE", "").strip().lo
 _psycopg = None
 _schema_ready = False
 _embedder = None
+
+
+def _get_existing_kb_chunks_dim(cur) -> int | None:
+    """
+    Return current kb_chunks.embedding vector dim if table exists, else None.
+    pgvector dimension is encoded in atttypmod. Depending on pgvector version/build,
+    it may be stored as (dim + 4) or dim. We detect both.
+    """
+    cur.execute("SELECT to_regclass('public.kb_chunks');")
+    exists = cur.fetchone()[0]
+    if not exists:
+        return None
+    cur.execute(
+        """
+        SELECT a.atttypmod
+        FROM pg_attribute a
+        WHERE a.attrelid = 'public.kb_chunks'::regclass
+          AND a.attname = 'embedding'
+          AND a.attnum > 0
+          AND NOT a.attisdropped;
+        """
+    )
+    row = cur.fetchone()
+    if not row or row[0] is None:
+        return None
+    typmod = int(row[0])
+    # typmod == -1 means "unspecified"
+    if typmod <= 0:
+        return None
+    cand_a = typmod - 4
+    cand_b = typmod
+    # Prefer common embedding dims
+    for c in (cand_a, cand_b):
+        if c in (128, 256, 384, 512, 768, 1024):
+            return c
+    # Fallback: cand_a is the documented encoding for many pgvector versions
+    return cand_a if cand_a > 0 else cand_b
 
 
 def _load_psycopg():
@@ -114,6 +151,28 @@ def init_pg_schema() -> None:
     with psycopg.connect(POSTGRES_URL, autocommit=True) as conn:
         with conn.cursor() as cur:
             cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+            # If schema exists with a different vector dim, we must recreate/alter.
+            existing_dim = _get_existing_kb_chunks_dim(cur)
+            if existing_dim is not None and existing_dim != EMBEDDING_DIM:
+                recreate = (os.environ.get("RAG_PG_RECREATE_SCHEMA") or "").strip().lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                )
+                msg = (
+                    f"kb_chunks.embedding is vector({existing_dim}) but this service is configured for "
+                    f"vector({EMBEDDING_DIM}). You changed embedding models/dimensions.\n"
+                    f"- Fix option A (recommended): set RAG_PG_RECREATE_SCHEMA=true and restart to recreate tables, "
+                    f"then re-ingest.\n"
+                    f"- Fix option B: drop the Postgres volume (docker compose down -v) and start fresh.\n"
+                    f"- Fix option C: manually ALTER the column to vector({EMBEDDING_DIM}) and re-ingest."
+                )
+                if not recreate:
+                    raise RuntimeError(msg)
+                logger.warning("%s", msg)
+                cur.execute("DROP TABLE IF EXISTS kb_chunks CASCADE;")
+                cur.execute("DROP TABLE IF EXISTS kb_documents CASCADE;")
+
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS kb_documents (
@@ -268,7 +327,7 @@ def _char_window_chunks(text: str, chunk_size: int, overlap: int) -> list[str]:
     return chunks
 
 
-def chunk_amharic_text(text: str, chunk_size: int = 1600, overlap: int = 200) -> list[str]:
+def chunk_amharic_text(text: str, chunk_size: int = 600, overlap: int = 100) -> list[str]:
     """
     Chunk Amharic PDF text using Ethiopic sentence ends (። ፧ ፨) and Latin . ? !
     before falling back to fixed character windows. Reduces mid-thought cuts.

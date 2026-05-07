@@ -18,9 +18,8 @@ _ETHIOPIC_CHAR_FOLD: dict[str, str] = {
     "ሓ": "ሀ",
     "ኻ": "ሀ",
     "ሗ": "ኋ",
-    "ዐ": "አ",
-    "ዓ": "አ",
-    "ዕ": "እ",
+    # Removed: ዐ→አ, ዓ→አ, ዕ→እ — these merge semantically distinct words
+    # e.g. ዓመት (year) ≠ አመት (hundred), ዓለም (world) ≠ አለም
     "ጸ": "ፀ",
     "ጹ": "ፁ",
     "ጺ": "ፂ",

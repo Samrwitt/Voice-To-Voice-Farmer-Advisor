@@ -34,6 +34,15 @@ from nlu import normalize_ethiopic_input
 
 KB_FILE_EXTENSIONS = (".pdf", ".docx", ".txt", ".md")
 
+def _ethiopic_ratio(text: str) -> float:
+    if not text:
+        return 0.0
+    non_ws = [c for c in text if not c.isspace()]
+    if not non_ws:
+        return 0.0
+    et = [c for c in non_ws if "\u1200" <= c <= "\u137f"]
+    return len(et) / len(non_ws)
+
 
 def clean_extracted_text(text: str) -> str:
     text = text.replace("\x00", " ")
@@ -49,9 +58,36 @@ def extract_text_from_file(path: Path) -> str:
     if suffix in (".txt", ".md"):
         return clean_extracted_text(path.read_text(encoding="utf-8", errors="ignore"))
     if suffix == ".pdf":
-        from pdfminer.high_level import extract_text as pdf_extract_text
+        raw = ""
+        # Prefer pdfminer (good for true text-layer PDFs), fall back to PyMuPDF (often better layout).
+        pdfminer_err: Exception | None = None
+        fitz_err: Exception | None = None
+        try:
+            from pdfminer.high_level import extract_text as pdf_extract_text
 
-        raw = pdf_extract_text(str(path)) or ""
+            raw = pdf_extract_text(str(path)) or ""
+        except Exception as exc:
+            pdfminer_err = exc
+            raw = ""
+        if not raw.strip():
+            try:
+                import fitz  # PyMuPDF
+
+                doc = fitz.open(str(path))
+                parts: list[str] = []
+                for page in doc:
+                    parts.append(page.get_text("text") or "")
+                raw = "\n".join(parts)
+            except Exception as exc:
+                fitz_err = exc
+                raw = raw or ""
+        if not raw.strip() and (pdfminer_err or fitz_err):
+            msg = f"PDF extraction failed for {path.name}."
+            if pdfminer_err:
+                msg += f" pdfminer: {pdfminer_err!r}."
+            if fitz_err:
+                msg += f" PyMuPDF: {fitz_err!r}."
+            raise RuntimeError(msg)
         return clean_extracted_text(raw)
     if suffix == ".docx":
         import docx
@@ -150,6 +186,15 @@ def main() -> None:
             if len(text) < 50:
                 print(
                     f"Skip (too little text — scanned PDF?): {path.name}",
+                    file=sys.stderr,
+                )
+                continue
+            # Guard: legacy-font PDFs often extract as mostly ASCII/cid garbage.
+            # Embedding that text destroys retrieval quality, so skip and ask for OCR/unicode PDF.
+            ratio = _ethiopic_ratio(text)
+            if len(text) > 500 and ratio < 0.05:
+                print(
+                    f"Skip (likely legacy-font / bad extraction; Ethiopic ratio {ratio:.1%}): {path.name}",
                     file=sys.stderr,
                 )
                 continue

@@ -741,7 +741,9 @@ def generate_rag_response(query_text: str, phone_number: str, session_id: str):
             return resp, "kb_unavailable", [], nlu.to_dict()
 
         # Keep Chroma behavior unchanged; just use retrieval hint if available.
-        retrieval_query = (retrieval_queries[0] if retrieval_queries else (nlu.retrieval_query or query_text))
+        retrieval_query = (
+            retrieval_queries[0] if retrieval_queries else (nlu.retrieval_query or query_text)
+        )
         results = collection.query(query_texts=[retrieval_query], n_results=2)
 
         if not results["documents"] or not results["documents"][0]:
@@ -925,8 +927,8 @@ async def system_check():
             results["stt_service"] = "disabled"
         else:
             stt_check = stt_base.rstrip("/") + "/docs"
-            resp = requests.get(stt_check, timeout=3)
-            results["stt_service"] = "ok" if resp.status_code == 200 else f"status {resp.status_code}"
+        resp = requests.get(stt_check, timeout=3)
+        results["stt_service"] = "ok" if resp.status_code == 200 else f"status {resp.status_code}"
     except Exception as e:
         results["stt_service"] = f"error: {e}"
 
@@ -936,8 +938,8 @@ async def system_check():
             results["tts_service"] = "disabled"
         else:
             tts_check = tts_base.replace("/synthesize", "").rstrip("/") + "/docs"
-            resp = requests.get(tts_check, timeout=3)
-            results["tts_service"] = "ok" if resp.status_code == 200 else f"status {resp.status_code}"
+        resp = requests.get(tts_check, timeout=3)
+        results["tts_service"] = "ok" if resp.status_code == 200 else f"status {resp.status_code}"
     except Exception as e:
         results["tts_service"] = f"error: {e}"
 

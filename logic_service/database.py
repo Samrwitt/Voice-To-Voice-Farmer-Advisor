@@ -7,8 +7,8 @@ import os
 # Initialize Vector DB for RAG
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 chroma_client = chromadb.PersistentClient(path=os.path.join(DATA_DIR, "chroma_db"))
-# Using a lightweight sentence transformer for embeddings
-sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="paraphrase-multilingual-MiniLM-L12-v2")
+# Using an Amharic-optimized sentence transformer for embeddings
+sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="rasyosef/roberta-amharic-text-embedding-base")
 
 collection = chroma_client.get_or_create_collection(name="agronomy_kb", embedding_function=sentence_transformer_ef)
 

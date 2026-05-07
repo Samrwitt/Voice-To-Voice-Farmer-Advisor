@@ -13,5 +13,7 @@ langchain-community
 requests
 bcrypt
 pdfminer.six
+PyMuPDF>=1.23.0
 python-docx
+pytest
 # torch is installed CPU-only in the Dockerfile via --no-deps
