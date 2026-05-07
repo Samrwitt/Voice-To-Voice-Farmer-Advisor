@@ -343,3 +343,34 @@ strong {
   font-weight: 800;
   direction: auto;
 }
+.utterance-rag {
+  margin-top: 8px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: #fff9e6;
+  border-left: 4px solid var(--accent);
+  font-weight: 600;
+  line-height: 1.6;
+  direction: auto;
+}
+
+.utterance-tts {
+  margin-top: 10px;
+}
+
+.utterance-tts a {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  text-decoration: none;
+  background: var(--primary);
+  color: white;
+  padding: 6px 12px;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.utterance-tts a:hover {
+  background: #24573e;
+}

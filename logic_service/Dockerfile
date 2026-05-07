@@ -3,11 +3,11 @@ WORKDIR /app
 
 COPY requirements-common.txt .
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -r requirements-common.txt
+    pip install --default-timeout=100 --retries=10 -r requirements-common.txt
 
 COPY logic_service/requirements.txt .
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -r requirements.txt
+    pip install --default-timeout=100 --retries=10 -r requirements.txt
 
 COPY logic_service/ /app/
 

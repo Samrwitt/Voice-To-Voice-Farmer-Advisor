@@ -15,7 +15,7 @@ from database import (
     get_conversation_history, get_market_price, register_farmer,
     get_farmer_profile, get_alerts_for_region, set_session_state,
     get_session_state, insert_call_record,
-    init_db, seed_default_admin,
+    init_db, seed_default_admin, init_kb,
 )
 from migrate_sqlite import migrate_sqlite_to_postgres
 
@@ -24,7 +24,26 @@ logger = logging.getLogger("logic_service")
 
 RAG_SERVICE_URL = os.environ.get("RAG_SERVICE_URL", "").strip().rstrip("/")
 
-app = FastAPI()
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Bootstrap logic in background thread
+    def _init_bg():
+        try:
+            init_db()
+            migrate_sqlite_to_postgres()
+            seed_default_admin()
+            init_kb()
+            logger.info("Postgres, Admin, and KB initialized for logic_service.")
+        except Exception as exc:
+            logger.error("Logic service background bootstrap failed: %s", exc)
+
+    import threading
+    threading.Thread(target=_init_bg, daemon=True).start()
+    yield
+
+app = FastAPI(lifespan=lifespan)
 
 # Allow the admin dashboard (any origin in dev; tighten for prod)
 app.add_middleware(
@@ -34,18 +53,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-@app.on_event("startup")
-def _startup_db():
-    """Bootstrap Postgres schema, migrate any legacy SQLite data, and seed admin."""
-    try:
-        init_db()
-        migrate_sqlite_to_postgres()
-        seed_default_admin()
-        logger.info("Postgres initialized for logic_service.")
-    except Exception as exc:
-        logger.error("Database bootstrap failed: %s", exc)
 
 
 @app.exception_handler(Exception)

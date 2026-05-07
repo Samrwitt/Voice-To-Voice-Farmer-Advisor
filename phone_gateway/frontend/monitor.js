@@ -94,6 +94,8 @@ function renderMonitor(data) {
   const hasAudio = Number(call.audio_chunks || 0) > 0;
   const hasUtterance = utterances.length > 0;
   const hasTranscript = transcripts.length > 0;
+  const hasRag = utterances.some(u => u.rag_response);
+  const hasTts = utterances.some(u => u.tts_url);
 
   const vadStatus = call.vad_status || "waiting";
 
@@ -140,7 +142,10 @@ function renderMonitor(data) {
     hasAudio,
     hasVad,
     hasUtterance,
+    hasUtterance,
     hasTranscript,
+    hasRag,
+    hasTts,
     transcripts,
     utterances,
   });
@@ -201,6 +206,18 @@ function renderPipeline({
       ? `${transcripts.length} transcript(s) ready`
       : "No transcript yet"
   );
+
+  setStep(
+    "stepRag",
+    hasRag ? "success" : (hasTranscript ? "active" : null),
+    hasRag ? "Answer generated" : (hasTranscript ? "Retrieving from KB..." : "Waiting")
+  );
+
+  setStep(
+    "stepTts",
+    hasTts ? "success" : (hasRag ? "active" : null),
+    hasTts ? "Audio synthesized" : (hasRag ? "Synthesizing voice..." : "Waiting")
+  );
 }
 
 function renderUtterances(utterances) {
@@ -227,7 +244,35 @@ function renderUtterances(utterances) {
 
           ${
             item.transcript
-              ? `<div class="utterance-transcript">${item.transcript}</div>`
+              ? `<div class="utterance-transcript"><strong>ASR:</strong> ${item.transcript}</div>`
+              : ""
+          }
+
+          ${
+            item.rag_response
+              ? `<div class="utterance-rag">
+                   <strong>RAG Answer:</strong> ${item.rag_response}
+                   ${
+                     item.rag_references && item.rag_references.length > 0
+                       ? `<div class="rag-sources">
+                            <hr style="opacity:0.2; margin: 8px 0;">
+                            <small>Sources:</small>
+                            ${item.rag_references.map(ref => `
+                              <div class="rag-source-item" style="font-size: 12px; margin-bottom: 4px;">
+                                📄 <strong>${ref.title || "Untitled Document"}</strong>
+                                <span style="opacity:0.7;">(dist: ${Number(ref.distance).toFixed(3)})</span>
+                              </div>
+                            `).join("")}
+                          </div>`
+                       : ""
+                   }
+                 </div>`
+              : ""
+          }
+
+          ${
+            item.tts_url
+              ? `<div class="utterance-tts"><a href="${item.tts_url}" target="_blank">🔊 Play TTS Response</a></div>`
               : ""
           }
         </div>

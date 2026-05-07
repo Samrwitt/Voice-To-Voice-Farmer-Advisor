@@ -104,6 +104,7 @@ class AssignEscalationRequest(BaseModel):
 
 class EscalationResponseRequest(BaseModel):
     answer: str
+    expert_notes: Optional[str] = None
 
 
 class KBDocumentUpdate(BaseModel):
@@ -603,9 +604,13 @@ def _escalation_dict(e: Escalation, db: Session) -> dict:
         "phone_number": e.phone_number,
         "session_id": e.session_id,
         "status": e.status,
+        "reason_code": e.reason_code,
+        "confidence": round(e.confidence, 4) if e.confidence is not None else None,
+        "entities": e.entities,
         "assigned_to": assignee,
         "assigned_at": _isoformat(e.assigned_at),
         "expert_response": e.expert_response,
+        "expert_notes": e.expert_notes,
         "answered_at": _isoformat(e.answered_at),
         "closed_at": _isoformat(e.closed_at),
         "timestamp": _isoformat(e.created_at),
@@ -683,6 +688,8 @@ def respond_escalation(
         raise HTTPException(status_code=403, detail="This case is not assigned to you")
 
     esc.expert_response = req.answer
+    if req.expert_notes is not None:
+        esc.expert_notes = req.expert_notes
     esc.answered_at = datetime.utcnow()
     esc.status = "answered"
     esc.updated_at = datetime.utcnow()

@@ -155,6 +155,43 @@ def generate_rag_response(query_text: str, phone_number: str, session_id: str):
     logger.info(f"Processing query for session={session_id} phone={phone_number}: '{query_text}'")
     log_conversation(phone_number, session_id, "user", query_text)
 
+    # ── Expert Response Check ─────────────────────────────────────────────────
+    # If a previous escalation was answered but not yet delivered, deliver it now.
+    import rag_pg
+    if rag_pg.kb_pg_enabled():
+        try:
+            import psycopg
+            with psycopg.connect(rag_pg.POSTGRES_URL) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT id, query, expert_response FROM escalations WHERE phone_number = %s AND status = 'answered' ORDER BY created_at ASC LIMIT 1",
+                        (phone_number,)
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        esc_id, orig_query, expert_resp = row
+                        cur.execute("UPDATE escalations SET status = 'closed', closed_at = NOW() WHERE id = %s", (esc_id,))
+                        conn.commit()
+                        
+                        resp = f"ቀደም ብለው ስለ '{orig_query}' ላቀረቡት ጥያቄ የባለሙያ ምላሽ አለኝ፡ {expert_resp}\n\nአሁን ደግሞ ስለ አዲሱ ጥያቄዎ ልርዳዎት።"
+                        # We return early or just prepend? Prepending is better so we still answer the current query.
+                        # But for simplicity in a voice UI, let's deliver the answer first.
+                        # Actually, let's just deliver it and then let the user ask again, 
+                        # or just prepend. Prepending is better for latency.
+                        current_resp, intent, refs, nlu = _generate_core_rag_response(query_text, phone_number, session_id)
+                        return f"{resp}\n\n{current_resp}", intent, refs, nlu
+        except Exception as exc:
+            logger.error(f"Failed to check for expert responses: {exc}")
+
+    return _generate_core_rag_response(query_text, phone_number, session_id)
+
+
+def _generate_core_rag_response(query_text: str, phone_number: str, session_id: str):
+    """
+    Returns (response_text, intent, references, nlu_dict).
+    - intent: outcome label for routing (often same as NLU primary_intent for KB turns).
+    - nlu_dict: { primary_intent, confidence, entities } from analyze_intent.
+    """
     # ── Language Check ────────────────────────────────────────────────────────
     if query_text.strip() and not is_amharic(query_text):
         resp = "እባክዎ ጥያቄዎን በአማርኛ ይናገሩ።"  # Please ask your question in Amharic.
@@ -167,7 +204,18 @@ def generate_rag_response(query_text: str, phone_number: str, session_id: str):
     # ── Farmer Profile & Context ──────────────────────────────────────────────
     profile = get_farmer_profile(phone_number)
     farmer_location = profile['location'] if profile else "Unknown"
-    user_context = f"Farmer Location: {farmer_location}. " if profile else ""
+    
+    # Identify the relevant region for RAG filtering
+    # Priority: 1. NLU extracted region, 2. Profile region
+    user_region = nlu.entities.get("region_en")
+    if not user_region and profile:
+        # Map profile location to a region keyword if possible
+        loc = str(profile.get('location', '')).lower()
+        if any(k in loc for k in ["highland", "ደጋ"]): user_region = "highland"
+        elif any(k in loc for k in ["lowland", "ቆላ"]): user_region = "lowland"
+        elif any(k in loc for k in ["midland", "ወይና"]): user_region = "midland"
+
+    user_context = f"Farmer Location: {farmer_location}. Region: {user_region or 'General'}. " if profile else ""
 
     # ── Active Alerts ─────────────────────────────────────────────────────────
     alerts = get_alerts_for_region(farmer_location)
@@ -205,6 +253,23 @@ def generate_rag_response(query_text: str, phone_number: str, session_id: str):
         set_session_state(session_id, "awaiting_slot", query_text)
         log_conversation(phone_number, session_id, "assistant", clarification)
         return clarification, "awaiting_slot", [], nlu.to_dict()
+
+    # ── Complex Query Escalation ──────────────────────────────────────────────
+    sensitive_intents = {"pest_disease", "soil_fertility", "crop_production"}
+    if nlu.primary_intent in sensitive_intents and nlu.confidence < 0.6:
+        logger.warning(f"Complex query detected (intent={nlu.primary_intent} conf={nlu.confidence}). Escalating.")
+        add_to_escalation(
+            query_text,
+            f"Complex {nlu.primary_intent} query with low NLU confidence ({nlu.confidence:.2f}).",
+            phone_number=phone_number,
+            session_id=session_id,
+            reason_code="COMPLEX_QUERY",
+            confidence=nlu.confidence,
+            entities=nlu.entities,
+        )
+        resp = "ይህ ጥያቄ ዝርዝር መረጃ ስለሚያስፈልገው ለግብርና ባለሙያ አስተላልፌዋለሁ። በቅርቡ መልስ ያገኛሉ።"
+        log_conversation(phone_number, session_id, "assistant", resp)
+        return resp, "escalated_complex", [], nlu.to_dict()
 
     # ── Market Price Intent ───────────────────────────────────────────────────
     if nlu.primary_intent == "market_price":
@@ -280,7 +345,10 @@ def generate_rag_response(query_text: str, phone_number: str, session_id: str):
     if use_pg:
         # Pull more candidates then rerank with keyword overlap.
         hits, closest_distance = rag_pg.retrieve_for_query(
-            retrieval_query, top_k=12, max_l2_distance=RAG_PG_MAX_L2_DISTANCE
+            retrieval_query, 
+            top_k=12, 
+            max_l2_distance=RAG_PG_MAX_L2_DISTANCE,
+            region=user_region
         )
         if not hits:
             logger.warning(
@@ -291,6 +359,11 @@ def generate_rag_response(query_text: str, phone_number: str, session_id: str):
             add_to_escalation(
                 query_text,
                 f"PG RAG: no chunk within L2 {RAG_PG_MAX_L2_DISTANCE} (best={closest_distance:.3f}).",
+                phone_number=phone_number,
+                session_id=session_id,
+                reason_code="LOW_CONFIDENCE",
+                confidence=closest_distance,
+                entities=nlu.entities,
             )
             resp = "ይቅርታ፣ ይህንን ጥያቄ ሙሉ በሙሉ ልመልስ አልቻልኩም። ለባለሙያ አስተላልፌዋለሁ።"
             log_conversation(phone_number, session_id, "assistant", resp)
@@ -342,7 +415,13 @@ def generate_rag_response(query_text: str, phone_number: str, session_id: str):
                 RAG_DISTANCE_THRESHOLD,
             )
             add_to_escalation(
-                query_text, f"Chroma distance: {closest_distance:.2f}. No confident KB match."
+                query_text, 
+                f"Chroma distance: {closest_distance:.2f}. No confident KB match.",
+                phone_number=phone_number,
+                session_id=session_id,
+                reason_code="LOW_CONFIDENCE",
+                confidence=closest_distance,
+                entities=nlu.entities,
             )
             resp = "ይቅርታ፣ ይህንን ጥያቄ ሙሉ በሙሉ ልመልስ አልቻልኩም። ለባለሙያ አስተላልፌዋለሁ።"
             log_conversation(phone_number, session_id, "assistant", resp)

@@ -128,12 +128,59 @@ def init_db():
     conn.commit()
     conn.close()
 
-def add_to_escalation(query: str, context: str):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("INSERT INTO escalated_queries (query, context) VALUES (?, ?)", (query, context))
-    conn.commit()
-    conn.close()
+POSTGRES_URL = os.environ.get("POSTGRES_URL", "").strip()
+
+def add_to_escalation(
+    query: str,
+    context: str,
+    phone_number: str = None,
+    session_id: str = None,
+    reason_code: str = None,
+    confidence: float = None,
+    entities: dict = None,
+):
+    if not POSTGRES_URL:
+        # Fallback to legacy SQLite if Postgres is not configured
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("INSERT INTO escalated_queries (query, context) VALUES (?, ?)", (query, context))
+        conn.commit()
+        conn.close()
+        return
+
+    try:
+        import psycopg
+        with psycopg.connect(POSTGRES_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO escalations 
+                    (query, context, phone_number, session_id, reason_code, confidence, entities, status, created_at, updated_at) 
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                    """,
+                    (
+                        query,
+                        context,
+                        phone_number,
+                        session_id,
+                        reason_code,
+                        confidence,
+                        json.dumps(entities) if entities else None,
+                        "pending"
+                    ),
+                )
+            conn.commit()
+    except Exception as exc:
+        print(f"[DB] add_to_escalation (Postgres) failed: {exc}")
+        # Fallback to local SQLite so the query isn't lost
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("INSERT INTO escalated_queries (query, context) VALUES (?, ?)", (query, f"[PG-FAIL] {context}"))
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
 
 def log_conversation(phone_number: str, session_id: str, role: str, message: str):
     conn = sqlite3.connect(DB_PATH)

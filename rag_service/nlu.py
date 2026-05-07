@@ -30,7 +30,20 @@ CROP_KEYWORDS: dict[str, str] = {
     "coffee": "Coffee",
 }
 
+REGION_KEYWORDS: dict[str, str] = {
+    "ደጋ": "highland",
+    "highland": "highland",
+    "ቆላ": "lowland",
+    "lowland": "lowland",
+    "ወይና ደጋ": "midland",
+    "ወይናደጋ": "midland",
+    "midland": "midland",
+    "መስኖ": "irrigated",
+    "irrigation": "irrigated",
+}
+
 CROP_ENTITY_WORDS = set(CROP_KEYWORDS.keys())
+REGION_ENTITY_WORDS = set(REGION_KEYWORDS.keys())
 
 MARKET_KEYWORDS = [
     "ዋጋ",
@@ -213,6 +226,17 @@ def _extract_crop_entities(text: str) -> dict[str, Any]:
     return out
 
 
+def _extract_region_entities(text: str) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    lower = text.lower()
+    for kw, reg_en in REGION_KEYWORDS.items():
+        if kw in lower or kw in text:
+            out["region_en"] = reg_en
+            out["region_keyword"] = kw
+            break
+    return out
+
+
 def analyze_intent(text: str) -> NLUResult:
     """
     Classify farmer question intent and build a retrieval query
@@ -223,6 +247,7 @@ def analyze_intent(text: str) -> NLUResult:
         return NLUResult("unknown", 0.0, {}, "")
 
     entities = _extract_crop_entities(stripped)
+    entities.update(_extract_region_entities(stripped))
     lower = stripped.lower()
 
     # Market price (separate data path in main)
@@ -298,7 +323,16 @@ def needs_slot_filling(text: str, session_state: Optional[dict], nlu: NLUResult)
     lower = text.lower()
     has_agri = any(k in lower or k in text for k in AGRI_INTENT_KEYWORDS)
     has_crop = any(k in lower or k in text for k in CROP_ENTITY_WORDS)
+    has_region = any(k in lower or k in text for k in REGION_ENTITY_WORDS)
 
+    # 1. Check for missing Crop
     if has_agri and not has_crop:
         return "ለምን ሰብል ነው ጥያቄዎ? (ስንዴ፣ ጤፍ፣ ቦሎቄ፣ ወዘተ.)"
+    
+    # 2. Check for missing Region on region-dependent questions
+    # (Planting and soil production are highly region-dependent)
+    region_critical_intents = {"crop_production", "soil_fertility"}
+    if nlu.primary_intent in region_critical_intents and not has_region:
+        return "ለየትኛው አካባቢ ነው የሚፈልጉት? (ደጋ፣ ቆላ ወይም ወይና ደጋ)"
+    
     return None

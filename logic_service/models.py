@@ -143,6 +143,12 @@ class Escalation(Base):
     status = Column(String, nullable=False, default="pending", index=True)
     # pending | assigned | answered | closed
 
+    reason_code = Column(String, nullable=True, index=True)
+    # LOW_CONFIDENCE | COMPLEX_QUERY | SAFETY_GUARDRAIL | USER_REQUESTED
+
+    confidence = Column(Float, nullable=True)
+    entities = Column(JSON, nullable=True)
+
     assigned_to_user_id = Column(
         String,
         ForeignKey("dashboard_users.user_id"),
@@ -152,6 +158,7 @@ class Escalation(Base):
     assigned_at = Column(DateTime, nullable=True)
 
     expert_response = Column(Text, nullable=True)
+    expert_notes = Column(Text, nullable=True)
     answered_at = Column(DateTime, nullable=True)
     closed_at = Column(DateTime, nullable=True)
 

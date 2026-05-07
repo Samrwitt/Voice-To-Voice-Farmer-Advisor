@@ -6,6 +6,8 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 
 from vad_engine import SileroStreamingVAD
 from asr_client import transcribe_utterance_file
+from rag_client import get_rag_answer
+from tts_client import synthesize_speech
 
 
 app = FastAPI(title="Silero VAD Service")
@@ -142,6 +144,95 @@ async def handle_completed_utterance(
             f"transcript={asr_result.get('transcript')}",
             flush=True,
         )
+
+        # ── RAG Step ────────────────────────────────────────────────────────
+        transcript = asr_result.get("transcript")
+        if not transcript:
+            return
+
+        await safe_send_json(
+            websocket,
+            send_lock,
+            {
+                "event": "rag_started",
+                "session_id": session_id,
+                "utterance_path": utterance_path,
+                "message": "Retrieving answer from Knowledge Base...",
+            },
+        )
+
+        rag_result = await get_rag_answer(
+            text=transcript,
+            session_id=session_id
+        )
+
+        rag_answer = rag_result.get("response")
+
+        await safe_send_json(
+            websocket,
+            send_lock,
+            {
+                "event": "rag_answer",
+                "session_id": session_id,
+                "utterance_path": utterance_path,
+                "response": rag_answer,
+                "references": rag_result.get("references"),
+                "message": "RAG answer generated",
+            },
+        )
+
+        print(
+            f"[RAG DONE] session={session_id}, "
+            f"file={utterance_path}, "
+            f"response={rag_answer[:50]}...",
+            flush=True,
+        )
+
+        # ── TTS Step ─────────────────────────────────────────────────────────
+        if not rag_answer:
+            return
+
+        await safe_send_json(
+            websocket,
+            send_lock,
+            {
+                "event": "tts_started",
+                "session_id": session_id,
+                "utterance_path": utterance_path,
+                "message": "Synthesizing voice response...",
+            },
+        )
+
+        tts_path = await synthesize_speech(
+            text=rag_answer,
+            utterance_path=utterance_path
+        )
+
+        if tts_path:
+            # We need to tell the gateway a URL it can serve.
+            # Gateway will serve /utterances/ as a static directory.
+            # So we return the relative path.
+            tts_filename = os.path.basename(tts_path)
+            tts_url = f"/static/utterances/{tts_filename}"
+
+            await safe_send_json(
+                websocket,
+                send_lock,
+                {
+                    "event": "tts_ready",
+                    "session_id": session_id,
+                    "utterance_path": utterance_path,
+                    "tts_url": tts_url,
+                    "message": "TTS synthesis completed",
+                },
+            )
+
+            print(
+                f"[TTS DONE] session={session_id}, "
+                f"file={utterance_path}, "
+                f"tts_url={tts_url}",
+                flush=True,
+            )
 
     except Exception as e:
         await safe_send_json(

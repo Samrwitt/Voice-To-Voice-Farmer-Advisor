@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 def _iter_files(folder: Path) -> list[Path]:
-    exts = (".pdf", ".docx", ".txt", ".md")
+    exts = (".pdf", ".docx", ".txt", ".md", ".jsonl")
     out: list[Path] = []
     for ext in exts:
         out.extend(folder.glob(f"*{ext}"))
@@ -68,11 +68,47 @@ def auto_ingest_if_empty() -> dict:
 
     max_files = int(os.getenv("AUTO_INGEST_MAX_FILES", "50"))
     batch_size = int(os.getenv("EMBED_BATCH_SIZE", "16"))
-
     ingested = 0
     for p in files:
         if ingested >= max_files:
             break
+        
+        if p.suffix.lower() == ".jsonl":
+            import json
+            with open(p, "r", encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip(): continue
+                    item = json.loads(line)
+                    text = item.get("text_am") or item.get("text")
+                    if not text or len(text.strip()) < 20: continue
+                    
+                    doc_uuid = uuid.uuid4()
+                    external_id = f"jsonl:{p.name}:{item.get('id', uuid.uuid4())}"
+                    title = item.get("title") or f"KB Item {item.get('id')}"
+                    
+                    with psycopg.connect(rag_pg.POSTGRES_URL, autocommit=False) as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """
+                                INSERT INTO rag_kb_documents
+                                    (id, external_document_id, title, source_org, source_url, language, status, original_filename, extra)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb);
+                                """,
+                                (doc_uuid, external_id, title, "kb_jsonl", None, "am", "approved", p.name, json.dumps(item)),
+                            )
+                            
+                            chunks = rag_pg.chunk_amharic_text(text)
+                            embeddings = rag_pg.embed_texts(chunks, batch_size=batch_size)
+                            for j, emb in enumerate(embeddings):
+                                lit = "[" + ",".join(f"{x:.8f}" for x in emb) + "]"
+                                cur.execute(
+                                    "INSERT INTO rag_kb_chunks (document_id, chunk_index, content, embedding) VALUES (%s, %s, %s, %s::vector);",
+                                    (doc_uuid, j, chunks[j], lit),
+                                )
+                            conn.commit()
+            ingested += 1
+            continue
+
         raw = extract_text_from_file(p)
         text = re.sub(r"\s+", " ", (raw or "").strip())
         if len(text) < 80:

@@ -3,11 +3,11 @@ WORKDIR /app
 
 COPY requirements-common.txt /app/requirements-common.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -r /app/requirements-common.txt
+    pip install --default-timeout=100 --retries=10 -r /app/requirements-common.txt
 
 COPY phone_gateway/backend/requirements.txt /app/backend/requirements.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -r /app/backend/requirements.txt
+    pip install --default-timeout=100 --retries=10 -r /app/backend/requirements.txt
 
 COPY phone_gateway/backend /app/backend
 COPY phone_gateway/frontend /app/frontend

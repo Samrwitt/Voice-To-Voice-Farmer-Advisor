@@ -1,11 +1,13 @@
 srs_text.txt
 extract_pdf.py
 Compiled SRS.pdf
+Compiled SRS.txt
+Compiled SDS.txt
 Compiled SDS.pdf
 setup_dev.ps1
 start_dev.ps1
 dev_requirements.txt
-
+Revised G8 Project Proposal.txt
 # Dev environment
 .venv/
 __pycache__/
@@ -18,7 +20,6 @@ models/asr/
 *.safetensors
 Revised G8 Project Proposal.pdf
 bdu_rtx4060_8khz_augmented.ipynb
-
 
 srs_text.txt
 extract_pdf.py
@@ -36,5 +37,7 @@ __pycache__/
 *.wav
 data/
 models/asr/
+models/
+
 *.bin
 *.safetensors

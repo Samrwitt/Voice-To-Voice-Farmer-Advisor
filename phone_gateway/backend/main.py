@@ -24,6 +24,8 @@ from backend.monitor_state import (
     update_vad_status,
     add_utterance,
     update_utterance_transcript,
+    update_utterance_rag,
+    update_utterance_tts,
     end_call_monitor,
     add_event,
     get_monitor_state,
@@ -87,6 +89,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 FRONTEND_DIR = BASE_DIR / "frontend"
 
 app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
+app.mount("/static/utterances", StaticFiles(directory="/app/utterances"), name="utterances")
 
 
 # ============================================================
@@ -570,6 +573,27 @@ async def forward_vad_events_to_browser(vad_ws, browser_ws: WebSocket):
                 )
 
                 save_asr_transcript_to_db(data)
+            
+            # ------------------------------------------------------------
+            # RAG Answer ready
+            # ------------------------------------------------------------
+            elif event_name == "rag_answer":
+                response_text = data.get("response") or data.get("answer")
+                utterance_path = data.get("utterance_path")
+                references = data.get("references")
+                
+                if response_text and utterance_path:
+                    update_utterance_rag(utterance_path, response_text, references)
+
+            # ------------------------------------------------------------
+            # TTS audio ready
+            # ------------------------------------------------------------
+            elif event_name == "tts_ready":
+                tts_url = data.get("tts_url") or data.get("audio_url")
+                utterance_path = data.get("utterance_path")
+
+                if tts_url and utterance_path:
+                    update_utterance_tts(utterance_path, tts_url)
 
             # ------------------------------------------------------------
             # ASR error

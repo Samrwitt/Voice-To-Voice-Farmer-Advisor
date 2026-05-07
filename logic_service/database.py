@@ -79,9 +79,34 @@ collection = _LazyCollectionProxy()
 
 
 def init_kb():
-    """Seed the Chroma collection from mock_kb.json on first boot."""
+    """Seed the Chroma collection from JSONL or mock_kb.json on first boot."""
     collection = get_kb_collection()
     if collection.count() == 0:
+        jsonl_path = "kb_merged_same_structure.jsonl"
+        if os.path.exists(jsonl_path):
+            documents, metadatas, ids = [], [], []
+            with open(jsonl_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    item = json.loads(line)
+                    text = item.get("text_am") or item.get("text")
+                    if not text:
+                        continue
+                    documents.append(text)
+                    # Extract all other fields as metadata
+                    meta = {k: v for k, v in item.items() if k not in ["text_am", "text", "id"]}
+                    # Ensure intent is present for backward compatibility
+                    if "intent" not in meta:
+                        meta["intent"] = item.get("crop", "general")
+                    metadatas.append(meta)
+                    ids.append(str(item.get("id") or len(ids)))
+            
+            if documents:
+                collection.add(documents=documents, metadatas=metadatas, ids=ids)
+                print(f"[KB] Knowledge Base initialized from {jsonl_path} ({len(documents)} docs)")
+                return
+
         if os.path.exists("mock_kb.json"):
             with open("mock_kb.json", "r", encoding="utf-8") as f:
                 kb_data = json.load(f)
@@ -94,7 +119,7 @@ def init_kb():
                 ids.append(str(i))
             if documents:
                 collection.add(documents=documents, metadatas=metadatas, ids=ids)
-                print("[KB] Knowledge Base initialised from mock_kb.json")
+                print("[KB] Knowledge Base initialized from mock_kb.json")
 
 
 # ── Postgres schema bootstrap ────────────────────────────────────────────────
@@ -156,6 +181,9 @@ def add_to_escalation(
     context: str,
     phone_number: Optional[str] = None,
     session_id: Optional[str] = None,
+    reason_code: Optional[str] = None,
+    confidence: Optional[float] = None,
+    entities: Optional[dict] = None,
 ):
     db = SessionLocal()
     try:
@@ -164,6 +192,9 @@ def add_to_escalation(
             context=context,
             phone_number=phone_number,
             session_id=session_id,
+            reason_code=reason_code,
+            confidence=confidence,
+            entities=entities,
             status="pending",
         )
         db.add(esc)
@@ -394,5 +425,4 @@ def insert_call_record(
         db.close()
 
 
-# ── Module init (called once on FastAPI startup from main.py) ────────────────
-init_kb()
+# init_kb() called from main.py startup event
