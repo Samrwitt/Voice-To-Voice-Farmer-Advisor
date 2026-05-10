@@ -1,16 +1,17 @@
-FROM python:3.12-slim
-
+FROM python:3.11-slim
 WORKDIR /app
 
-COPY backend/requirements.txt /app/backend/requirements.txt
+COPY requirements-common.txt /app/requirements-common.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r /app/requirements-common.txt
 
-RUN pip install --no-cache-dir -r /app/backend/requirements.txt
+COPY phone_gateway/backend/requirements.txt /app/backend/requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r /app/backend/requirements.txt
 
-COPY backend /app/backend
-COPY frontend /app/frontend
+COPY phone_gateway/backend /app/backend
+COPY phone_gateway/frontend /app/frontend
 
 RUN mkdir -p /app/recordings/audio
-
 EXPOSE 8000
-
 CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]

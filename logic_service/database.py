@@ -1,228 +1,398 @@
+"""
+Logic-service data layer.
+
+Postgres-backed via SQLAlchemy (db.py) and Chroma for vector search.
+Public CRUD helpers preserve the original signatures used by main.py so the
+RAG pipeline keeps working.
+"""
+import json
+import os
+from datetime import datetime
+from typing import Optional
+
 import chromadb
 from chromadb.utils import embedding_functions
-import json
-import sqlite3
-import os
+from sqlalchemy import desc, func, select
 
-# Initialize Vector DB for RAG
+from db import Base, SessionLocal, engine
+from models import (
+    Alert,
+    CallRecord,
+    ConversationMessage,
+    DashboardUser,
+    Escalation,
+    FarmerKB,
+    MarketPrice,
+    SessionState,
+)
+from auth import hash_password
+
+
+# ── Chroma (RAG vector DB) ────────────────────────────────────────────────────
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 chroma_client = chromadb.PersistentClient(path=os.path.join(DATA_DIR, "chroma_db"))
-# Using a lightweight sentence transformer for embeddings
-sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="paraphrase-multilingual-MiniLM-L12-v2")
 
-collection = chroma_client.get_or_create_collection(name="agronomy_kb", embedding_function=sentence_transformer_ef)
+_collection = None
+
+
+def get_kb_collection():
+    """
+    Lazily initialize the Chroma collection.
+
+    This avoids blocking service startup on HuggingFace downloads in constrained
+    environments; if embedding init fails, we still let the API boot so admin
+    endpoints work.
+    """
+    global _collection
+    if _collection is not None:
+        return _collection
+
+    try:
+        ef = embedding_functions.SentenceTransformerEmbeddingFunction(
+            model_name=os.getenv(
+                "CHROMA_EMBEDDING_MODEL",
+                "paraphrase-multilingual-MiniLM-L12-v2",
+            ),
+        )
+        _collection = chroma_client.get_or_create_collection(
+            name="agronomy_kb",
+            embedding_function=ef,
+        )
+    except Exception as exc:
+        # Create the collection without an embedding function; RAG operations
+        # requiring embeddings will fail later with a clearer error, but the
+        # admin dashboard stays usable.
+        print(f"[KB] Embedding init failed; starting without embeddings: {exc}")
+        _collection = chroma_client.get_or_create_collection(name="agronomy_kb")
+
+    return _collection
+
+
+class _LazyCollectionProxy:
+    def __getattr__(self, item):
+        return getattr(get_kb_collection(), item)
+
+
+# Backwards-compatible import for existing modules:
+#   from database import collection
+collection = _LazyCollectionProxy()
+
 
 def init_kb():
+    """Seed the Chroma collection from mock_kb.json on first boot."""
+    collection = get_kb_collection()
     if collection.count() == 0:
-        # Load mock KB
         if os.path.exists("mock_kb.json"):
             with open("mock_kb.json", "r", encoding="utf-8") as f:
                 kb_data = json.load(f)
-                
-            documents = []
-            metadatas = []
-            ids = []
-            
+            documents, metadatas, ids = [], [], []
             for i, (intent, response) in enumerate(kb_data.items()):
                 if intent == "unknown":
                     continue
-                # Mapping intent keywords to the Amharic response
                 documents.append(response)
                 metadatas.append({"intent": intent})
                 ids.append(str(i))
-                
-            collection.add(documents=documents, metadatas=metadatas, ids=ids)
-            print("Knowledge Base Initialized.")
+            if documents:
+                collection.add(documents=documents, metadatas=metadatas, ids=ids)
+                print("[KB] Knowledge Base initialised from mock_kb.json")
 
-DB_PATH = os.path.join(DATA_DIR, "advisor.db")
 
-# Initialize SQLite for all entities
+# ── Postgres schema bootstrap ────────────────────────────────────────────────
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    
-    # Escalated Queries
-    c.execute('''CREATE TABLE IF NOT EXISTS escalated_queries
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  query TEXT NOT NULL,
-                  context TEXT,
-                  status TEXT DEFAULT 'pending',
-                  timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+    """Create all tables defined on the SQLAlchemy Base."""
+    Base.metadata.create_all(bind=engine)
 
-    # Farmers Profile
-    c.execute('''CREATE TABLE IF NOT EXISTS farmers
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  phone_number TEXT UNIQUE NOT NULL,
-                  name TEXT,
-                  location TEXT,
-                  preferred_language TEXT DEFAULT 'am',
-                  registered_at DATETIME DEFAULT CURRENT_TIMESTAMP)''')
 
-    # Conversation History
-    c.execute('''CREATE TABLE IF NOT EXISTS conversation_history
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  phone_number TEXT,
-                  session_id TEXT NOT NULL,
-                  role TEXT NOT NULL,
-                  message TEXT NOT NULL,
-                  timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+def seed_default_admin():
+    """
+    Insert a default dashboard admin user if dashboard_users is empty.
 
-    # Market Prices
-    c.execute('''CREATE TABLE IF NOT EXISTS market_prices
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  crop_name TEXT NOT NULL,
-                  region TEXT NOT NULL,
-                  price REAL NOT NULL,
-                  unit TEXT NOT NULL,
-                  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+    Honours the same env vars used by phone_gateway/bootstrap.py:
+      DEFAULT_ADMIN_EMAIL    (default: admin@example.com)
+      DEFAULT_ADMIN_PASSWORD (default: admin123)
+      DEFAULT_ADMIN_NAME     (default: System Admin)
+      CREATE_DEFAULT_ADMIN   (default: true)
+      RESET_DEFAULT_ADMIN_PASSWORD (default: false)
+    """
+    if os.getenv("CREATE_DEFAULT_ADMIN", "true").lower() not in ("true", "1", "yes"):
+        return
 
-    # Admin Users
-    c.execute('''CREATE TABLE IF NOT EXISTS admin_users
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  username TEXT UNIQUE NOT NULL,
-                  password_hash TEXT NOT NULL,
-                  role TEXT NOT NULL,
-                  created_at DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+    email = os.getenv("DEFAULT_ADMIN_EMAIL", "admin@example.com")
+    password = os.getenv("DEFAULT_ADMIN_PASSWORD", "admin123")
+    name = os.getenv("DEFAULT_ADMIN_NAME", "System Admin")
+    reset = os.getenv("RESET_DEFAULT_ADMIN_PASSWORD", "false").lower() in ("true", "1", "yes")
 
-    # Alerts / Forecasts
-    c.execute('''CREATE TABLE IF NOT EXISTS alerts
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  target_region TEXT NOT NULL,
-                  alert_message TEXT NOT NULL,
-                  severity TEXT DEFAULT 'warning',
-                  created_at DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+    db = SessionLocal()
+    try:
+        existing = db.query(DashboardUser).filter(DashboardUser.email == email).first()
+        if existing:
+            if reset:
+                existing.password_hash = hash_password(password)
+                existing.role = "admin"
+                existing.is_active = True
+                db.commit()
+                print(f"[BOOTSTRAP] Reset password for default admin {email}.")
+            return
+        admin = DashboardUser(
+            full_name=name,
+            email=email,
+            password_hash=hash_password(password),
+            role="admin",
+            is_active=True,
+        )
+        db.add(admin)
+        db.commit()
+        print(f"[BOOTSTRAP] Default admin created: {email}")
+    except Exception as exc:
+        db.rollback()
+        print(f"[BOOTSTRAP] Default admin seeding failed: {exc}")
+    finally:
+        db.close()
 
-    # Session States (For Multi-turn / Safety Confirmations)
-    c.execute('''CREATE TABLE IF NOT EXISTS session_states
-                 (session_id TEXT PRIMARY KEY,
-                  current_state TEXT NOT NULL,
-                  pending_action TEXT,
-                  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)''')
 
-    # Call Records
-    c.execute('''CREATE TABLE IF NOT EXISTS call_records
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  session_id TEXT UNIQUE NOT NULL,
-                  phone_number TEXT NOT NULL,
-                  recording_path TEXT NOT NULL,
-                  duration INTEGER NOT NULL,
-                  timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+# ── Escalations ──────────────────────────────────────────────────────────────
+def add_to_escalation(
+    query: str,
+    context: str,
+    phone_number: Optional[str] = None,
+    session_id: Optional[str] = None,
+):
+    db = SessionLocal()
+    try:
+        esc = Escalation(
+            query=query,
+            context=context,
+            phone_number=phone_number,
+            session_id=session_id,
+            status="pending",
+        )
+        db.add(esc)
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        print(f"[DB] add_to_escalation failed: {exc}")
+    finally:
+        db.close()
 
-    conn.commit()
-    conn.close()
 
-def add_to_escalation(query: str, context: str):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("INSERT INTO escalated_queries (query, context) VALUES (?, ?)", (query, context))
-    conn.commit()
-    conn.close()
-
+# ── Conversation history ─────────────────────────────────────────────────────
 def log_conversation(phone_number: str, session_id: str, role: str, message: str):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("INSERT INTO conversation_history (phone_number, session_id, role, message) VALUES (?, ?, ?, ?)", 
-              (phone_number, session_id, role, message))
-    conn.commit()
-    conn.close()
+    db = SessionLocal()
+    try:
+        db.add(
+            ConversationMessage(
+                phone_number=phone_number,
+                session_id=session_id,
+                role=role,
+                message=message,
+            )
+        )
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        print(f"[DB] log_conversation failed: {exc}")
+    finally:
+        db.close()
+
 
 def get_conversation_history(session_id: str, limit: int = 5):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT role, message FROM conversation_history WHERE session_id = ? ORDER BY timestamp DESC LIMIT ?", (session_id, limit))
-    history = c.fetchall()
-    conn.close()
-    return list(reversed(history))
-
-def get_market_price(crop_name: str, region: str = None):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    if region:
-        c.execute(
-            "SELECT price, unit, updated_at FROM market_prices WHERE crop_name = ? AND region = ? ORDER BY updated_at DESC LIMIT 1",
-            (crop_name, region)
-        )
-    else:
-        c.execute(
-            "SELECT price, unit, updated_at FROM market_prices WHERE crop_name = ? ORDER BY updated_at DESC LIMIT 1",
-            (crop_name,)
-        )
-    result = c.fetchone()
-    conn.close()
-    return result  # (price, unit, updated_at) or None
-
-def register_farmer(phone_number: str, name: str, location: str, preferred_language: str = 'am'):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
+    """Returns a list of (role, message) tuples in chronological order."""
+    db = SessionLocal()
     try:
-        # SQLite UPSERT equivalent (since sqlite 3.24)
-        c.execute("INSERT INTO farmers (phone_number, name, location, preferred_language) VALUES (?, ?, ?, ?) ON CONFLICT(phone_number) DO UPDATE SET name=excluded.name, location=excluded.location, preferred_language=excluded.preferred_language", 
-                  (phone_number, name, location, preferred_language))
-        conn.commit()
-    except Exception as e:
-        print(f"Error registering farmer: {e}")
+        rows = (
+            db.query(ConversationMessage.role, ConversationMessage.message)
+            .filter(ConversationMessage.session_id == session_id)
+            .order_by(desc(ConversationMessage.timestamp))
+            .limit(limit)
+            .all()
+        )
+        return list(reversed([(r[0], r[1]) for r in rows]))
     finally:
-        conn.close()
+        db.close()
+
+
+# ── Market prices ────────────────────────────────────────────────────────────
+def get_market_price(crop_name: str, region: Optional[str] = None):
+    """Returns (price, unit, updated_at) for the latest matching row."""
+    db = SessionLocal()
+    try:
+        query = db.query(MarketPrice).filter(MarketPrice.crop_name == crop_name)
+        if region:
+            query = query.filter(MarketPrice.region == region)
+        row = query.order_by(desc(MarketPrice.updated_at)).first()
+        if not row:
+            return None
+        return (row.price, row.unit, row.updated_at)
+    finally:
+        db.close()
+
+
+# ── Farmer profiles (RAG-side) ───────────────────────────────────────────────
+def register_farmer(
+    phone_number: str,
+    name: str,
+    location: str,
+    preferred_language: str = "am",
+):
+    """Upsert a lightweight farmer profile keyed by phone number."""
+    db = SessionLocal()
+    try:
+        existing = (
+            db.query(FarmerKB).filter(FarmerKB.phone_number == phone_number).first()
+        )
+        if existing:
+            existing.name = name
+            existing.location = location
+            existing.preferred_language = preferred_language
+            existing.updated_at = datetime.utcnow()
+        else:
+            db.add(
+                FarmerKB(
+                    phone_number=phone_number,
+                    name=name,
+                    location=location,
+                    preferred_language=preferred_language,
+                )
+            )
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        print(f"[DB] register_farmer failed: {exc}")
+    finally:
+        db.close()
+
 
 def get_farmer_profile(phone_number: str):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT name, location, preferred_language, registered_at FROM farmers WHERE phone_number = ?", (phone_number,))
-    row = c.fetchone()
-    conn.close()
-    if row:
-        return {"phone_number": phone_number, "name": row[0], "location": row[1], "preferred_language": row[2], "registered_at": row[3]}
-    return None
+    db = SessionLocal()
+    try:
+        row = (
+            db.query(FarmerKB).filter(FarmerKB.phone_number == phone_number).first()
+        )
+        if not row:
+            return None
+        return {
+            "phone_number": row.phone_number,
+            "name": row.name,
+            "location": row.location,
+            "preferred_language": row.preferred_language,
+            "registered_at": row.registered_at.isoformat() if row.registered_at else None,
+        }
+    finally:
+        db.close()
 
+
+# ── Alerts ───────────────────────────────────────────────────────────────────
 def create_alert(target_region: str, alert_message: str, severity: str = "warning"):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("INSERT INTO alerts (target_region, alert_message, severity) VALUES (?, ?, ?)", 
-              (target_region, alert_message, severity))
-    conn.commit()
-    conn.close()
+    db = SessionLocal()
+    try:
+        db.add(
+            Alert(
+                target_region=target_region,
+                alert_message=alert_message,
+                severity=severity,
+            )
+        )
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        print(f"[DB] create_alert failed: {exc}")
+    finally:
+        db.close()
+
 
 def get_alerts_for_region(region: str):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT alert_message, severity FROM alerts WHERE target_region = ? OR target_region = 'all' ORDER BY created_at DESC", (region,))
-    alerts = c.fetchall()
-    conn.close()
-    return alerts
-
-def set_session_state(session_id: str, current_state: str, pending_action: str = None):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
+    db = SessionLocal()
     try:
-        c.execute("INSERT INTO session_states (session_id, current_state, pending_action) VALUES (?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET current_state=excluded.current_state, pending_action=excluded.pending_action, updated_at=CURRENT_TIMESTAMP", 
-                  (session_id, current_state, pending_action))
-        conn.commit()
-    except Exception as e:
-        print(f"Error setting session state: {e}")
+        rows = (
+            db.query(Alert.alert_message, Alert.severity)
+            .filter((Alert.target_region == region) | (Alert.target_region == "all"))
+            .order_by(desc(Alert.created_at))
+            .all()
+        )
+        return [(r[0], r[1]) for r in rows]
     finally:
-        conn.close()
+        db.close()
+
+
+# ── Session state (multi-turn / safety confirmations) ────────────────────────
+def set_session_state(
+    session_id: str,
+    current_state: str,
+    pending_action: Optional[str] = None,
+):
+    db = SessionLocal()
+    try:
+        existing = (
+            db.query(SessionState).filter(SessionState.session_id == session_id).first()
+        )
+        if existing:
+            existing.current_state = current_state
+            existing.pending_action = pending_action
+            existing.updated_at = datetime.utcnow()
+        else:
+            db.add(
+                SessionState(
+                    session_id=session_id,
+                    current_state=current_state,
+                    pending_action=pending_action,
+                )
+            )
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        print(f"[DB] set_session_state failed: {exc}")
+    finally:
+        db.close()
+
 
 def get_session_state(session_id: str):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT current_state, pending_action FROM session_states WHERE session_id = ?", (session_id,))
-    row = c.fetchone()
-    conn.close()
-    if row:
-        return {"current_state": row[0], "pending_action": row[1]}
-    return None
-
-def insert_call_record(session_id: str, phone_number: str, recording_path: str, duration: int):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
+    db = SessionLocal()
     try:
-        c.execute("INSERT INTO call_records (session_id, phone_number, recording_path, duration) VALUES (?, ?, ?, ?)",
-                  (session_id, phone_number, recording_path, duration))
-        conn.commit()
-    except Exception as e:
-        print(f"Error inserting call record: {e}")
+        row = (
+            db.query(SessionState).filter(SessionState.session_id == session_id).first()
+        )
+        if not row:
+            return None
+        return {
+            "current_state": row.current_state,
+            "pending_action": row.pending_action,
+        }
     finally:
-        conn.close()
+        db.close()
 
+
+# ── Call records ─────────────────────────────────────────────────────────────
+def insert_call_record(
+    session_id: str,
+    phone_number: str,
+    recording_path: str,
+    duration: int,
+):
+    db = SessionLocal()
+    try:
+        existing = (
+            db.query(CallRecord).filter(CallRecord.session_id == session_id).first()
+        )
+        if existing:
+            existing.phone_number = phone_number
+            existing.recording_path = recording_path
+            existing.duration = duration
+        else:
+            db.add(
+                CallRecord(
+                    session_id=session_id,
+                    phone_number=phone_number,
+                    recording_path=recording_path,
+                    duration=duration,
+                )
+            )
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        print(f"[DB] insert_call_record failed: {exc}")
+    finally:
+        db.close()
+
+
+# ── Module init (called once on FastAPI startup from main.py) ────────────────
 init_kb()
-init_db()

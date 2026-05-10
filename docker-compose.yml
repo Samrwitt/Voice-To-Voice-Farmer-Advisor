@@ -1,80 +1,253 @@
 services:
-  stt_service:
-    build: ./stt_service
-    ports:
-      - "8001:8000"
-    environment:
-      - WHISPER_MODEL=medium      # options: tiny | base | small | medium
-      - WHISPER_THREADS=8        # Ryzen 7 7840HS: 8 cores
-    volumes:
-      - ./data:/data
+  base:
+    image: farmer-advisor-base
+    build:
+      context: .
+      dockerfile: Dockerfile.base
+    command: ["echo", "Base image built"]
 
-  logic_service:
-    build: ./logic_service
-    ports:
-      - "8002:8000"
+  postgres:
+    # pgvector-enabled Postgres (required for fast KB retrieval)
+    # image: pgvector/pgvector:pg16
+    image: postgres:16
+    container_name: phone_gateway_postgres
     environment:
-      - TTS_URL=http://tts_service:8000/synthesize
-      - STT_URL=http://stt_service:8000/transcribe
-      - DATA_DIR=/data
-      - RAG_DISTANCE_THRESHOLD=1.2
-      - HF_HOME=/data/hf_cache              # cache HuggingFace models to volume
-      - SENTENCE_TRANSFORMERS_HOME=/data/hf_cache
-      - TRANSFORMERS_CACHE=/data/hf_cache
-      - HF_HUB_DISABLE_PROGRESS_BARS=1
+      POSTGRES_DB: phone_gateway_db
+      POSTGRES_USER: phone_user
+      POSTGRES_PASSWORD: phone_pass
+    ports:
+      - "5432:5432"
     volumes:
-      - ./logic_service:/app
-      - ./data:/data
+      - postgres_data:/var/lib/postgresql/data
+
+  minio:
+    image: minio/minio:latest
+    container_name: farmer_advisor_minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+
+  rag-service:
+    build:
+      context: rag_service
+      dockerfile: Dockerfile
+    container_name: rag_service
     depends_on:
-      - stt_service
-      - tts_service
-
-  tts_service:
-    build: ./tts_service
+      postgres:
+        condition: service_started
     ports:
-      - "8003:8000"
-    volumes:
-      - ./data:/data
-
-  # admin_dashboard (old Streamlit UI) removed — replaced by frontend (nginx)
-
-  telephony_service:
-    build: ./telephony_service
+      - "8004:8000"
     environment:
-      - STT_URL=http://stt_service:8000/transcribe
-      - LOGIC_URL=http://logic_service:8000/ask
-      - SAVE_RECORD_URL=http://logic_service:8000/save_call_record
-      - TTS_URL=http://tts_service:8000/synthesize
-      - SIP_IP=0.0.0.0
-      - SIP_PORT=5060
-      - SIP_USER=${SIP_USER:-advisor}
-      - SIP_PASS=${SIP_PASS:-changeme}
-    ports:
-      - "5060:5060/udp"
-      - "5060:5060/tcp"
+      POSTGRES_URL: postgresql://phone_user:phone_pass@postgres:5432/phone_gateway_db
+      RAG_PG_MAX_L2_DISTANCE: "1.35"
+      TTS_URL: http://tts-service:8000/synthesize
+      AUTO_INGEST_KB_DIR: /app/kb_documents/amharic
+      AUTO_INGEST_ON_STARTUP: "true"
+      AUTO_INGEST_MAX_FILES: "20"
+      EMBED_BATCH_SIZE: "8"
+      HF_TOKEN: ${HF_TOKEN}
+      HF_HOME: /models/huggingface
+      HF_HUB_CACHE: /models/huggingface/hub
+      SENTENCE_TRANSFORMERS_HOME: /models/sentence_transformers
+      # If embeddings need a different model, override KB_EMBEDDING_MODEL.
     volumes:
-      - ./telephony_service:/app
-      - ./data:/data
-    depends_on:
-      - stt_service
-      - logic_service
-      - tts_service
+      - ./kb_documents:/app/kb_documents:ro
+      - rag_models:/models
 
-  # ── Admin Dashboard Frontend (Next.js) ───────────────────────────────────
-  admin_dashboard_frontend:
-    build: ./admin_dashboard_frontend
+  phone-gateway:
+    build:
+      context: .
+      dockerfile: phone_gateway/Dockerfile
+    container_name: phone_gateway_backend
+    depends_on:
+      - postgres
+      - vad-service
+    environment:
+      DATABASE_URL: postgresql://phone_user:phone_pass@postgres:5432/phone_gateway_db
+      RECORDINGS_DIR: /app/recordings
+      VAD_WS_BASE_URL: ws://vad-service:8010/ws/vad
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_REGION: us-east-1
+      S3_ACCESS_KEY_ID: minioadmin
+      S3_SECRET_ACCESS_KEY: minioadmin
+      S3_BUCKET: farmer-advisor-media
+
+      CREATE_DEFAULT_ADMIN: "true"
+      DEFAULT_ADMIN_NAME: "System Admin"
+      DEFAULT_ADMIN_EMAIL: "admin@example.com"
+      DEFAULT_ADMIN_PASSWORD: "admin123"
+      RESET_DEFAULT_ADMIN_PASSWORD: "false"
+    ports:
+      - "8000:8000"
+    volumes:
+      - call_recordings:/app/recordings
+
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: phone_gateway_pgadmin
+    depends_on:
+      - postgres
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@gmail.com
+      PGADMIN_DEFAULT_PASSWORD: admin123
+    ports:
+      - "5050:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+      - ./pgadmin_servers.json:/pgadmin4/servers.json
+
+  vad-service:
+    build:
+      context: .
+      dockerfile: vad_service/Dockerfile
+    container_name: vad_service
+    depends_on:
+      base:
+        condition: service_completed_successfully
+      asr-service:
+        condition: service_started
+    ports:
+      - "8010:8010"
+    environment:
+      ASR_HTTP_URL: http://asr-service:8001/transcribe-file
+      VAD_UTTERANCES_DIR: /app/utterances
+      MAX_CONCURRENT_ASR: 2
+    volumes:
+      - vad_utterances:/app/utterances
+
+
+  asr-service:
+    build:
+      context: .
+      dockerfile: asr_service/Dockerfile
+    container_name: asr_service
+    ports:
+      - "8001:8001"
+    environment:
+      ASR_ENGINE: whisper_local
+      ASR_MODEL_PATH: /models/asr/whisper-small-amharic-bdu-8khz-aug-ct2-fp16
+      SHARED_UTTERANCES_DIR: /shared/utterances
+      ASR_USE_OLLAMA: "true"
+      OLLAMA_URL: http://ollama:11434
+      OLLAMA_MODEL: qwen2.5:7b
+    depends_on:
+      - ollama
+    volumes:
+      - vad_utterances:/shared/utterances:ro
+      - ./models/asr:/models/asr:ro
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama_service
+    ports:
+      - "11435:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+
+
+  tts-service:
+    build:
+      context: .
+      dockerfile: tts_service/Dockerfile
+    container_name: tts_service
+    depends_on:
+      base:
+        condition: service_completed_successfully
+    ports:
+      - "8002:8002"
+
+  admin-dashboard:
+    image: farmer-advisor-admin-dashboard
+    build:
+      context: ./admin_dashboard_frontend
+      dockerfile: Dockerfile
+    container_name: admin_dashboard
+    depends_on:
+      - logic-service
     ports:
       - "3000:3000"
     environment:
-      - NODE_ENV=production
-      - NEXT_TELEMETRY_DISABLED=1
-      # Server-side proxy URL — NOT exposed to browser (no NEXT_PUBLIC_ prefix)
-      - LOGIC_SERVICE_URL=http://logic_service:8000
-      # Path for the /api/audio streaming route
-      - DATA_DIR=/data
-    volumes:
-      - ./data:/data:ro   # read-only: frontend only streams recordings, never writes
-    depends_on:
-      - logic_service
-    restart: unless-stopped
+      NODE_ENV: production
+      NEXT_TELEMETRY_DISABLED: 1
 
+      # Server-side proxy: Next.js API routes forward /api/admin/* here
+      LOGIC_SERVICE_URL: http://logic-service:8002
+
+      # Kept for any remaining browser-side references (login redirect, etc.)
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+
+  logic-service:
+    image: farmer-advisor-logic-service
+    build:
+      context: .
+      dockerfile: logic_service/Dockerfile
+    container_name: logic_service
+    depends_on:
+      base:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_started
+    ports:
+      - "8002:8002"
+    environment:
+      DATABASE_URL: postgresql://phone_user:phone_pass@postgres:5432/phone_gateway_db
+      LOG_LEVEL: INFO
+      TTS_URL: http://tts-service:8000/synthesize
+
+      HF_HOME: /models/huggingface
+      HF_HUB_CACHE: /models/huggingface/hub
+      SENTENCE_TRANSFORMERS_HOME: /models/sentence_transformers
+      HF_TOKEN: ${HF_TOKEN}
+
+
+      # Shared with phone-gateway so JWTs are mutually verifiable
+      JWT_SECRET_KEY: "change-this-secret-key-in-production"
+      ACCESS_TOKEN_EXPIRE_MINUTES: "1440"
+
+      # Default admin seeded into shared dashboard_users table
+      CREATE_DEFAULT_ADMIN: "true"
+      DEFAULT_ADMIN_NAME: "System Admin"
+      DEFAULT_ADMIN_EMAIL: "admin@example.com"
+      DEFAULT_ADMIN_PASSWORD: "admin123"
+      RESET_DEFAULT_ADMIN_PASSWORD: "false"
+
+      # Service health probes used by /admin/system-status
+      VAD_HEALTH_URL: "http://vad-service:8010/health"
+      ASR_HEALTH_URL: "http://asr-service:8001/docs"
+      TTS_HEALTH_URL: "http://tts-service:8000/docs"
+      PHONE_GATEWAY_URL: "http://phone-gateway:8000/health"
+      RAG_SERVICE_URL: "http://rag-service:8000"
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_REGION: us-east-1
+      S3_ACCESS_KEY_ID: minioadmin
+      S3_SECRET_ACCESS_KEY: minioadmin
+
+      DATA_DIR: "/app/data"
+    volumes:
+      - logic_data:/app/data
+
+
+volumes:
+  postgres_data:
+  call_recordings:
+  pgadmin_data:
+  vad_utterances:
+  ollama_data:
+
+  logic_data:
+  minio_data:
+  rag_models:

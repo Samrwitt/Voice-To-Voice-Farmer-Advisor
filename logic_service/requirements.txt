@@ -9,4 +9,11 @@ langchain-community
 # llama-cpp-python              # requires VS C++ on Windows; install manually if needed
 requests
 bcrypt
+sqlalchemy
+psycopg2-binary
+python-jose[cryptography]
+python-multipart
+email-validator
+pypdf
+boto3
 # torch is installed CPU-only in the Dockerfile via --no-deps

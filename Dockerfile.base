@@ -1,5 +1,13 @@
-FROM python:3.10-slim
+FROM python:3.11-slim
+WORKDIR /app
 
 RUN pip install --upgrade pip setuptools wheel
-COPY requirements-common.txt /tmp/requirements-common.txt
-RUN pip install --default-timeout=1000 --retries 10 --no-cache-dir -r /tmp/requirements-common.txt
+
+# Install common dependencies
+COPY requirements-common.txt /app/requirements-common.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r /app/requirements-common.txt
+
+# Pre-install CPU-only PyTorch so it is inherited instantly by tts and vad
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu

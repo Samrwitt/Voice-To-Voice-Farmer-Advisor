@@ -114,6 +114,25 @@ def add_utterance(
     add_event("utterance_saved", utterance)
 
 
+def update_utterance_transcript(utterance_path: str, transcript: str, confidence: float):
+    utterance = None
+
+    with _lock:
+        active = monitor_state.get("active_call")
+        if not active:
+            return
+
+        for u in active.get("utterances", []):
+            if u.get("utterance_path") == utterance_path:
+                u["transcript"] = transcript
+                u["confidence"] = confidence
+                utterance = u
+                break
+
+    if utterance:
+        add_event("transcript_saved", utterance)
+
+
 def end_call_monitor(audio_file_path: str | None = None):
     with _lock:
         active = monitor_state.get("active_call")
@@ -148,10 +167,70 @@ def add_event(event_type: str, payload: dict | None = None):
 
 def get_monitor_state():
     with _lock:
+        active_call = monitor_state.get("active_call")
+        events = list(monitor_state.get("events", []))[:80]
+        recent_calls = list(monitor_state.get("recent_calls", []))[:20]
+
+        asr_transcripts = []
+
+        # Build ASR transcripts from active_call.utterances
+        if active_call:
+            for utterance in active_call.get("utterances", []):
+                transcript = utterance.get("transcript")
+
+                if transcript:
+                    asr_transcripts.append({
+                        "session_id": active_call.get("session_id"),
+                        "utterance_path": utterance.get("utterance_path"),
+                        "transcript": transcript,
+                        "confidence": utterance.get("confidence"),
+                        "engine": utterance.get("engine", "mock"),
+                        "timestamp": utterance.get("created_at"),
+                        "source": "active_call.utterances",
+                    })
+
+        # Also build from events just in case
+        for event in events:
+            event_type = event.get("event_type")
+            payload = event.get("payload", {})
+
+            if event_type in ("asr_transcript", "transcript_saved"):
+                transcript = payload.get("transcript")
+
+                if transcript:
+                    asr_transcripts.append({
+                        "session_id": payload.get("session_id") or (
+                            active_call.get("session_id") if active_call else None
+                        ),
+                        "utterance_path": payload.get("utterance_path"),
+                        "transcript": transcript,
+                        "confidence": payload.get("confidence"),
+                        "engine": payload.get("engine", "mock"),
+                        "timestamp": event.get("time") or payload.get("created_at"),
+                        "source": "events",
+                    })
+
+        # Remove duplicates
+        seen = set()
+        unique_asr_transcripts = []
+
+        for item in asr_transcripts:
+            key = (
+                item.get("utterance_path"),
+                item.get("transcript"),
+            )
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+            unique_asr_transcripts.append(item)
+
         return {
-            "active_call": monitor_state.get("active_call"),
-            "events": list(monitor_state.get("events", []))[:80],
-            "recent_calls": list(monitor_state.get("recent_calls", []))[:20],
+            "active_call": active_call,
+            "events": events,
+            "recent_calls": recent_calls,
+            "asr_transcripts": unique_asr_transcripts[:50],
         }
 
 

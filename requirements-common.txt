@@ -1,8 +1,4 @@
-torch==2.2.2
-torchaudio==2.2.2
-filelock
-typing-extensions
-sympy
-networkx
-jinja2
-fsspec
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic
+python-multipart

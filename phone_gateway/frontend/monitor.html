@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 
-  <title>Farmer to Farmer Voice Advisory</title>
+  <title>Farmer Voice Advisory Monitor</title>
 
   <link rel="stylesheet" href="/static/monitor.css" />
 </head>
@@ -13,8 +13,8 @@
 
     <header class="header">
       <div>
-        <h1>Farmer to Farmer Voice Advisory</h1>
-        <p>Live backend view of phone gateway, audio stream, and Silero VAD</p>
+        <h1>Farmer Voice Advisory Monitor</h1>
+        <p>Live view of call audio, VAD, saved utterances, and ASR transcription</p>
       </div>
 
       <div id="systemStatus" class="status-badge offline">
@@ -24,6 +24,7 @@
 
     <section class="main-grid">
 
+      <!-- ACTIVE CALL -->
       <div class="card active-call-card">
         <div class="card-title">
           <h2>Active Call</h2>
@@ -31,7 +32,6 @@
         </div>
 
         <div class="call-center-visual">
-
           <div id="callStateText" class="call-state-text">
             Waiting for incoming browser call
           </div>
@@ -110,6 +110,7 @@
         </div>
       </div>
 
+      <!-- LIVE PIPELINE -->
       <div class="card pipeline-card">
         <h2>Live Pipeline</h2>
 
@@ -134,7 +135,7 @@
             <div class="step-icon">3</div>
             <div>
               <strong>Silero VAD</strong>
-              <span>Waiting</span>
+              <span>Waiting for speech</span>
             </div>
           </div>
 
@@ -142,12 +143,29 @@
             <div class="step-icon">4</div>
             <div>
               <strong>Utterance Saved</strong>
-              <span>None</span>
+              <span>None yet</span>
+            </div>
+          </div>
+
+          <div id="stepAsr" class="step">
+            <div class="step-icon">5</div>
+            <div>
+              <strong>ASR Transcribing</strong>
+              <span>Waiting</span>
+            </div>
+          </div>
+
+          <div id="stepTranscript" class="step">
+            <div class="step-icon">6</div>
+            <div>
+              <strong>ASR Transcript</strong>
+              <span>No transcript yet</span>
             </div>
           </div>
         </div>
       </div>
 
+      <!-- AUDIO METRICS -->
       <div class="card metrics-card">
         <h2>Audio Metrics</h2>
 
@@ -174,6 +192,7 @@
         </div>
       </div>
 
+      <!-- SPEECH SEGMENTS -->
       <div class="card utterance-card">
         <h2>Detected Speech Segments</h2>
 
@@ -182,17 +201,19 @@
         </div>
       </div>
 
-      <div class="card event-card">
+      <!-- ASR TRANSCRIPTS -->
+      <div class="card transcript-card">
         <div class="card-title">
-          <h2>Backend Event Log</h2>
+          <h2>ASR Transcripts</h2>
           <button onclick="loadMonitor()">Refresh</button>
         </div>
 
-        <div id="eventLog" class="event-log">
-          <div class="empty">No backend events yet.</div>
+        <div id="asrTranscriptLog" class="transcript-log">
+          <div class="empty">No ASR transcripts yet.</div>
         </div>
       </div>
 
+      <!-- RECENT CALLS -->
       <div class="card recent-card">
         <h2>Recent Calls</h2>
 
@@ -202,9 +223,8 @@
       </div>
 
     </section>
-
   </div>
 
-  <script src="/static/monitor.js"></script>
+<script src="/static/monitor.js?v=30"></script>
 </body>
 </html>

@@ -1,41 +1,38 @@
-FROM python:3.12-slim
-
+FROM farmer-advisor-base
 WORKDIR /app
 
-COPY requirements.txt /app/requirements.txt
+COPY vad_service/requirements.txt /app/requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r /app/requirements.txt
 
-RUN pip install --upgrade pip setuptools wheel
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install silero-vad --no-deps
 
-# 1) Install normal lightweight dependencies
-RUN pip install \
-    --no-cache-dir \
-    --timeout 300 \
-    --retries 10 \
-    -r /app/requirements.txt
-
-# 2) Install CPU-only PyTorch and Torchaudio from the PyTorch CPU index
-RUN pip install \
-    --no-cache-dir \
-    --timeout 300 \
-    --retries 10 \
-    torch torchaudio \
-    --index-url https://download.pytorch.org/whl/cpu
-
-# 3) Install silero-vad WITHOUT dependencies
-# This prevents pip from trying to download another torch from PyPI
-RUN pip install \
-    --no-cache-dir \
-    --timeout 300 \
-    --retries 10 \
-    silero-vad \
-    --no-deps
-
-COPY main.py /app/main.py
-COPY vad_engine.py /app/vad_engine.py
-COPY audio_utils.py /app/audio_utils.py
+COPY vad_service/main.py /app/main.py
+COPY vad_service/vad_engine.py /app/vad_engine.py
+COPY vad_service/audio_utils.py /app/audio_utils.py
+COPY vad_service/asr_client.py /app/asr_client.py
 
 RUN mkdir -p /app/utterances
-
 EXPOSE 8010
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8010"]
 
+# syntax=docker/dockerfile:1
+FROM farmer-advisor-base
+WORKDIR /app
+
+COPY vad_service/requirements.txt /app/requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r /app/requirements.txt
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install silero-vad --no-deps
+
+COPY vad_service/main.py /app/main.py
+COPY vad_service/vad_engine.py /app/vad_engine.py
+COPY vad_service/audio_utils.py /app/audio_utils.py
+COPY vad_service/asr_client.py /app/asr_client.py
+
+RUN mkdir -p /app/utterances
+EXPOSE 8010
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8010"]
