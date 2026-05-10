@@ -39,12 +39,22 @@ def auto_ingest_if_empty() -> dict:
     rag_pg.init_pg_schema()
 
     # Check if already populated
+    force_reindex = os.getenv("FORCE_REINDEX_KB", "false").lower() in ("1", "true", "yes")
+    
     with psycopg.connect(rag_pg.POSTGRES_URL) as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM rag_kb_chunks;")
             existing = int((cur.fetchone() or [0])[0])
-    if existing > 0:
+            
+    if existing > 0 and not force_reindex:
         return {"enabled": True, "ingested": 0, "skipped": "already_populated", "existing_chunks": existing}
+
+    if force_reindex:
+        logger.info("FORCE_REINDEX_KB is true. Clearing old data...")
+        with psycopg.connect(rag_pg.POSTGRES_URL, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.execute("TRUNCATE TABLE rag_kb_chunks CASCADE;")
+                cur.execute("TRUNCATE TABLE rag_kb_documents CASCADE;")
 
     def extract_text_from_file(path: Path) -> str:
         suffix = path.suffix.lower()

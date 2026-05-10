@@ -22,6 +22,7 @@ async def synthesize_speech(text: str, utterance_path: str) -> str:
     tts_path = str(original_p.parent / tts_filename)
     
     try:
+        print(f"[TTS HTTP] Requesting synthesis from {url}", flush=True)
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(url, json={"text": text})
             response.raise_for_status()
@@ -29,9 +30,9 @@ async def synthesize_speech(text: str, utterance_path: str) -> str:
             with open(tts_path, "wb") as f:
                 f.write(response.content)
             
-            logger.info(f"TTS saved to {tts_path}")
+            print(f"[TTS SAVED] {tts_path} (size={len(response.content)})", flush=True)
             return tts_path
             
     except Exception as e:
-        logger.error(f"TTS request failed: {e}")
+        print(f"[TTS ERROR] Request failed: {e}", flush=True)
         return ""

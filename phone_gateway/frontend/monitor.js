@@ -46,9 +46,10 @@ function setStep(id, state, text) {
   if (span) span.textContent = text || "Waiting";
 }
 
-function updateWaveform(level) {
+function updateWaveform(level, playbackLevel = 0) {
   const bars = document.querySelectorAll(".wave-bar");
-  const normalized = Math.max(0, Math.min(1, Number(level || 0)));
+  const combinedLevel = Math.max(Number(level || 0), Number(playbackLevel || 0));
+  const normalized = Math.max(0, Math.min(1, combinedLevel));
 
   setText("audioLevelValue", `${Math.round(normalized * 100)}%`);
 
@@ -58,6 +59,13 @@ function updateWaveform(level) {
 
     bar.style.height = `${height}%`;
     bar.style.opacity = `${0.25 + normalized * 0.75}`;
+    
+    // Change color if advisor is talking
+    if (playbackLevel > 0.05) {
+        bar.style.backgroundColor = "#4facfe"; // Advisor blue
+    } else {
+        bar.style.backgroundColor = "#00f2fe"; // User cyan
+    }
   });
 }
 

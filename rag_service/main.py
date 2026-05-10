@@ -145,6 +145,30 @@ def compose_grounded_answer_no_llm(query_text: str, hits: list[dict], max_chars:
     return (intro + "\n\n".join(parts))[:max_chars]
 
 
+def check_and_deliver_expert_responses(phone_number: str) -> str:
+    """Checks if there's an answered escalation for this phone number and returns the formatted response."""
+    import rag_pg
+    if not rag_pg.kb_pg_enabled():
+        return ""
+    try:
+        import psycopg
+        with psycopg.connect(rag_pg.POSTGRES_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, query, expert_response FROM escalations WHERE phone_number = %s AND status = 'answered' ORDER BY created_at ASC LIMIT 1",
+                    (phone_number,)
+                )
+                row = cur.fetchone()
+                if row:
+                    esc_id, orig_query, expert_resp = row
+                    cur.execute("UPDATE escalations SET status = 'closed', closed_at = NOW() WHERE id = %s", (esc_id,))
+                    conn.commit()
+                    return f"ቀደም ብለው ስለ '{orig_query}' ላቀረቡት ጥያቄ የባለሙያ ምላሽ አለኝ፡ {expert_resp}\n\nአሁን ደግሞ ስለ አዲሱ ጥያቄዎ ልርዳዎት።"
+    except Exception as exc:
+        logger.error(f"Failed to check for expert responses: {exc}")
+    return ""
+
+
 # ── Core RAG Pipeline ────────────────────────────────────────────────────────
 def generate_rag_response(query_text: str, phone_number: str, session_id: str):
     """
@@ -156,34 +180,12 @@ def generate_rag_response(query_text: str, phone_number: str, session_id: str):
     log_conversation(phone_number, session_id, "user", query_text)
 
     # ── Expert Response Check ─────────────────────────────────────────────────
-    # If a previous escalation was answered but not yet delivered, deliver it now.
-    import rag_pg
-    if rag_pg.kb_pg_enabled():
-        try:
-            import psycopg
-            with psycopg.connect(rag_pg.POSTGRES_URL) as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT id, query, expert_response FROM escalations WHERE phone_number = %s AND status = 'answered' ORDER BY created_at ASC LIMIT 1",
-                        (phone_number,)
-                    )
-                    row = cur.fetchone()
-                    if row:
-                        esc_id, orig_query, expert_resp = row
-                        cur.execute("UPDATE escalations SET status = 'closed', closed_at = NOW() WHERE id = %s", (esc_id,))
-                        conn.commit()
-                        
-                        resp = f"ቀደም ብለው ስለ '{orig_query}' ላቀረቡት ጥያቄ የባለሙያ ምላሽ አለኝ፡ {expert_resp}\n\nአሁን ደግሞ ስለ አዲሱ ጥያቄዎ ልርዳዎት።"
-                        # We return early or just prepend? Prepending is better so we still answer the current query.
-                        # But for simplicity in a voice UI, let's deliver the answer first.
-                        # Actually, let's just deliver it and then let the user ask again, 
-                        # or just prepend. Prepending is better for latency.
-                        current_resp, intent, refs, nlu = _generate_core_rag_response(query_text, phone_number, session_id)
-                        return f"{resp}\n\n{current_resp}", intent, refs, nlu
-        except Exception as exc:
-            logger.error(f"Failed to check for expert responses: {exc}")
-
-    return _generate_core_rag_response(query_text, phone_number, session_id)
+    expert_delivery = check_and_deliver_expert_responses(phone_number)
+    
+    current_resp, intent, refs, nlu = _generate_core_rag_response(query_text, phone_number, session_id)
+    
+    final_text = f"{expert_delivery}\n\n{current_resp}" if expert_delivery else current_resp
+    return final_text, intent, refs, nlu
 
 
 def _generate_core_rag_response(query_text: str, phone_number: str, session_id: str):
@@ -214,6 +216,34 @@ def _generate_core_rag_response(query_text: str, phone_number: str, session_id: 
         if any(k in loc for k in ["highland", "ደጋ"]): user_region = "highland"
         elif any(k in loc for k in ["lowland", "ቆላ"]): user_region = "lowland"
         elif any(k in loc for k in ["midland", "ወይና"]): user_region = "midland"
+        
+    # ── Slot Filling Logic ────────────────────────────────────────────────────
+    intent = nlu.primary_intent
+    if intent in REQUIRED_SLOTS:
+        missing_slots = []
+        for slot in REQUIRED_SLOTS[intent]:
+            # Check both current NLU and session state
+            val = nlu.entities.get(slot) or get_session_state(session_id, f"slot_{slot}")
+            if not val:
+                missing_slots.append(slot)
+            else:
+                # Save found slot to session for future turns
+                set_session_state(session_id, f"slot_{slot}", val)
+
+        if missing_slots:
+            # Ask for the first missing slot
+            next_slot = missing_slots[0]
+            prompt_text = SLOT_PROMPTS.get(next_slot, f"እባክዎን {next_slot} ይንገሩኝ።")
+            log_conversation(phone_number, session_id, "assistant", prompt_text)
+            # Save the intent we are pursuing
+            set_session_state(session_id, "pending_intent", intent)
+            return prompt_text, "slot_filling", [], nlu.to_dict()
+
+    # If we are here, slots are filled. Check if we just finished filling slots.
+    pending_intent = get_session_state(session_id, "pending_intent")
+    if pending_intent:
+        intent = pending_intent
+        set_session_state(session_id, "pending_intent", None)
 
     user_context = f"Farmer Location: {farmer_location}. Region: {user_region or 'General'}. " if profile else ""
 
@@ -223,7 +253,7 @@ def _generate_core_rag_response(query_text: str, phone_number: str, session_id: 
 
     # ── Safety Confirmation State ─────────────────────────────────────────────
     state = get_session_state(session_id)
-    if state and state["current_state"] == "awaiting_confirmation":
+    if state and state.get("current_state") == "awaiting_confirmation":
         if "አዎ" in query_text or "yes" in query_text.lower():
             set_session_state(session_id, "active", None)
             resp = alerts_text + state["pending_action"]
@@ -240,7 +270,7 @@ def _generate_core_rag_response(query_text: str, phone_number: str, session_id: 
             return resp, "awaiting_confirmation", [], nlu.to_dict()
 
     # ── Slot Awaiting State ───────────────────────────────────────────────────
-    if state and state["current_state"] == "awaiting_slot":
+    if state and state.get("current_state") == "awaiting_slot":
         # user provided the missing crop/info; resume with enriched query
         original_query = state.get("pending_action", "")
         enriched_query = f"{original_query} {query_text}"
@@ -256,11 +286,11 @@ def _generate_core_rag_response(query_text: str, phone_number: str, session_id: 
 
     # ── Complex Query Escalation ──────────────────────────────────────────────
     sensitive_intents = {"pest_disease", "soil_fertility", "crop_production"}
-    if nlu.primary_intent in sensitive_intents and nlu.confidence < 0.6:
-        logger.warning(f"Complex query detected (intent={nlu.primary_intent} conf={nlu.confidence}). Escalating.")
+    if intent in sensitive_intents and nlu.confidence < 0.6:
+        logger.warning(f"Complex query detected (intent={intent} conf={nlu.confidence}). Escalating.")
         add_to_escalation(
             query_text,
-            f"Complex {nlu.primary_intent} query with low NLU confidence ({nlu.confidence:.2f}).",
+            f"Complex {intent} query with low NLU confidence ({nlu.confidence:.2f}).",
             phone_number=phone_number,
             session_id=session_id,
             reason_code="COMPLEX_QUERY",
@@ -350,22 +380,20 @@ def _generate_core_rag_response(query_text: str, phone_number: str, session_id: 
             max_l2_distance=RAG_PG_MAX_L2_DISTANCE,
             region=user_region
         )
+        
+        # FILTER: only keep hits within the allowed distance
+        hits = [h for h in hits if float(h.get("distance", 999)) <= RAG_PG_MAX_L2_DISTANCE]
+
         if not hits:
-            logger.warning(
-                "Postgres RAG: no chunk within L2 distance %.3f (best was %.3f). Escalating.",
-                RAG_PG_MAX_L2_DISTANCE,
-                closest_distance,
-            )
+            logger.info(f"No results found for query: {query_text}. Escalating.")
             add_to_escalation(
                 query_text,
-                f"PG RAG: no chunk within L2 {RAG_PG_MAX_L2_DISTANCE} (best={closest_distance:.3f}).",
+                "No relevant KB documents found.",
                 phone_number=phone_number,
                 session_id=session_id,
-                reason_code="LOW_CONFIDENCE",
-                confidence=closest_distance,
-                entities=nlu.entities,
+                reason_code="NO_KB_HITS"
             )
-            resp = "ይቅርታ፣ ይህንን ጥያቄ ሙሉ በሙሉ ልመልስ አልቻልኩም። ለባለሙያ አስተላልፌዋለሁ።"
+            resp = "ይቅርታ፣ ለዚህ ጥያቄ በቂ መረጃ አልተገኘም። ጥያቄዎን ለግብርና ባለሙያ ልከናል፤ በቅርቡ መልስ ያገኛሉ።"
             log_conversation(phone_number, session_id, "assistant", resp)
             return resp, "escalated", [], nlu.to_dict()
 
@@ -449,6 +477,9 @@ def _generate_core_rag_response(query_text: str, phone_number: str, session_id: 
     else:
         if use_pg and hits:
             response_text = compose_grounded_answer_no_llm(query_text, hits)
+            # VOICE OPTIMIZATION: Keep answers very concise (max 280 chars) to prevent gateway timeouts
+            if len(response_text) > 280:
+                response_text = response_text[:277] + "..."
         else:
             response_text = context or ""
 
@@ -507,13 +538,24 @@ async def rag_answer(req: RagAnswerRequest):
         raise HTTPException(status_code=400, detail="Empty query")
 
     nlu = analyze_intent(query_text)
+    expert_delivery = check_and_deliver_expert_responses(req.phone_number)
+    
     crop_name = getattr(nlu, "entities", {}).get("crop_en") if nlu else None
     try:
         dyn = build_dynamic_context(req.phone_number, crop_name=crop_name)
     except Exception:
         dyn = ""
 
-    hits, best = rag_pg.retrieve_for_query(query_text, top_k=4)
+    # Identify region for filtering
+    profile = get_farmer_profile(req.phone_number)
+    user_region = nlu.entities.get("region_en")
+    if not user_region and profile:
+        loc = str(profile.get('location', '')).lower()
+        if any(k in loc for k in ["highland", "ደጋ"]): user_region = "highland"
+        elif any(k in loc for k in ["lowland", "ቆላ"]): user_region = "lowland"
+        elif any(k in loc for k in ["midland", "ወይና"]): user_region = "midland"
+
+    hits, best = rag_pg.retrieve_for_query(query_text, top_k=4, region=user_region)
     answer = compose_grounded_answer_no_llm(query_text, hits) if hits else ""
 
     if dyn and answer:
@@ -523,8 +565,23 @@ async def rag_answer(req: RagAnswerRequest):
     else:
         final = answer
 
+    if expert_delivery:
+        final = f"{expert_delivery}\n\n{final}"
+
     if not final:
-        final = "ይቅርታ፣ በአሁኑ ጊዜ ለዚህ ጥያቄ የበቂ መረጃ አልተገኘም።"
+        # Escalation for voice pipeline
+        add_to_escalation(
+            query_text,
+            "Empty response in voice pipeline.",
+            phone_number=req.phone_number,
+            session_id=req.session_id,
+            reason_code="EMPTY_VOICE_RESP"
+        )
+        final = "ይቅርታ፣ ለዚህ ጥያቄ በቂ መረጃ አልተገኘም። ጥያቄዎን ለግብርና ባለሙያ ልከናል፤ በቅርቡ መልስ ያገኛሉ።"
+    
+    # VOICE OPTIMIZATION: Strict limit for fast TTS
+    if len(final) > 280:
+        final = final[:277] + "..."
 
     refs: list[dict] = []
     for h in hits[:3]:

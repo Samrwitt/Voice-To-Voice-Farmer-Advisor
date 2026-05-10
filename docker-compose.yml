@@ -4,9 +4,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.base
-    dns:
-      - 8.8.8.8
-      - 1.1.1.1
     command: [ "echo", "Base image built" ]
 
   postgres:
@@ -45,15 +42,13 @@ services:
         condition: service_started
     ports:
       - "8004:8000"
-    dns:
-      - 8.8.8.8
-      - 1.1.1.1
     environment:
       POSTGRES_URL: postgresql://phone_user:phone_pass@postgres:5432/phone_gateway_db
       RAG_PG_MAX_L2_DISTANCE: "1.35"
       TTS_URL: http://tts-service:8009/synthesize
       AUTO_INGEST_KB_DIR: /app/kb_documents/amharic
       AUTO_INGEST_ON_STARTUP: "true"
+      FORCE_REINDEX_KB: "true"
       AUTO_INGEST_MAX_FILES: "20"
       EMBED_BATCH_SIZE: "8"
       HF_TOKEN: ${HF_TOKEN}
@@ -94,9 +89,6 @@ services:
       RESET_DEFAULT_ADMIN_PASSWORD: "false"
     ports:
       - "8000:8000"
-    dns:
-      - 8.8.8.8
-      - 1.1.1.1
     volumes:
       - call_recordings:/app/recordings
       - vad_utterances:/app/utterances:ro
@@ -127,9 +119,6 @@ services:
         condition: service_started
     ports:
       - "8010:8010"
-    dns:
-      - 8.8.8.8
-      - 1.1.1.1
     environment:
       ASR_HTTP_URL: http://asr-service:8001/transcribe-file
       RAG_SERVICE_URL: http://rag-service:8000
@@ -146,9 +135,6 @@ services:
     container_name: asr_service
     ports:
       - "8001:8001"
-    dns:
-      - 8.8.8.8
-      - 1.1.1.1
     environment:
       ASR_ENGINE: whisper_local
       ASR_MODEL_PATH: /models/asr/whisper-small-amharic-bdu-8khz-aug-ct2-fp16
@@ -189,9 +175,6 @@ services:
         condition: service_completed_successfully
     ports:
       - "8009:8009"
-    dns:
-      - 8.8.8.8
-      - 1.1.1.1
 
   admin-dashboard:
     image: farmer-advisor-admin-dashboard
@@ -203,9 +186,6 @@ services:
       - logic-service
     ports:
       - "3000:3000"
-    dns:
-      - 8.8.8.8
-      - 1.1.1.1
     environment:
       NODE_ENV: production
       NEXT_TELEMETRY_DISABLED: 1
@@ -229,9 +209,6 @@ services:
         condition: service_started
     ports:
       - "8002:8002"
-    dns:
-      - 8.8.8.8
-      - 1.1.1.1
     environment:
       DATABASE_URL: postgresql://phone_user:phone_pass@postgres:5432/phone_gateway_db
       LOG_LEVEL: INFO

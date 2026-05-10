@@ -507,9 +507,18 @@ async def forward_vad_events_to_browser(vad_ws, browser_ws: WebSocket):
 
     try:
         async for message in vad_ws:
+            # Handle binary audio chunks from VAD service
+            if isinstance(message, bytes):
+                try:
+                    await browser_ws.send_bytes(message)
+                except Exception as exc:
+                    print(f"[BROWSER BINARY SEND FAILED] {exc}", flush=True)
+                    break
+                continue
+
+            # Handle JSON events
             try:
                 data = json.loads(message)
-
             except Exception:
                 data = {
                     "event": "vad_raw_message",
@@ -652,11 +661,13 @@ async def call_websocket(
         audio_format=audio_format,
     )
 
-    vad_url = (
-        f"{VAD_WS_BASE_URL}"
-        f"?session_id={session_id}"
-        f"&sample_rate={sample_rate}"
-    )
+    # ── Connect to VAD Service ──
+    query_params = {
+        "session_id": session_id,
+        "sample_rate": sample_rate,
+        "phone_number": caller_phone
+    }
+    vad_url = f"{VAD_WS_BASE_URL}?" + "&".join([f"{k}={v}" for k, v in query_params.items()])
 
     vad_ws = None
     vad_event_task = None
