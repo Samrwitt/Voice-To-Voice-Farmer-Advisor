@@ -18,6 +18,9 @@ from database import (
 from nlu import analyze_intent, needs_slot_filling
 from dynamic_layer_runtime import build_dynamic_context
 from farmer_persona import build_personalization_block
+from quality_metrics import quality_snapshot
+from trust_meta import build_voice_trust_meta, maybe_append_trust_footer
+from rag_retrieval import ranked_hits_for_voice_query
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("logic_service")
@@ -107,6 +110,20 @@ class RagAnswerRequest(BaseModel):
     phone_number: str = "Unknown"
     session_id: str = "default_session"
 
+
+def _require_metrics_token(authorization: Optional[str] = Header(None)) -> None:
+    tok = os.getenv("RAG_METRICS_TOKEN", "").strip()
+    if not tok:
+        return
+    if (authorization or "").strip() != f"Bearer {tok}":
+        raise HTTPException(status_code=401, detail="Missing or invalid Bearer token (RAG_METRICS_TOKEN).")
+
+
+@app.get("/api/quality/snapshot")
+def api_quality_snapshot(hours: int = 24, _auth: None = Depends(_require_metrics_token)):
+    """Aggregated interaction + escalation counts for the trust / proof loop."""
+    h = max(1, min(int(hours or 24), 168))
+    return quality_snapshot(window_hours=h)
 
 
 # ── Text Normalization ───────────────────────────────────────────────────────

@@ -16,12 +16,12 @@ def trust_footer_enabled() -> bool:
     return os.getenv("RAG_TRUST_FOOTER", "0").strip().lower() in ("1", "true", "yes", "on")
 
 
-def maybe_append_trust_footer(final_text: str, *, grounding: str) -> str:
+def maybe_append_trust_footer(final_text: str, *, sources: list[str]) -> str:
     if not trust_footer_enabled():
         return final_text
     if not (final_text or "").strip():
         return final_text
-    if grounding in ("escalation", "none", "dynamic_only"):
+    if "escalation" in sources or "kb" not in sources:
         return final_text
     if TRUST_FOOTER_AM in final_text:
         return final_text
@@ -33,43 +33,30 @@ def build_voice_trust_meta(
     hits: list[dict[str, Any]],
     used_llm_assistant: bool,
     used_chunk_compose: bool,
-    dynamic_prefixed: bool,
+    sources: list[str],
     escalated_empty: bool,
     latency_ms: float,
     sla_target_hours: int,
 ) -> dict[str, Any]:
     n = len(hits or [])
-    if escalated_empty:
-        return {
-            "grounding": "escalation",
-            "kb_chunks_used": n,
-            "sources_in_prompt": n,
-            "human_review": True,
-            "latency_ms": round(latency_ms, 1),
-            "escalation_sla_target_hours": sla_target_hours,
-        }
-    if n == 0:
-        return {
-            "grounding": "none",
-            "kb_chunks_used": 0,
-            "sources_in_prompt": 0,
-            "human_review": False,
-            "latency_ms": round(latency_ms, 1),
-            "escalation_sla_target_hours": sla_target_hours,
-        }
-    if dynamic_prefixed and not (used_llm_assistant or used_chunk_compose):
-        g = "dynamic_only"
-    elif used_llm_assistant:
-        g = "kb_llm"
-    elif used_chunk_compose:
-        g = "kb_compose"
-    else:
-        g = "unknown"
-    return {
-        "grounding": g,
+    base = {
+        "sources": list(sources),
         "kb_chunks_used": n,
         "sources_in_prompt": min(n, 3),
-        "human_review": False,
         "latency_ms": round(latency_ms, 1),
         "escalation_sla_target_hours": sla_target_hours,
+        "human_review": escalated_empty,
     }
+    if escalated_empty:
+        base["grounding"] = "escalation"
+        return base
+    if "kb" not in sources:
+        base["grounding"] = "dynamic_only" if "dynamic" in sources else "none"
+        return base
+    if used_llm_assistant:
+        base["grounding"] = "kb_llm"
+    elif used_chunk_compose:
+        base["grounding"] = "kb_compose"
+    else:
+        base["grounding"] = "kb_unknown"
+    return base
