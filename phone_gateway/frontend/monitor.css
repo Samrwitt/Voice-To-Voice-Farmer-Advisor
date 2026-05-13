@@ -70,9 +70,34 @@ body {
   background: var(--primary-soft);
 }
 
-.status-badge.offline {
+.status-badge.idle {
+  color: var(--muted);
+  background: #e8ebe5;
+  border: 1px solid var(--border);
+}
+
+.status-badge.pending {
+  color: #4a5568;
+  background: #edf2f7;
+  border: 1px solid #cbd5e0;
+}
+
+.status-badge.ended {
+  color: #744210;
+  background: var(--accent-soft);
+  border: 1px solid var(--accent);
+}
+
+.status-badge.error {
   color: var(--danger);
   background: var(--danger-soft);
+}
+
+/* Legacy: keep class name for older scripts; prefer .idle for “no call”. */
+.status-badge.offline {
+  color: var(--muted);
+  background: #e8ebe5;
+  border: 1px solid var(--border);
 }
 
 .main-grid {

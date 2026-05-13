@@ -5,11 +5,12 @@ import uuid
 from pathlib import Path
 
 import websockets
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
+import httpx
 
 from backend.database import Base, engine, SessionLocal
 from backend.models import Caller
@@ -92,9 +93,40 @@ app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
 app.mount("/static/utterances", StaticFiles(directory="/app/utterances"), name="utterances")
 
 
+class TtsSynthesizeBody(BaseModel):
+    """Proxy to tts-service for browser playback (same-origin; avoids exposing internal URLs)."""
+
+    text: str
+
+
+@app.post("/api/tts/synthesize")
+async def proxy_tts_synthesize(body: TtsSynthesizeBody):
+    text = (body.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Text must not be empty.")
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            upstream = await client.post(TTS_SERVICE_URL, json={"text": text})
+            upstream.raise_for_status()
+        ct = upstream.headers.get("content-type", "audio/wav")
+        return Response(content=upstream.content, media_type=ct)
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"TTS upstream error: {exc.response.status_code}",
+        ) from exc
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail=f"TTS unreachable: {exc}") from exc
+
+
 # ============================================================
 # Configuration
 # ============================================================
+
+TTS_SERVICE_URL = os.getenv(
+    "TTS_SERVICE_URL",
+    "http://tts-service:8009/synthesize",
+).strip()
 
 VAD_WS_BASE_URL = os.getenv(
     "VAD_WS_BASE_URL",
@@ -603,6 +635,9 @@ async def forward_vad_events_to_browser(vad_ws, browser_ws: WebSocket):
 
                 if tts_url and utterance_path:
                     update_utterance_tts(utterance_path, tts_url)
+
+            elif event_name == "tts_started":
+                add_event("tts_started", data)
 
             # ------------------------------------------------------------
             # ASR error
