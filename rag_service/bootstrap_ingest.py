@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 def _iter_files(folder: Path) -> list[Path]:
@@ -55,6 +58,12 @@ def auto_ingest_if_empty() -> dict:
             with conn.cursor() as cur:
                 cur.execute("TRUNCATE TABLE rag_kb_chunks CASCADE;")
                 cur.execute("TRUNCATE TABLE rag_kb_documents CASCADE;")
+        try:
+            from chroma_mirror import clear_mirrored_chroma_kb
+
+            clear_mirrored_chroma_kb()
+        except Exception as exc:
+            logger.warning("Chroma mirror clear on reindex failed: %s", exc)
 
     def extract_text_from_file(path: Path) -> str:
         suffix = path.suffix.lower()
@@ -95,7 +104,11 @@ def auto_ingest_if_empty() -> dict:
                     doc_uuid = uuid.uuid4()
                     external_id = f"jsonl:{p.name}:{item.get('id', uuid.uuid4())}"
                     title = item.get("title") or f"KB Item {item.get('id')}"
-                    
+
+                    chunks = rag_pg.chunk_amharic_text(text)
+                    if not chunks:
+                        continue
+
                     with psycopg.connect(rag_pg.POSTGRES_URL, autocommit=False) as conn:
                         with conn.cursor() as cur:
                             cur.execute(
@@ -106,8 +119,7 @@ def auto_ingest_if_empty() -> dict:
                                 """,
                                 (doc_uuid, external_id, title, "kb_jsonl", None, "am", "approved", p.name, json.dumps(item)),
                             )
-                            
-                            chunks = rag_pg.chunk_amharic_text(text)
+
                             embeddings = rag_pg.embed_texts(chunks, batch_size=batch_size)
                             for j, emb in enumerate(embeddings):
                                 lit = "[" + ",".join(f"{x:.8f}" for x in emb) + "]"
@@ -116,6 +128,12 @@ def auto_ingest_if_empty() -> dict:
                                     (doc_uuid, j, chunks[j], lit),
                                 )
                             conn.commit()
+                    try:
+                        from chroma_mirror import upsert_kb_chunks
+
+                        upsert_kb_chunks(external_id, title, chunks, kind="kb")
+                    except Exception as exc:
+                        logger.debug("chroma mirror jsonl: %s", exc)
             ingested += 1
             continue
 
@@ -176,6 +194,12 @@ def auto_ingest_if_empty() -> dict:
                         )
                     conn.commit()
                     idx += batch_size
+        try:
+            from chroma_mirror import upsert_kb_chunks
+
+            upsert_kb_chunks(external_id, title, chunks, kind="kb")
+        except Exception as exc:
+            logger.debug("chroma mirror folder: %s", exc)
         ingested += 1
 
     return {

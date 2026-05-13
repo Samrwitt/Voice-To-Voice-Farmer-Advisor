@@ -15,6 +15,7 @@ from database import (
 )
 from nlu import analyze_intent, needs_slot_filling
 from dynamic_layer_runtime import build_dynamic_context
+from farmer_persona import build_personalization_block
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("logic_service")
@@ -44,6 +45,18 @@ async def lifespan(app: FastAPI):
 
         t = threading.Thread(target=_run, daemon=True)
         t.start()
+
+        def _merged_qa():
+            try:
+                from merged_ingest import sync_merged_qa
+
+                mrep = sync_merged_qa()
+                if mrep.get("ingested"):
+                    logger.info("merged.json QA sync: %s", mrep)
+            except Exception as exc:
+                logger.warning("merged.json QA sync failed: %s", exc)
+
+        threading.Thread(target=_merged_qa, daemon=True).start()
     except Exception as exc:
         logger.warning("KB auto-ingest setup skipped: %s", exc)
     yield
@@ -243,7 +256,7 @@ def _generate_core_rag_response(query_text: str, phone_number: str, session_id: 
 
     # ── Farmer Profile & Context ──────────────────────────────────────────────
     profile = get_farmer_profile(phone_number)
-    farmer_location = profile['location'] if profile else "Unknown"
+    farmer_location = (profile or {}).get("location") or "Unknown"
     
     # Identify the relevant region for RAG filtering
     # Priority: 1. NLU extracted region, 2. Profile region
@@ -291,7 +304,9 @@ def _generate_core_rag_response(query_text: str, phone_number: str, session_id: 
         intent = pending_intent
         set_session_state(session_id, "pending_intent", None)
 
-    user_context = f"Farmer Location: {farmer_location}. Region: {user_region or 'General'}. " if profile else ""
+    user_context = build_personalization_block(phone_number, profile)
+    if user_region:
+        user_context = (user_context or "") + f"የክልል ማጣሪያ / ቦታ፦ {user_region}።\n"
 
     # ── Active Alerts ─────────────────────────────────────────────────────────
     alerts = get_alerts_for_region(farmer_location)
@@ -436,63 +451,38 @@ def _generate_core_rag_response(query_text: str, phone_number: str, session_id: 
     # ── RAG: Postgres+pgvector (preferred) or legacy Chroma ───────────────────
     import rag_pg
 
-    def _keyword_overlap_score(query: str, text: str) -> int:
-        """
-        Tiny hybrid-rerank: prefer chunks that contain key query words.
-        This fixes common embedding confusion for generic words like "መመሪያ".
-        """
-        if not query or not text:
-            return 0
-        q = re.sub(r"\s+", " ", query.strip())
-        t = (text or "")
-        # Prefer longer / more specific tokens, keep Ethiopic + ASCII words
-        tokens = re.findall(r"[\u1200-\u137F]+|[A-Za-z]+", q)
-        stop = {
-            "የ",
-            "እና",
-            "ነው",
-            "ለ",
-            "በ",
-            "ላይ",
-            "ነበር",
-            "ምን",
-            "ማን",
-            "እንዴት",
-            "እባክዎ",
-            "ይህ",
-            "ይህን",
-            "መሆኑ",
-            "መሆን",
-        }
-        scored = 0
-        for tok in tokens:
-            if len(tok) < 3:
-                continue
-            if tok in stop:
-                continue
-            # Exact substring match is fine for Amharic morphology MVP
-            if tok in t:
-                scored += 2
-        return scored
-
     references: list = []
     context: str | None = None
     hits: list[dict] = []
     closest_distance = 999.0
     use_pg = rag_pg.kb_pg_enabled() and rag_pg.count_approved_chunks() > 0
-    retrieval_query = nlu.retrieval_query or query_text
+    history_pairs = get_conversation_history(session_id, limit=6)
+    conv_msgs = [{"role": r, "content": (m or "").strip()} for r, m in history_pairs if (m or "").strip()]
+    from farmer_rag_stack.context_utils import retrieval_query_for
+    from farmer_rag_stack.assistant import try_llm_assistant_response
+    from farmer_rag_stack.nlu_farmer import augment_retrieval_query_with_nlu, parse_farmer_nlu
+    from farmer_rag_stack.retrieval_ranking import rank_pg_hits
+    from chroma_retrieve import merge_pg_chroma_hits, retrieve_chroma_mirror_hits
+
+    farmer_nlu = parse_farmer_nlu(query_text)
+    retrieval_query = augment_retrieval_query_with_nlu(
+        retrieval_query_for(nlu.retrieval_query or query_text, conv_msgs),
+        farmer_nlu,
+    )
 
     if use_pg:
-        # Pull more candidates then rerank with keyword overlap.
+        pool = max(12, int(os.environ.get("RAG_PG_RETRIEVE_POOL", "40")))
         hits, closest_distance = rag_pg.retrieve_for_query(
-            retrieval_query, 
-            top_k=12, 
+            retrieval_query,
+            top_k=pool,
             max_l2_distance=RAG_PG_MAX_L2_DISTANCE,
-            region=user_region
+            region=user_region,
         )
-        
-        # FILTER: only keep hits within the allowed distance
-        hits = [h for h in hits if float(h.get("distance", 999)) <= RAG_PG_MAX_L2_DISTANCE]
+
+        pg_hits = [h for h in hits if float(h.get("distance", 999)) <= RAG_PG_MAX_L2_DISTANCE]
+        chroma_k = max(8, int(os.getenv("RAG_CHROMA_TOP_K", "18").strip() or "18"))
+        chroma_hits = retrieve_chroma_mirror_hits(retrieval_query, top_k=chroma_k)
+        hits = merge_pg_chroma_hits(pg_hits, chroma_hits)
 
         if not hits:
             logger.info(f"No results found for query: {query_text}. Escalating.")
@@ -515,15 +505,25 @@ def _generate_core_rag_response(query_text: str, phone_number: str, session_id: 
             )
             return resp, "escalated", [], nlu.to_dict()
 
-        # Hybrid rerank (keyword overlap) then keep the best 4
-        hits = sorted(
+        def _retrieve_more_boosted(q: str) -> list:
+            hh, _ = rag_pg.retrieve_for_query(
+                q,
+                top_k=pool,
+                max_l2_distance=RAG_PG_MAX_L2_DISTANCE,
+                region=user_region,
+            )
+            return [h for h in hh if float(h.get("distance", 999)) <= RAG_PG_MAX_L2_DISTANCE]
+
+        keep = max(4, int(os.environ.get("RAG_PG_FINAL_TOP_K", "6")))
+        hits = rank_pg_hits(
+            query_text,
+            retrieval_query,
             hits,
-            key=lambda h: (
-                -_keyword_overlap_score(query_text, (h.get("title") or "") + "\n" + (h.get("content") or "")),
-                float(h.get("distance") or 999.0),
-            ),
+            farmer_nlu,
+            retrieve_more=_retrieve_more_boosted,
+            max_hits=max(keep, 8),
         )
-        hits = hits[:4]
+        hits = hits[:keep]
 
         references = [
             {
@@ -589,6 +589,12 @@ def _generate_core_rag_response(query_text: str, phone_number: str, session_id: 
     history = get_conversation_history(session_id, limit=3)
     history_str = "\n".join([f"{h[0]}: {h[1]}" for h in history])
 
+    dyn_block = ""
+    try:
+        dyn_block = build_dynamic_context(phone_number, crop_name=nlu.entities.get("crop_en")) or ""
+    except Exception:
+        dyn_block = ""
+
     # ── LLM or Direct KB Response ─────────────────────────────────────────────
     if llm:
         logger.info("Invoking LLM for grounded response...")
@@ -601,12 +607,22 @@ def _generate_core_rag_response(query_text: str, phone_number: str, session_id: 
         )
         response_text = llm(prompt)
     else:
+        response_text = None
         if use_pg and hits:
+            response_text = try_llm_assistant_response(
+                query_text=query_text,
+                session_id=session_id,
+                hits=hits,
+                user_context=user_context,
+                alerts_text=alerts_text,
+                dynamic_block=dyn_block,
+                history_pairs=history_pairs,
+            )
+        if response_text is None and use_pg and hits:
             response_text = compose_grounded_answer_no_llm(query_text, hits)
-            # VOICE OPTIMIZATION: Keep answers very concise (max 280 chars) to prevent gateway timeouts
             if len(response_text) > 280:
                 response_text = response_text[:277] + "..."
-        else:
+        elif response_text is None:
             response_text = context or ""
 
     # ── High-Risk Safety Interceptor ──────────────────────────────────────────
@@ -668,10 +684,10 @@ async def process_query(query: Query):
 @app.post("/rag/answer")
 async def rag_answer(req: RagAnswerRequest):
     """
-    Speed-first RAG endpoint for other services:
+    RAG endpoint for other services:
     - static retrieval: Postgres+pgvector (rag_kb_*)
-    - dynamic retrieval: Postgres alerts/market (dynamic_layer_runtime)
-    - response: grounded (no LLM required)
+    - dynamic: alerts/market (``build_dynamic_context``)
+    - generation: RAG-folder-style assistant (Groq/Gemini/Ollama) when enabled, else chunk composition
     """
     import rag_pg
 
@@ -697,15 +713,71 @@ async def rag_answer(req: RagAnswerRequest):
         elif any(k in loc for k in ["lowland", "ቆላ"]): user_region = "lowland"
         elif any(k in loc for k in ["midland", "ወይና"]): user_region = "midland"
 
-    hits, best = rag_pg.retrieve_for_query(query_text, top_k=4, region=user_region)
-    answer = compose_grounded_answer_no_llm(query_text, hits) if hits else ""
+    hist = get_conversation_history(req.session_id, limit=6)
+    hist_pairs = list(hist)
+    conv_msgs = [{"role": r, "content": (m or "").strip()} for r, m in hist_pairs if (m or "").strip()]
+    from farmer_rag_stack.context_utils import retrieval_query_for
+    from farmer_rag_stack.assistant import try_llm_assistant_response
+    from farmer_rag_stack.nlu_farmer import augment_retrieval_query_with_nlu, parse_farmer_nlu
+    from farmer_rag_stack.retrieval_ranking import rank_pg_hits
+    from chroma_retrieve import merge_pg_chroma_hits, retrieve_chroma_mirror_hits
+
+    farmer_nlu = parse_farmer_nlu(query_text)
+    rq = augment_retrieval_query_with_nlu(
+        retrieval_query_for(nlu.retrieval_query or query_text, conv_msgs),
+        farmer_nlu,
+    )
+    max_d = float(os.environ.get("RAG_PG_MAX_L2_DISTANCE", str(RAG_PG_MAX_L2_DISTANCE)))
+    pool = max(12, int(os.environ.get("RAG_PG_RETRIEVE_POOL", "40")))
+    hits, best = rag_pg.retrieve_for_query(rq, top_k=pool, max_l2_distance=max_d, region=user_region)
+    pg_hits = [h for h in hits if float(h.get("distance", 999)) <= max_d]
+    chroma_k = max(8, int(os.getenv("RAG_CHROMA_TOP_K", "18").strip() or "18"))
+    chroma_hits = retrieve_chroma_mirror_hits(rq, top_k=chroma_k)
+    hits = merge_pg_chroma_hits(pg_hits, chroma_hits)
+
+    def _retrieve_more_voice(q: str) -> list:
+        hh, _ = rag_pg.retrieve_for_query(q, top_k=pool, max_l2_distance=max_d, region=user_region)
+        return [h for h in hh if float(h.get("distance", 999)) <= max_d]
+
+    keep = max(4, int(os.environ.get("RAG_PG_FINAL_TOP_K", "6")))
+    if hits:
+        hits = rank_pg_hits(
+            query_text,
+            rq,
+            hits,
+            farmer_nlu,
+            retrieve_more=_retrieve_more_voice,
+            max_hits=max(keep, 8),
+        )
+        hits = hits[:keep]
+
+    profile_line = build_personalization_block(req.phone_number, profile)
+    if user_region:
+        profile_line = (profile_line or "") + f"የክልል ማጣሪያ፦ {user_region}።\n"
+
+    answer = ""
+    if hits:
+        answer = (
+            try_llm_assistant_response(
+                query_text=query_text,
+                session_id=req.session_id,
+                hits=hits,
+                user_context=profile_line,
+                alerts_text="",
+                dynamic_block=dyn or "",
+                history_pairs=hist_pairs,
+            )
+            or ""
+        )
+    if not answer.strip() and hits:
+        answer = compose_grounded_answer_no_llm(query_text, hits)
 
     if dyn and answer:
         final = f"{dyn}\n\n{answer}"
     elif dyn:
         final = dyn
     else:
-        final = answer
+        final = answer or ""
 
     if expert_delivery:
         final = f"{expert_delivery}\n\n{final}"
@@ -720,10 +792,14 @@ async def rag_answer(req: RagAnswerRequest):
             reason_code="EMPTY_VOICE_RESP"
         )
         final = "ይቅርታ፣ ለዚህ ጥያቄ በቂ መረጃ አልተገኘም። ጥያቄዎን ለግብርና ባለሙያ ልከናል፤ በቅርቡ መልስ ያገኛሉ።"
-    
-    # VOICE OPTIMIZATION: Strict limit for fast TTS
-    if len(final) > 280:
-        final = final[:277] + "..."
+
+    voice_cap_raw = os.environ.get("RAG_VOICE_RAG_ANSWER_MAX_CHARS", "600").strip()
+    try:
+        voice_cap = int(voice_cap_raw) if voice_cap_raw else 600
+    except ValueError:
+        voice_cap = 600
+    if voice_cap > 0 and len(final) > voice_cap:
+        final = final[: max(0, voice_cap - 3)].rstrip() + "..."
 
     refs: list[dict] = []
     for h in hits[:3]:

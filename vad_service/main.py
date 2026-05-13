@@ -213,6 +213,52 @@ async def handle_completed_utterance(
         if not transcript:
             return
 
+        from transcript_quality import GIBBERISH_REPLY_AM, is_asr_gibberish
+
+        conf = asr_result.get("confidence")
+        try:
+            conf_f = float(conf) if conf is not None else None
+        except (TypeError, ValueError):
+            conf_f = None
+        if is_asr_gibberish(transcript, conf_f):
+            rag_answer = GIBBERISH_REPLY_AM
+            print(
+                f"[ASR GIBBERISH] session={session_id}, transcript={transcript!r}, conf={conf_f}",
+                flush=True,
+            )
+            await safe_send(
+                websocket,
+                send_lock,
+                {
+                    "event": "rag_answer",
+                    "session_id": session_id,
+                    "utterance_path": utterance_path,
+                    "response": rag_answer,
+                    "references": [],
+                    "message": "Low-confidence ASR; asking user to repeat in Amharic",
+                },
+            )
+            await safe_send(
+                websocket,
+                send_lock,
+                {
+                    "event": "tts_started",
+                    "session_id": session_id,
+                    "utterance_path": utterance_path,
+                    "message": "Synthesizing voice response...",
+                },
+            )
+            session_state.playback_task = asyncio.create_task(
+                play_advisor_response(
+                    websocket=websocket,
+                    send_lock=send_lock,
+                    session_id=session_id,
+                    utterance_path=utterance_path,
+                    rag_answer=rag_answer,
+                )
+            )
+            return
+
         await safe_send(
             websocket,
             send_lock,

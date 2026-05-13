@@ -45,6 +45,17 @@ services:
     environment:
       POSTGRES_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       RAG_PG_MAX_L2_DISTANCE: "1.35"
+      OLLAMA_HOST: http://ollama:11434
+      OLLAMA_MODEL: qwen2.5:7b
+      RAG_ASSISTANT_LLM: "1"
+      RAG_PG_RETRIEVE_POOL: "40"
+      RAG_PG_FINAL_TOP_K: "6"
+      RAG_PG_BM25: "1"
+      RAG_PG_TOPIC_REFINE: "1"
+      RAG_TOOLS: "1"
+      RAG_WEB_MODE: "off"
+      RAG_WEB_ALLOW: "1"
+      RAG_WEATHER_TOOL: "1"
       TTS_URL: http://tts-service:8009/synthesize
       AUTO_INGEST_KB_DIR: /app/kb_documents/amharic
       AUTO_INGEST_ON_STARTUP: "true"
@@ -60,8 +71,11 @@ services:
       KB_EMBEDDING_MODEL: /models/sentence_transformers/sentence-transformers_paraphrase-multilingual-MiniLM-L12-v2
       TRANSFORMERS_OFFLINE: "1"
       HF_HUB_OFFLINE: "1"
+      RAG_MERGED_JSON: /app/RAG/merged.json
+      RAG_MERGED_SYNC: "true"
     volumes:
       - ./kb_documents:/app/kb_documents:ro
+      - ./RAG:/app/RAG:ro
       - ./models:/models
 
   phone-gateway:
@@ -185,7 +199,8 @@ services:
     depends_on:
       - logic-service
     ports:
-      - "3000:3000"
+      # Host 3000 is often taken (other Next.js, Grafana, etc.). Override: ADMIN_DASHBOARD_PORT=3000
+      - "${ADMIN_DASHBOARD_PORT:-3001}:3000"
     environment:
       NODE_ENV: production
       NEXT_TELEMETRY_DISABLED: 1

@@ -16,8 +16,12 @@ try:
     from chromadb.utils import embedding_functions  # type: ignore
 
     chroma_client = chromadb.PersistentClient(path=os.path.join(DATA_DIR, "chroma_db"))
+    _emb_model = os.environ.get(
+        "KB_EMBEDDING_MODEL",
+        "paraphrase-multilingual-MiniLM-L12-v2",
+    ).strip()
     sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
-        model_name="paraphrase-multilingual-MiniLM-L12-v2"
+        model_name=_emb_model
     )
     collection = chroma_client.get_or_create_collection(
         name="agronomy_kb", embedding_function=sentence_transformer_ef
@@ -375,14 +379,112 @@ def register_farmer(phone_number: str, name: str, location: str, preferred_langu
     finally:
         conn.close()
 
+def _phone_lookup_keys(phone_number: str) -> list[str]:
+    p = (phone_number or "").strip()
+    if not p:
+        return []
+    keys: list[str] = [p]
+    if p.startswith("+"):
+        tail = p[1:].strip()
+        if tail and tail not in keys:
+            keys.append(tail)
+    else:
+        plus = f"+{p}"
+        if plus not in keys:
+            keys.append(plus)
+    digits = "".join(ch for ch in p if ch.isdigit())
+    if len(digits) >= 8 and digits not in keys:
+        keys.append(digits)
+    return list(dict.fromkeys(keys))
+
+
 def get_farmer_profile(phone_number: str):
+    p = (phone_number or "").strip()
+    if not p or p == "Unknown":
+        return None
+    keys = _phone_lookup_keys(p)
+    if not keys:
+        return None
+
+    if _pg_enabled():
+        try:
+            import psycopg
+
+            with psycopg.connect(POSTGRES_URL) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT c.full_name, fp.location, fp.primary_language, fp.farm_size
+                        FROM callers c
+                        LEFT JOIN farmer_profiles fp ON fp.caller_id = c.caller_id
+                        WHERE c.phone_number = ANY(%s)
+                        LIMIT 1;
+                        """,
+                        (keys,),
+                    )
+                    row = cur.fetchone()
+                    profile: dict | None = None
+                    if row:
+                        profile = {
+                            "phone_number": p,
+                            "full_name": row[0],
+                            "name": row[0],
+                            "location": row[1],
+                            "primary_language": row[2],
+                            "preferred_language": row[2] or "am",
+                            "farm_size": row[3],
+                        }
+                    try:
+                        cur.execute(
+                            """
+                            SELECT name, location, preferred_language, crops, farm_size, notes
+                            FROM farmers_kb
+                            WHERE phone_number = ANY(%s)
+                            LIMIT 1;
+                            """,
+                            (keys,),
+                        )
+                        kb = cur.fetchone()
+                    except Exception:
+                        kb = None
+                    if kb:
+                        kb_name, kb_loc, kb_lang, kb_crops, kb_fs, kb_notes = kb
+                        if profile is None:
+                            profile = {"phone_number": p}
+                        if kb_name and not profile.get("name"):
+                            profile["name"] = kb_name
+                        if kb_loc and not profile.get("location"):
+                            profile["location"] = kb_loc
+                        if kb_lang:
+                            profile["preferred_language"] = kb_lang
+                            profile["primary_language"] = kb_lang
+                        if kb_crops is not None:
+                            profile["crops"] = kb_crops
+                        if kb_fs is not None and profile.get("farm_size") is None:
+                            profile["farm_size"] = kb_fs
+                        if kb_notes:
+                            profile["notes"] = kb_notes
+                    if profile:
+                        return profile
+        except Exception as exc:
+            print(f"[DB] get_farmer_profile (Postgres) failed: {exc}")
+
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT name, location, preferred_language, registered_at FROM farmers WHERE phone_number = ?", (phone_number,))
+    c.execute(
+        "SELECT name, location, preferred_language, registered_at FROM farmers WHERE phone_number = ?",
+        (p,),
+    )
     row = c.fetchone()
     conn.close()
     if row:
-        return {"phone_number": phone_number, "name": row[0], "location": row[1], "preferred_language": row[2], "registered_at": row[3]}
+        return {
+            "phone_number": p,
+            "name": row[0],
+            "location": row[1],
+            "preferred_language": row[2],
+            "registered_at": row[3],
+        }
     return None
 
 def create_alert(target_region: str, alert_message: str, severity: str = "warning"):
