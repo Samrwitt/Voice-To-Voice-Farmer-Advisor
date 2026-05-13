@@ -2,14 +2,40 @@ from datetime import datetime
 import uuid
 
 from backend.database import SessionLocal
-from backend.models import CallSession
+from backend.models import CallSession, Caller
+from backend.callers import create_or_get_caller
 from backend.s3_client import is_enabled as s3_enabled, upload_file
 
 
-def create_session(caller_id: str | None = None) -> dict:
+def create_session(
+    caller_id: str | None = None,
+    full_name: str | None = None,
+    phone_number: str | None = None
+) -> dict:
     db = SessionLocal()
 
     try:
+        # Verify caller exists if provided
+        if caller_id:
+            caller = db.query(Caller).filter(Caller.caller_id == caller_id).first()
+            if not caller:
+                print(f"[WARNING] Caller {caller_id} not found in database.", flush=True)
+                
+                # Try to re-register if we have the info
+                if full_name and phone_number:
+                    print(f"[INFO] Attempting to re-register {full_name}...", flush=True)
+                    caller_data = create_or_get_caller(full_name, phone_number)
+                    caller_id = caller_data["caller_id"]
+                else:
+                    print("[INFO] No registration info available. Starting anonymous session.", flush=True)
+                    caller_id = None
+        
+        # If no caller_id was provided, but we have info, register now
+        elif full_name and phone_number:
+            print(f"[INFO] Registering new caller: {full_name}", flush=True)
+            caller_data = create_or_get_caller(full_name, phone_number)
+            caller_id = caller_data["caller_id"]
+
         session_id = str(uuid.uuid4())
 
         call_session = CallSession(

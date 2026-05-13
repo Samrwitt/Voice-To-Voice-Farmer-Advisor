@@ -11,7 +11,7 @@ from database import (
     collection, add_to_escalation, log_conversation,
     get_conversation_history, get_market_price, register_farmer,
     get_farmer_profile, get_alerts_for_region, set_session_state,
-    get_session_state, insert_call_record,
+    get_session_state, insert_call_record, log_interaction_record,
 )
 from nlu import analyze_intent, needs_slot_filling
 from dynamic_layer_runtime import build_dynamic_context
@@ -203,6 +203,44 @@ def _generate_core_rag_response(query_text: str, phone_number: str, session_id: 
     nlu = analyze_intent(query_text)
     logger.info("NLU intent=%s conf=%.2f entities=%s", nlu.primary_intent, nlu.confidence, nlu.entities)
 
+    # ── User-requested escalation (FR22) ──────────────────────────────────────
+    # A lightweight trigger: if the user explicitly asks for an expert/human.
+    # We do this early, before retrieval, so it's deterministic.
+    q = (query_text or "").lower()
+    user_escalation_phrases = (
+        "expert",
+        "human",
+        "agent",
+        "helpdesk",
+        "operator",
+        "ለባለሙያ",
+        "ባለሙያ",
+        "ሰው",
+        "ወደ ባለሙያ",
+        "እርዳታ",
+    )
+    if any(p in q for p in user_escalation_phrases):
+        add_to_escalation(
+            query_text,
+            "User explicitly requested expert handoff.",
+            phone_number=phone_number,
+            session_id=session_id,
+            reason_code="USER_REQUESTED",
+            confidence=nlu.confidence,
+            entities=nlu.entities,
+        )
+        resp = "እሺ፣ ጥያቄዎን ለግብርና ባለሙያ አስተላልፌዋለሁ። በቅርቡ መልስ ያገኛሉ።"
+        log_conversation(phone_number, session_id, "assistant", resp)
+        log_interaction_record(
+            phone_number=phone_number,
+            session_id=session_id,
+            intent=nlu.primary_intent,
+            response_type="escalated_user_requested",
+            entities=nlu.entities,
+            confidence=nlu.confidence,
+        )
+        return resp, "escalated_user_requested", [], nlu.to_dict()
+
     # ── Farmer Profile & Context ──────────────────────────────────────────────
     profile = get_farmer_profile(phone_number)
     farmer_location = profile['location'] if profile else "Unknown"
@@ -235,6 +273,14 @@ def _generate_core_rag_response(query_text: str, phone_number: str, session_id: 
             next_slot = missing_slots[0]
             prompt_text = SLOT_PROMPTS.get(next_slot, f"እባክዎን {next_slot} ይንገሩኝ።")
             log_conversation(phone_number, session_id, "assistant", prompt_text)
+            log_interaction_record(
+                phone_number=phone_number,
+                session_id=session_id,
+                intent=intent,
+                response_type="slot_filling",
+                entities=nlu.entities,
+                confidence=nlu.confidence,
+            )
             # Save the intent we are pursuing
             set_session_state(session_id, "pending_intent", intent)
             return prompt_text, "slot_filling", [], nlu.to_dict()
@@ -258,15 +304,39 @@ def _generate_core_rag_response(query_text: str, phone_number: str, session_id: 
             set_session_state(session_id, "active", None)
             resp = alerts_text + state["pending_action"]
             log_conversation(phone_number, session_id, "assistant", resp)
+            log_interaction_record(
+                phone_number=phone_number,
+                session_id=session_id,
+                intent=nlu.primary_intent,
+                response_type="confirmed_action" if "አዎ" in query_text or "yes" in query_text.lower() else "safety_confirmation",
+                entities=nlu.entities,
+                confidence=nlu.confidence,
+            )
             return resp, "confirmed_action", [], nlu.to_dict()
         elif "አይ" in query_text or "no" in query_text.lower():
             set_session_state(session_id, "active", None)
             resp = "እሺ፣ እርምጃው ተሰርዟል። ሌላ ምን ልርዳዎት?"
             log_conversation(phone_number, session_id, "assistant", resp)
+            log_interaction_record(
+                phone_number=phone_number,
+                session_id=session_id,
+                intent=nlu.primary_intent,
+                response_type="cancelled_action",
+                entities=nlu.entities,
+                confidence=nlu.confidence,
+            )
             return resp, "cancelled_action", [], nlu.to_dict()
         else:
             resp = "እባክዎን 'አዎ' ወይም 'አይ' ብለው ያረጋግጡ።"
             log_conversation(phone_number, session_id, "assistant", resp)
+            log_interaction_record(
+                phone_number=phone_number,
+                session_id=session_id,
+                intent=nlu.primary_intent,
+                response_type="safety_confirmation",
+                entities=nlu.entities,
+                confidence=nlu.confidence,
+            )
             return resp, "awaiting_confirmation", [], nlu.to_dict()
 
     # ── Slot Awaiting State ───────────────────────────────────────────────────
@@ -282,6 +352,14 @@ def _generate_core_rag_response(query_text: str, phone_number: str, session_id: 
     if clarification:
         set_session_state(session_id, "awaiting_slot", query_text)
         log_conversation(phone_number, session_id, "assistant", clarification)
+        log_interaction_record(
+            phone_number=phone_number,
+            session_id=session_id,
+            intent=nlu.primary_intent,
+            response_type="awaiting_slot",
+            entities=nlu.entities,
+            confidence=nlu.confidence,
+        )
         return clarification, "awaiting_slot", [], nlu.to_dict()
 
     # ── Complex Query Escalation ──────────────────────────────────────────────
@@ -299,6 +377,14 @@ def _generate_core_rag_response(query_text: str, phone_number: str, session_id: 
         )
         resp = "ይህ ጥያቄ ዝርዝር መረጃ ስለሚያስፈልገው ለግብርና ባለሙያ አስተላልፌዋለሁ። በቅርቡ መልስ ያገኛሉ።"
         log_conversation(phone_number, session_id, "assistant", resp)
+        log_interaction_record(
+            phone_number=phone_number,
+            session_id=session_id,
+            intent=intent,
+            response_type="escalated_complex",
+            entities=nlu.entities,
+            confidence=nlu.confidence,
+        )
         return resp, "escalated_complex", [], nlu.to_dict()
 
     # ── Market Price Intent ───────────────────────────────────────────────────
@@ -311,16 +397,40 @@ def _generate_core_rag_response(query_text: str, phone_number: str, session_id: 
                 price, unit, updated_at = price_data
                 resp = f"የ{crop_name} ዋጋ {price} ብር በ {unit} ነው። (የዋጋ ቀን: {updated_at})"
                 log_conversation(phone_number, session_id, "assistant", resp)
+                log_interaction_record(
+                    phone_number=phone_number,
+                    session_id=session_id,
+                    intent="market_price",
+                    response_type="market_price",
+                    entities=nlu.entities,
+                    confidence=nlu.confidence,
+                )
                 return resp, "market_price", [], nlu.to_dict()
             else:
                 resp = f"ለ{crop_name} ዋጋ መረጃ አሁን የለም። ቆይተው ይደውሉ።"
                 log_conversation(phone_number, session_id, "assistant", resp)
+                log_interaction_record(
+                    phone_number=phone_number,
+                    session_id=session_id,
+                    intent="market_price",
+                    response_type="market_price_unavailable",
+                    entities=nlu.entities,
+                    confidence=nlu.confidence,
+                )
                 return resp, "market_price_unavailable", [], nlu.to_dict()
         else:
             # Crop not specified
             resp = "ስለ ምን ሰብል ዋጋ ይፈልጋሉ? (ጤፍ፣ ስንዴ፣ ቦሎቄ፣ ወዘተ.)"
             set_session_state(session_id, "awaiting_slot", query_text)
             log_conversation(phone_number, session_id, "assistant", resp)
+            log_interaction_record(
+                phone_number=phone_number,
+                session_id=session_id,
+                intent="market_price",
+                response_type="awaiting_slot",
+                entities=nlu.entities,
+                confidence=nlu.confidence,
+            )
             return resp, "awaiting_slot", [], nlu.to_dict()
 
     # ── RAG: Postgres+pgvector (preferred) or legacy Chroma ───────────────────
@@ -395,6 +505,14 @@ def _generate_core_rag_response(query_text: str, phone_number: str, session_id: 
             )
             resp = "ይቅርታ፣ ለዚህ ጥያቄ በቂ መረጃ አልተገኘም። ጥያቄዎን ለግብርና ባለሙያ ልከናል፤ በቅርቡ መልስ ያገኛሉ።"
             log_conversation(phone_number, session_id, "assistant", resp)
+            log_interaction_record(
+                phone_number=phone_number,
+                session_id=session_id,
+                intent=intent,
+                response_type="escalated_no_kb_hits",
+                entities=nlu.entities,
+                confidence=nlu.confidence,
+            )
             return resp, "escalated", [], nlu.to_dict()
 
         # Hybrid rerank (keyword overlap) then keep the best 4
@@ -453,6 +571,14 @@ def _generate_core_rag_response(query_text: str, phone_number: str, session_id: 
             )
             resp = "ይቅርታ፣ ይህንን ጥያቄ ሙሉ በሙሉ ልመልስ አልቻልኩም። ለባለሙያ አስተላልፌዋለሁ።"
             log_conversation(phone_number, session_id, "assistant", resp)
+            log_interaction_record(
+                phone_number=phone_number,
+                session_id=session_id,
+                intent=nlu.primary_intent,
+                response_type="escalated_low_confidence",
+                entities=nlu.entities,
+                confidence=nlu.confidence,
+            )
             return resp, "escalated", [], nlu.to_dict()
 
         context = results["documents"][0][0]
@@ -503,10 +629,26 @@ def _generate_core_rag_response(query_text: str, phone_number: str, session_id: 
         set_session_state(session_id, "awaiting_confirmation", response_text)
         resp = alerts_text + "ይህ እርምጃ ጥንቃቄ ይፈልጋል። ስለ ሁኔታዎ እርግጠኛ ነዎት? (አዎ ወይም አይ)"
         log_conversation(phone_number, session_id, "assistant", resp)
+        log_interaction_record(
+            phone_number=phone_number,
+            session_id=session_id,
+            intent=nlu.primary_intent,
+            response_type="requires_confirmation",
+            entities=nlu.entities,
+            confidence=nlu.confidence,
+        )
         return resp, "requires_confirmation", references, nlu.to_dict()
 
     final_response = alerts_text + normalize_text(response_text)
     log_conversation(phone_number, session_id, "assistant", final_response)
+    log_interaction_record(
+        phone_number=phone_number,
+        session_id=session_id,
+        intent=nlu.primary_intent,
+        response_type="rag_answer",
+        entities=nlu.entities,
+        confidence=nlu.confidence,
+    )
     return final_response, intent, references, nlu.to_dict()
 
 

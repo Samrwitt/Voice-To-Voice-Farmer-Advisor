@@ -266,7 +266,9 @@ async function startCall() {
 
     const wsUrl =
       `${protocol}://${window.location.host}/ws/call` +
-      `?caller_id=${encodeURIComponent(callerId)}` +
+      `?caller_id=${encodeURIComponent(callerId || "")}` +
+      `&full_name=${encodeURIComponent(callerName || "")}` +
+      `&phone_number=${encodeURIComponent(callerPhone || "")}` +
       `&audio_format=pcm16` +
       `&sample_rate=${TARGET_SAMPLE_RATE}`;
 

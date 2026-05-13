@@ -18,7 +18,7 @@ import requests
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, EmailStr
-from sqlalchemy import case, desc, func
+from sqlalchemy import case, desc, func, text
 from sqlalchemy.orm import Session
 
 from auth import (
@@ -1340,6 +1340,71 @@ def da_performance(
         }
         for r in rows
     ]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Interaction records (FR16 traceability)
+# ──────────────────────────────────────────────────────────────────────────────
+@router.get("/interaction-records")
+def list_interaction_records(
+    phone_number: Optional[str] = None,
+    session_id: Optional[str] = None,
+    limit: int = Query(default=100, le=500),
+    _: DashboardUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Returns structured interaction records written by the voice/RAG pipeline.
+    These records are stored in Postgres table `interaction_records`.
+    """
+    # Best-effort: the table is created by rag_service. If it's missing, return empty.
+    where = []
+    params: dict = {"limit": limit}
+    if phone_number:
+        where.append("phone_number = :phone_number")
+        params["phone_number"] = phone_number
+    if session_id:
+        where.append("session_id = :session_id")
+        params["session_id"] = session_id
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+    try:
+        rows = db.execute(
+            text(
+                f"""
+                SELECT
+                  id,
+                  phone_number,
+                  session_id,
+                  intent,
+                  response_type,
+                  entities,
+                  confidence,
+                  created_at
+                FROM interaction_records
+                {where_sql}
+                ORDER BY created_at DESC
+                LIMIT :limit
+                """
+            ),
+            params,
+        ).mappings().all()
+    except Exception:
+        return []
+
+    def _row(r) -> dict:
+        return {
+            "id": int(r["id"]) if r.get("id") is not None else None,
+            "phone_number": r.get("phone_number"),
+            "session_id": r.get("session_id"),
+            "intent": r.get("intent"),
+            "response_type": r.get("response_type"),
+            "entities": r.get("entities"),
+            "confidence": float(r["confidence"]) if r.get("confidence") is not None else None,
+            "created_at": _isoformat(r.get("created_at")),
+        }
+
+    return [_row(r) for r in rows]
 
 
 # ──────────────────────────────────────────────────────────────────────────────

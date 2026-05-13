@@ -4,8 +4,8 @@ import { useEffect, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 
-import { fetchCallDetail } from "@/lib/api";
-import type { CallDetail } from "@/types";
+import { fetchCallDetail, fetchInteractionRecords } from "@/lib/api";
+import type { CallDetail, InteractionRecord } from "@/types";
 
 export default function CallSessionPage() {
   const params = useParams<{ session_id: string }>();
@@ -13,13 +13,20 @@ export default function CallSessionPage() {
   const sessionId = decodeURIComponent(params.session_id);
 
   const [detail, setDetail] = useState<CallDetail | null>(null);
+  const [interactions, setInteractions] = useState<InteractionRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
   useEffect(() => {
     setLoading(true);
-    fetchCallDetail(sessionId)
-      .then(setDetail)
+    Promise.all([
+      fetchCallDetail(sessionId),
+      fetchInteractionRecords({ session_id: sessionId, limit: 200 }),
+    ])
+      .then(([d, ir]) => {
+        setDetail(d);
+        setInteractions(ir);
+      })
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false));
   }, [sessionId]);
@@ -159,6 +166,67 @@ export default function CallSessionPage() {
                   </li>
                 ))}
               </ul>
+            )}
+          </div>
+
+          <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+            <div className="px-8 py-6 border-b border-slate-100">
+              <h3 className="text-base font-medium text-slate-800">
+                Interaction records
+                <span className="ml-2 text-sm font-normal text-slate-400">
+                  ({interactions.length})
+                </span>
+              </h3>
+              <p className="text-sm text-slate-500 mt-1">
+                Structured (intent/entities/response type) records emitted by the voice pipeline.
+              </p>
+            </div>
+
+            {interactions.length === 0 ? (
+              <div className="p-12 text-center text-sm text-slate-400">
+                No interaction records for this session.
+              </div>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-left">
+                  <thead>
+                    <tr className="border-b border-slate-100">
+                      <th className="py-4 px-8 text-xs font-semibold text-slate-500 uppercase tracking-wide">
+                        When
+                      </th>
+                      <th className="py-4 px-8 text-xs font-semibold text-slate-500 uppercase tracking-wide">
+                        Intent
+                      </th>
+                      <th className="py-4 px-8 text-xs font-semibold text-slate-500 uppercase tracking-wide">
+                        Response type
+                      </th>
+                      <th className="py-4 px-8 text-xs font-semibold text-slate-500 uppercase tracking-wide">
+                        Confidence
+                      </th>
+                      <th className="py-4 px-8 text-xs font-semibold text-slate-500 uppercase tracking-wide">
+                        Entities
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {interactions.map((r) => (
+                      <tr key={r.id} className="hover:bg-slate-50">
+                        <td className="py-4 px-8 text-sm text-slate-600">
+                          {r.created_at ? new Date(r.created_at).toLocaleString() : "—"}
+                        </td>
+                        <td className="py-4 px-8 text-sm text-slate-700">{r.intent ?? "—"}</td>
+                        <td className="py-4 px-8 text-sm text-slate-700">{r.response_type ?? "—"}</td>
+                        <td className="py-4 px-8 text-sm text-slate-700">
+                          {r.confidence != null ? r.confidence.toFixed(3) : "—"}
+                        </td>
+                        <td className="py-4 px-8 text-xs text-slate-600 font-mono whitespace-pre-wrap break-all max-w-[520px]">
+                          {r.entities != null ? JSON.stringify(r.entities) : "—"}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             )}
           </div>
         </>

@@ -4,8 +4,8 @@ import { useEffect, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 
-import { fetchFarmer, fetchFarmerCalls } from "@/lib/api";
-import type { CallLog, FarmerProfile } from "@/types";
+import { fetchFarmer, fetchFarmerCalls, fetchInteractionRecords } from "@/lib/api";
+import type { CallLog, FarmerProfile, InteractionRecord } from "@/types";
 
 export default function FarmerDetailPage() {
   const params = useParams<{ phone_number: string }>();
@@ -14,15 +14,21 @@ export default function FarmerDetailPage() {
 
   const [farmer, setFarmer] = useState<FarmerProfile | null>(null);
   const [calls, setCalls] = useState<CallLog[]>([]);
+  const [interactions, setInteractions] = useState<InteractionRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
   useEffect(() => {
     setLoading(true);
-    Promise.all([fetchFarmer(phone), fetchFarmerCalls(phone)])
-      .then(([f, c]) => {
+    Promise.all([
+      fetchFarmer(phone),
+      fetchFarmerCalls(phone),
+      fetchInteractionRecords({ phone_number: phone, limit: 50 }),
+    ])
+      .then(([f, c, ir]) => {
         setFarmer(f);
         setCalls(c);
+        setInteractions(ir);
       })
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false));
@@ -153,6 +159,80 @@ export default function FarmerDetailPage() {
                               Unavailable
                             </span>
                           )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+
+          <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+            <div className="px-8 py-6 border-b border-slate-100">
+              <h3 className="text-base font-medium text-slate-800">
+                Recent interactions
+                <span className="ml-2 text-sm font-normal text-slate-400">
+                  ({interactions.length})
+                </span>
+              </h3>
+              <p className="text-sm text-slate-500 mt-1">
+                Structured records (intent/entities/response type) emitted by the voice pipeline.
+              </p>
+            </div>
+
+            {interactions.length === 0 ? (
+              <div className="p-12 text-center text-sm text-slate-400">
+                No interaction records yet.
+              </div>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-left">
+                  <thead>
+                    <tr className="border-b border-slate-100">
+                      <th className="py-4 px-8 text-xs font-semibold text-slate-500 uppercase tracking-wide">
+                        When
+                      </th>
+                      <th className="py-4 px-8 text-xs font-semibold text-slate-500 uppercase tracking-wide">
+                        Session
+                      </th>
+                      <th className="py-4 px-8 text-xs font-semibold text-slate-500 uppercase tracking-wide">
+                        Intent
+                      </th>
+                      <th className="py-4 px-8 text-xs font-semibold text-slate-500 uppercase tracking-wide">
+                        Response type
+                      </th>
+                      <th className="py-4 px-8 text-xs font-semibold text-slate-500 uppercase tracking-wide">
+                        Confidence
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {interactions.map((r) => (
+                      <tr key={r.id} className="hover:bg-slate-50">
+                        <td className="py-4 px-8 text-sm text-slate-600">
+                          {r.created_at ? new Date(r.created_at).toLocaleString() : "—"}
+                        </td>
+                        <td className="py-4 px-8 text-sm font-mono text-slate-600">
+                          {r.session_id ? (
+                            <Link
+                              href={`/calls/${encodeURIComponent(r.session_id)}`}
+                              className="text-blue-600 hover:text-blue-700"
+                            >
+                              {r.session_id}
+                            </Link>
+                          ) : (
+                            "—"
+                          )}
+                        </td>
+                        <td className="py-4 px-8 text-sm text-slate-700">
+                          {r.intent ?? "—"}
+                        </td>
+                        <td className="py-4 px-8 text-sm text-slate-700">
+                          {r.response_type ?? "—"}
+                        </td>
+                        <td className="py-4 px-8 text-sm text-slate-700">
+                          {r.confidence != null ? r.confidence.toFixed(3) : "—"}
                         </td>
                       </tr>
                     ))}

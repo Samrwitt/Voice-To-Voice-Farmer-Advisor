@@ -18,8 +18,8 @@ app = FastAPI(title="Silero VAD Service")
 # ============================================================
 
 MAX_CONCURRENT_ASR = int(os.getenv("MAX_CONCURRENT_ASR", "2"))
-VAD_THRESHOLD = float(os.getenv("VAD_THRESHOLD", "0.65"))
-VAD_MIN_SPEECH_MS = int(os.getenv("VAD_MIN_SPEECH_MS", "250"))
+VAD_THRESHOLD = float(os.getenv("VAD_THRESHOLD", "0.85"))
+VAD_MIN_SPEECH_MS = int(os.getenv("VAD_MIN_SPEECH_MS", "400"))
 ASR_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_ASR)
 PLAYBACK_LOCK = asyncio.Lock()
 
@@ -521,6 +521,8 @@ async def vad_websocket(
                                 send_lock=send_lock,
                                 session_id=session_id,
                                 utterance_path=utterance_path,
+                                session_state=session_state,
+                                phone_number=phone_number,
                             )
 
                         if active_asr_tasks:
@@ -561,6 +563,8 @@ async def vad_websocket(
                                 send_lock=send_lock,
                                 session_id=session_id,
                                 utterance_path=utterance_path,
+                                session_state=session_state,
+                                phone_number=phone_number,
                             )
 
                         if active_asr_tasks:

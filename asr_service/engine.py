@@ -56,6 +56,7 @@ class ASREngine:
             beam_size=BEAM_SIZE,
             temperature=0.0,
             vad_filter=USE_VAD,
+            vad_parameters=dict(threshold=0.6, min_speech_duration_ms=400),
             condition_on_previous_text=CONDITION_ON_PREVIOUS_TEXT,
             max_new_tokens=MAX_NEW_TOKENS,
             repetition_penalty=REPETITION_PENALTY,

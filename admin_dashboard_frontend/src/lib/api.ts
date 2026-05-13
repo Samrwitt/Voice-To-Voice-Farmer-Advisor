@@ -10,6 +10,7 @@ import type {
   EscalationCase,
   ExpertPerformance,
   FarmerProfile,
+  InteractionRecord,
   KBDocument,
   KBEntry,
   MarketPrice,
@@ -117,6 +118,20 @@ export async function fetchCalls(): Promise<CallLog[]> {
 
 export async function fetchCallDetail(session_id: string): Promise<CallDetail> {
   return request(`/calls/${encodeURIComponent(session_id)}`);
+}
+
+// ── Interaction Records ───────────────────────────────────────────────────────
+export async function fetchInteractionRecords(params?: {
+  phone_number?: string;
+  session_id?: string;
+  limit?: number;
+}): Promise<InteractionRecord[]> {
+  const qs = new URLSearchParams();
+  if (params?.phone_number) qs.set('phone_number', params.phone_number);
+  if (params?.session_id) qs.set('session_id', params.session_id);
+  if (params?.limit != null) qs.set('limit', String(params.limit));
+  const suffix = qs.toString() ? `?${qs.toString()}` : '';
+  return request(`/interaction-records${suffix}`);
 }
 
 // ── Escalations ───────────────────────────────────────────────────────────────

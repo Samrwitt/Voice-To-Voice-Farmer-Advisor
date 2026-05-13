@@ -1,6 +1,8 @@
 import json
 import sqlite3
 import os
+from datetime import datetime
+from typing import Optional, Any
 
 # NOTE:
 # This service is now optimized for Postgres+pgvector (rag_pg.py). ChromaDB is
@@ -130,6 +132,69 @@ def init_db():
 
 POSTGRES_URL = os.environ.get("POSTGRES_URL", "").strip()
 
+def _pg_enabled() -> bool:
+    return bool(POSTGRES_URL)
+
+
+def init_pg_app_tables():
+    """
+    Create the minimal Postgres tables needed for:
+    - conversation history in dashboard
+    - structured interaction records (intent/entities/response_type)
+
+    We do NOT depend on SQLAlchemy models here; keep it lightweight.
+    """
+    if not _pg_enabled():
+        return
+    try:
+        import psycopg
+        with psycopg.connect(POSTGRES_URL, autocommit=False) as conn:
+            with conn.cursor() as cur:
+                # Matches logic_service/models.py table name
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS conversation_history (
+                      id SERIAL PRIMARY KEY,
+                      phone_number TEXT,
+                      session_id TEXT NOT NULL,
+                      role TEXT NOT NULL,
+                      message TEXT NOT NULL,
+                      timestamp TIMESTAMPTZ DEFAULT NOW()
+                    );
+                    """
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_conversation_history_session ON conversation_history(session_id);"
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_conversation_history_phone ON conversation_history(phone_number);"
+                )
+
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS interaction_records (
+                      id SERIAL PRIMARY KEY,
+                      phone_number TEXT,
+                      session_id TEXT,
+                      intent TEXT,
+                      response_type TEXT,
+                      entities JSONB,
+                      confidence DOUBLE PRECISION,
+                      created_at TIMESTAMPTZ DEFAULT NOW()
+                    );
+                    """
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_interaction_records_session ON interaction_records(session_id);"
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_interaction_records_phone ON interaction_records(phone_number);"
+                )
+            conn.commit()
+    except Exception as exc:
+        print(f"[DB] init_pg_app_tables failed: {exc}")
+
+
 def add_to_escalation(
     query: str,
     context: str,
@@ -183,20 +248,102 @@ def add_to_escalation(
             pass
 
 def log_conversation(phone_number: str, session_id: str, role: str, message: str):
+    # Prefer Postgres so dashboard can read unified history.
+    if _pg_enabled():
+        try:
+            import psycopg
+            with psycopg.connect(POSTGRES_URL) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO conversation_history (phone_number, session_id, role, message, timestamp)
+                        VALUES (%s, %s, %s, %s, NOW());
+                        """,
+                        (phone_number, session_id, role, message),
+                    )
+                conn.commit()
+            return
+        except Exception as exc:
+            print(f"[DB] log_conversation (Postgres) failed: {exc} — falling back to SQLite")
+
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("INSERT INTO conversation_history (phone_number, session_id, role, message) VALUES (?, ?, ?, ?)", 
-              (phone_number, session_id, role, message))
+    c.execute(
+        "INSERT INTO conversation_history (phone_number, session_id, role, message) VALUES (?, ?, ?, ?)",
+        (phone_number, session_id, role, message),
+    )
     conn.commit()
     conn.close()
 
 def get_conversation_history(session_id: str, limit: int = 5):
+    if _pg_enabled():
+        try:
+            import psycopg
+            with psycopg.connect(POSTGRES_URL) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT role, message
+                        FROM conversation_history
+                        WHERE session_id = %s
+                        ORDER BY timestamp DESC
+                        LIMIT %s;
+                        """,
+                        (session_id, limit),
+                    )
+                    rows = cur.fetchall() or []
+                    return list(reversed(rows))
+        except Exception as exc:
+            print(f"[DB] get_conversation_history (Postgres) failed: {exc} — falling back to SQLite")
+
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT role, message FROM conversation_history WHERE session_id = ? ORDER BY timestamp DESC LIMIT ?", (session_id, limit))
+    c.execute(
+        "SELECT role, message FROM conversation_history WHERE session_id = ? ORDER BY timestamp DESC LIMIT ?",
+        (session_id, limit),
+    )
     history = c.fetchall()
     conn.close()
     return list(reversed(history))
+
+
+def log_interaction_record(
+    phone_number: str,
+    session_id: str,
+    intent: Optional[str],
+    response_type: str,
+    entities: Optional[dict[str, Any]] = None,
+    confidence: Optional[float] = None,
+):
+    """
+    Structured interaction record for FR16 traceability:
+    - intent/entities/confidence (best-effort)
+    - response_type: market_price | rag_answer | escalated | slot_filling | fallback | etc.
+    """
+    if not _pg_enabled():
+        return
+    try:
+        import psycopg
+        with psycopg.connect(POSTGRES_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO interaction_records
+                      (phone_number, session_id, intent, response_type, entities, confidence, created_at)
+                    VALUES (%s, %s, %s, %s, %s::jsonb, %s, NOW());
+                    """,
+                    (
+                        phone_number,
+                        session_id,
+                        intent,
+                        response_type,
+                        json.dumps(entities) if entities else None,
+                        confidence,
+                    ),
+                )
+            conn.commit()
+    except Exception as exc:
+        print(f"[DB] log_interaction_record failed: {exc}")
 
 def get_market_price(crop_name: str, region: str = None):
     conn = sqlite3.connect(DB_PATH)
@@ -290,3 +437,4 @@ def insert_call_record(session_id: str, phone_number: str, recording_path: str, 
 
 init_kb()
 init_db()
+init_pg_app_tables()

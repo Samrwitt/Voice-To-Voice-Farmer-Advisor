@@ -640,13 +640,20 @@ async def forward_vad_events_to_browser(vad_ws, browser_ws: WebSocket):
 async def call_websocket(
     websocket: WebSocket,
     caller_id: str | None = Query(default=None),
+    full_name: str | None = Query(default=None),
+    phone_number: str | None = Query(default=None),
     audio_format: str = Query(default="pcm16"),
     sample_rate: int = Query(default=16000),
 ):
     await websocket.accept()
 
-    session = create_session(caller_id=caller_id)
+    session = create_session(
+        caller_id=caller_id,
+        full_name=full_name,
+        phone_number=phone_number
+    )
     session_id = session["session_id"]
+    caller_id = session["caller_id"]
 
     caller_name, caller_phone = get_caller_details(caller_id)
 

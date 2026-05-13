@@ -25,8 +25,8 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 COPY asr_service/requirements.txt .
-RUN pip install --default-timeout=100 --retries=10 --no-cache-dir -r requirements.txt || \
-    pip install --default-timeout=100 --retries=10 --no-cache-dir -r requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --default-timeout=1000 --retries=20 -r requirements.txt
 
 COPY asr_service/ /app/
 

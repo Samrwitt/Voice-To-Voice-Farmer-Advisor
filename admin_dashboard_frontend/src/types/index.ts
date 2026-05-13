@@ -85,6 +85,18 @@ export interface CallDetail {
   transcript: TranscriptMessage[];
 }
 
+// ── Interaction records — /admin/interaction-records ─────────────────────────
+export interface InteractionRecord {
+  id: number;
+  phone_number?: string | null;
+  session_id?: string | null;
+  intent?: string | null;
+  response_type?: string | null;
+  entities?: unknown;
+  confidence?: number | null;
+  created_at?: string | null;
+}
+
 // ── Knowledge Base — /admin/kb ────────────────────────────────────────────────
 export interface KBEntry {
   id: string;
