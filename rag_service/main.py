@@ -1,5 +1,7 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from typing import Optional
+
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Header
 from pydantic import BaseModel
 import os
 import re
