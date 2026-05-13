@@ -11,9 +11,9 @@ services:
     image: pgvector/pgvector:pg16
     container_name: phone_gateway_postgres
     environment:
-      POSTGRES_DB: phone_gateway_db
-      POSTGRES_USER: phone_user
-      POSTGRES_PASSWORD: phone_pass
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     ports:
       - "5432:5432"
     volumes:
@@ -24,8 +24,8 @@ services:
     container_name: farmer_advisor_minio
     command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     ports:
       - "9000:9000"
       - "9001:9001"
@@ -43,7 +43,7 @@ services:
     ports:
       - "8004:8000"
     environment:
-      POSTGRES_URL: postgresql://phone_user:phone_pass@postgres:5432/phone_gateway_db
+      POSTGRES_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       RAG_PG_MAX_L2_DISTANCE: "1.35"
       TTS_URL: http://tts-service:8009/synthesize
       AUTO_INGEST_KB_DIR: /app/kb_documents/amharic
@@ -73,19 +73,19 @@ services:
       - postgres
       - vad-service
     environment:
-      DATABASE_URL: postgresql://phone_user:phone_pass@postgres:5432/phone_gateway_db
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       RECORDINGS_DIR: /app/recordings
       VAD_WS_BASE_URL: ws://vad-service:8010/ws/vad
       S3_ENDPOINT_URL: http://minio:9000
       S3_REGION: us-east-1
-      S3_ACCESS_KEY_ID: minioadmin
-      S3_SECRET_ACCESS_KEY: minioadmin
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY}
       S3_BUCKET: farmer-advisor-media
 
       CREATE_DEFAULT_ADMIN: "true"
       DEFAULT_ADMIN_NAME: "System Admin"
-      DEFAULT_ADMIN_EMAIL: "admin@example.com"
-      DEFAULT_ADMIN_PASSWORD: "admin123"
+      DEFAULT_ADMIN_EMAIL: ${DEFAULT_ADMIN_EMAIL}
+      DEFAULT_ADMIN_PASSWORD: ${DEFAULT_ADMIN_PASSWORD}
       RESET_DEFAULT_ADMIN_PASSWORD: "false"
     ports:
       - "8000:8000"
@@ -99,8 +99,8 @@ services:
     depends_on:
       - postgres
     environment:
-      PGADMIN_DEFAULT_EMAIL: admin@gmail.com
-      PGADMIN_DEFAULT_PASSWORD: admin123
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD}
     ports:
       - "5050:80"
     volumes:
@@ -210,7 +210,7 @@ services:
     ports:
       - "8002:8002"
     environment:
-      DATABASE_URL: postgresql://phone_user:phone_pass@postgres:5432/phone_gateway_db
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       LOG_LEVEL: INFO
       TTS_URL: http://tts-service:8009/synthesize
 
@@ -225,14 +225,14 @@ services:
       HF_HUB_OFFLINE: "1"
 
       # Shared with phone-gateway so JWTs are mutually verifiable
-      JWT_SECRET_KEY: "change-this-secret-key-in-production"
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
       ACCESS_TOKEN_EXPIRE_MINUTES: "1440"
 
       # Default admin seeded into shared dashboard_users table
       CREATE_DEFAULT_ADMIN: "true"
       DEFAULT_ADMIN_NAME: "System Admin"
-      DEFAULT_ADMIN_EMAIL: "admin@example.com"
-      DEFAULT_ADMIN_PASSWORD: "admin123"
+      DEFAULT_ADMIN_EMAIL: ${DEFAULT_ADMIN_EMAIL}
+      DEFAULT_ADMIN_PASSWORD: ${DEFAULT_ADMIN_PASSWORD}
       RESET_DEFAULT_ADMIN_PASSWORD: "false"
 
       # Service health probes used by /admin/system-status
@@ -242,9 +242,10 @@ services:
       PHONE_GATEWAY_URL: "http://phone-gateway:8000/health"
       RAG_SERVICE_URL: "http://rag-service:8000"
       S3_ENDPOINT_URL: http://minio:9000
+      S3_PUBLIC_ENDPOINT_URL: http://localhost:9000
       S3_REGION: us-east-1
-      S3_ACCESS_KEY_ID: minioadmin
-      S3_SECRET_ACCESS_KEY: minioadmin
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY}
 
       DATA_DIR: "/app/data"
     volumes:

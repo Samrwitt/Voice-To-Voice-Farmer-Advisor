@@ -162,6 +162,23 @@ export async function closeEscalation(id: number): Promise<EscalationCase> {
   return request(`/escalations/${id}/close`, { method: 'POST' });
 }
 
+export async function uploadEscalationAudio(id: number, audioBlob: Blob): Promise<EscalationCase> {
+  const token = getToken();
+  const form = new FormData();
+  form.append('audio_file', audioBlob, 'response.wav');
+  
+  const res = await fetch(`${BASE}/escalations/${id}/audio-response`, {
+    method: 'POST',
+    headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+    body: form,
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail ?? 'Audio upload failed');
+  }
+  return res.json();
+}
+
 export async function resolveEscalation(id: number): Promise<void> {
   await request(`/escalations/${id}/resolve`, { method: 'PUT' });
 }

@@ -158,6 +158,7 @@ class Escalation(Base):
     assigned_at = Column(DateTime, nullable=True)
 
     expert_response = Column(Text, nullable=True)
+    expert_audio_path = Column(String, nullable=True)
     expert_notes = Column(Text, nullable=True)
     answered_at = Column(DateTime, nullable=True)
     closed_at = Column(DateTime, nullable=True)

@@ -10,8 +10,9 @@ import boto3
 from botocore.client import Config
 
 
-def _client():
-    endpoint = os.getenv("S3_ENDPOINT_URL")
+def _client(endpoint=None):
+    if not endpoint:
+        endpoint = os.getenv("S3_ENDPOINT_URL")
     region = os.getenv("S3_REGION", "us-east-1")
 
     session = boto3.session.Session()
@@ -44,7 +45,12 @@ def presign_get_url(ref: str, expires_seconds: int = 600) -> Optional[str]:
     if not parsed:
         return None
     bucket, key = parsed
-    c = _client()
+    
+    # If a public endpoint is provided, use it for the presigned URL so the browser can reach it.
+    # Otherwise, fall back to the internal endpoint.
+    public_endpoint = os.getenv("S3_PUBLIC_ENDPOINT_URL")
+    c = _client(endpoint=public_endpoint if public_endpoint else None)
+    
     return c.generate_presigned_url(
         "get_object",
         Params={"Bucket": bucket, "Key": key},

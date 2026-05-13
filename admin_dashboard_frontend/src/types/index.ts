@@ -153,6 +153,7 @@ export interface EscalationCase {
   assigned_to?: { user_id: string; full_name: string; email: string } | null;
   assigned_at?: string | null;
   expert_response?: string | null;
+  expert_audio_url?: string | null;
   answered_at?: string | null;
   closed_at?: string | null;
   // legacy / mock

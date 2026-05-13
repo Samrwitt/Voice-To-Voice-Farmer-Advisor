@@ -5,6 +5,7 @@ import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 
 import { fetchCallDetail, fetchInteractionRecords } from "@/lib/api";
+import { getToken } from "@/lib/auth";
 import type { CallDetail, InteractionRecord } from "@/types";
 
 export default function CallSessionPage() {
@@ -115,9 +116,9 @@ export default function CallSessionPage() {
               <audio
                 controls
                 src={
-                  detail.record.recording_path.startsWith('s3://')
-                    ? `/api/admin/calls/${encodeURIComponent(detail.session_id)}/audio`
-                    : `/api/audio?path=${encodeURIComponent(detail.record.recording_path)}`
+                  detail.session_id
+                    ? `/api/admin/calls/${encodeURIComponent(detail.session_id)}/audio${(typeof window !== 'undefined' && getToken()) ? `?token=${getToken()}` : ''}`
+                    : `/api/audio?path=${encodeURIComponent(detail.record.recording_path)}${(typeof window !== 'undefined' && getToken()) ? `&token=${getToken()}` : ''}`
                 }
                 className="w-full h-10"
               />
