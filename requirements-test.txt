@@ -10,3 +10,15 @@ numpy
 requests
 python-multipart
 gTTS
+chromadb
+sqlalchemy
+psycopg2-binary
+python-jose[cryptography]
+bcrypt
+email-validator
+pypdf
+boto3
+langchain
+langchain-community
+websockets
+passlib[bcrypt]
