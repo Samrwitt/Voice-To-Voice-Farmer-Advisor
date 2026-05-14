@@ -2,7 +2,7 @@ import sys
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-sys.path.append(str(Path(__file__).resolve().parents[1] / "asr_service"))
+sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 import pytest
 

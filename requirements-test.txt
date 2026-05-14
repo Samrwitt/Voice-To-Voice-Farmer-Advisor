@@ -1,0 +1,12 @@
+pytest
+fastapi
+httpx
+anyio
+rapidfuzz
+faster-whisper
+librosa
+soundfile
+numpy
+requests
+python-multipart
+gTTS

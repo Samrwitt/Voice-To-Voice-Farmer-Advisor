@@ -6,7 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 # Add asr_service to path so we can import main
-sys.path.append(str(Path(__file__).resolve().parents[1] / "asr_service"))
+sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from main import app
 
