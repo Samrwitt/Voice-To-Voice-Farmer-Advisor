@@ -73,6 +73,11 @@ services:
       HF_HUB_OFFLINE: "1"
       RAG_MERGED_JSON: /app/RAG/merged.json
       RAG_MERGED_SYNC: "true"
+      ESCALATION_SLA_HOURS: "48"
+      CALL_RECORDING_RETENTION_DAYS: "30"
+      RAG_AGROCHEM_EXPERT_ONLY: "1"
+      RAG_RESPONSE_CACHE_TTL_SEC: "120"
+      RAG_RESPONSE_CACHE_MAX: "512"
     volumes:
       - ./kb_documents:/app/kb_documents:ro
       - ./RAG:/app/RAG:ro
@@ -261,6 +266,7 @@ services:
       TTS_HEALTH_URL: "http://tts-service:8000/docs"
       PHONE_GATEWAY_URL: "http://phone-gateway:8000/health"
       RAG_SERVICE_URL: "http://rag-service:8000"
+      ESCALATION_SLA_HOURS: "48"
       S3_ENDPOINT_URL: http://minio:9000
       S3_PUBLIC_ENDPOINT_URL: http://localhost:9000
       S3_REGION: us-east-1

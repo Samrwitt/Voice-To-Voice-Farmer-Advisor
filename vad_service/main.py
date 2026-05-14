@@ -287,6 +287,8 @@ async def handle_completed_utterance(
                 "utterance_path": utterance_path,
                 "response": rag_answer,
                 "references": rag_result.get("references"),
+                "trust": rag_result.get("trust"),
+                "meta": rag_result.get("meta"),
                 "message": "RAG answer generated",
             },
         )

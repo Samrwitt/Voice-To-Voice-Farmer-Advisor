@@ -25,6 +25,7 @@ def quality_snapshot(*, window_hours: int = 24) -> dict[str, Any]:
     out: dict[str, Any] = {
         "ok": True,
         "window_hours": window_hours,
+        "ops_alerts": [],
         "policy": {
             "call_recording_retention_days": retention,
             "escalation_sla_target_hours": sla_h,
@@ -88,7 +89,34 @@ def quality_snapshot(*, window_hours: int = 24) -> dict[str, Any]:
                 cur.execute("SELECT COUNT(*)::int FROM escalations WHERE status = 'pending';")
                 pend = cur.fetchone()
                 out["escalations_pending_total"] = int(pend[0]) if pend else 0
+
+                alerts: list[dict[str, Any]] = []
+                breach = int(out.get("escalations_pending_over_sla") or 0)
+                if breach > 0:
+                    alerts.append(
+                        {
+                            "code": "escalation_sla_breach",
+                            "severity": "warning",
+                            "count": breach,
+                            "message": (
+                                f"{breach} pending escalation(s) older than "
+                                f"{sla_h}h SLA target — assign or answer in the helpdesk."
+                            ),
+                        }
+                    )
+                pend_tot = int(out.get("escalations_pending_total") or 0)
+                if pend_tot > 0 and breach == 0:
+                    alerts.append(
+                        {
+                            "code": "escalation_backlog",
+                            "severity": "info",
+                            "count": pend_tot,
+                            "message": f"{pend_tot} pending escalation(s) within SLA window.",
+                        }
+                    )
+                out["ops_alerts"] = alerts
     except Exception as exc:
         out["ok"] = False
         out["error"] = str(exc)
+        out.setdefault("ops_alerts", [])
     return out

@@ -1,0 +1,73 @@
+[
+  {
+    "id": "greeting_amharic",
+    "question": "ሰላም",
+    "rubric": {
+      "max_latency_ms": 90000,
+      "min_response_len": 1
+    }
+  },
+  {
+    "id": "wheat_altitude",
+    "question": "ስንዴ ለመዝራት የሚመከር ከፍታ ስንት ነው?",
+    "rubric": {
+      "expect_substrings_any": ["ስንዴ", "ከፍታ"],
+      "max_latency_ms": 180000,
+      "min_response_len": 12
+    }
+  },
+  {
+    "id": "fertilizer_general",
+    "question": "ማዳበሪያ እንዴት መጠቀም አለብኝ?",
+    "rubric": {
+      "expect_substrings_any": ["ማዳበሪያ"],
+      "max_latency_ms": 180000,
+      "min_response_len": 15
+    }
+  },
+  {
+    "id": "teff_price_intent",
+    "question": "የጤፍ ዋጋ ስንት ነው?",
+    "rubric": {
+      "expect_substrings_any": ["ጤፍ"],
+      "max_latency_ms": 90000,
+      "min_response_len": 8
+    }
+  },
+  {
+    "id": "coffee_pest",
+    "question": "ለቡና ተባይ ምን ልደርግ?",
+    "rubric": {
+      "expect_substrings_any": ["ቡና", "ተባይ"],
+      "max_latency_ms": 180000,
+      "min_response_len": 12
+    }
+  },
+  {
+    "id": "compost_benefit",
+    "question": "ኮምፖስት ጥቅም ምንድን ነው?",
+    "rubric": {
+      "expect_substrings_any": ["ኮምፖስት"],
+      "max_latency_ms": 180000,
+      "min_response_len": 10
+    }
+  },
+  {
+    "id": "barley_region",
+    "question": "ገብስ በደጋ ምን ያህል ዘር ይዘራል?",
+    "rubric": {
+      "expect_substrings_any": ["ገብስ"],
+      "max_latency_ms": 180000,
+      "min_response_len": 10
+    }
+  },
+  {
+    "id": "urea_timing",
+    "question": "ዩሪያ ማዳበሪያ መቼ መጨመር አለብኝ?",
+    "rubric": {
+      "expect_substrings_any": ["ዩሪያ"],
+      "max_latency_ms": 180000,
+      "min_response_len": 12
+    }
+  }
+]

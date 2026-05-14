@@ -39,10 +39,7 @@ def sync_merged_qa() -> dict[str, Any]:
     if not path:
         return {"ok": False, "skipped": "no_merged_json_file"}
 
-    sync_default = "true"
-    if os.getenv("RAG_MERGED_JSON", "").strip():
-        sync_default = "true"
-    flag = os.getenv("RAG_MERGED_SYNC", sync_default).strip().lower()
+    flag = os.getenv("RAG_MERGED_SYNC", "true").strip().lower()
     if flag in ("0", "false", "no", "off"):
         return {"ok": False, "skipped": "RAG_MERGED_SYNC_disabled"}
 

@@ -21,6 +21,8 @@ from farmer_persona import build_personalization_block
 from quality_metrics import quality_snapshot
 from trust_meta import build_voice_trust_meta, maybe_append_trust_footer
 from rag_retrieval import ranked_hits_for_voice_query
+import chemical_safety
+import response_cache
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("logic_service")
@@ -119,11 +121,70 @@ def _require_metrics_token(authorization: Optional[str] = Header(None)) -> None:
         raise HTTPException(status_code=401, detail="Missing or invalid Bearer token (RAG_METRICS_TOKEN).")
 
 
-@app.get("/api/quality/snapshot")
-def api_quality_snapshot(hours: int = 24, _auth: None = Depends(_require_metrics_token)):
+@app.get("/api/quality/snapshot", dependencies=[Depends(_require_metrics_token)])
+def api_quality_snapshot(hours: int = 24):
     """Aggregated interaction + escalation counts for the trust / proof loop."""
     h = max(1, min(int(hours or 24), 168))
     return quality_snapshot(window_hours=h)
+
+
+def _ops_notify_tokens() -> list[str]:
+    out: list[str] = []
+    for env in ("OPS_NOTIFY_TOKEN", "RAG_METRICS_TOKEN"):
+        v = (os.getenv(env) or "").strip()
+        if v and v not in out:
+            out.append(v)
+    return out
+
+
+def _require_ops_notify_token(authorization: Optional[str] = Header(None)) -> None:
+    toks = _ops_notify_tokens()
+    if not toks:
+        raise HTTPException(
+            status_code=503,
+            detail="Set OPS_NOTIFY_TOKEN or RAG_METRICS_TOKEN to call this endpoint.",
+        )
+    auth = (authorization or "").strip()
+    if not any(auth == f"Bearer {t}" for t in toks):
+        raise HTTPException(status_code=401, detail="Missing or invalid Bearer token.")
+
+
+@app.post("/api/ops/notify", dependencies=[Depends(_require_ops_notify_token)])
+def api_ops_notify():
+    """
+    Push a minimal SLA / backlog payload to ``OPS_ALERT_WEBHOOK_URL`` (Slack incoming
+    webhook, PagerDuty, etc.). Intended for cron: call every N minutes; no-op when
+    there are zero SLA breaches.
+    """
+    url = (os.getenv("OPS_ALERT_WEBHOOK_URL") or "").strip()
+    if not url:
+        raise HTTPException(status_code=503, detail="OPS_ALERT_WEBHOOK_URL is not set.")
+
+    snap = quality_snapshot(window_hours=24)
+    breaches = int(snap.get("escalations_pending_over_sla") or 0)
+    if breaches <= 0:
+        return {"ok": True, "pushed": False, "reason": "no_escalation_sla_breaches"}
+
+    payload = {
+        "source": "voice-farmer-advisor-rag",
+        "escalations_pending_over_sla": breaches,
+        "escalations_pending_total": snap.get("escalations_pending_total"),
+        "sla_target_hours": (snap.get("policy") or {}).get("escalation_sla_target_hours"),
+        "ops_alerts": snap.get("ops_alerts") or [],
+    }
+    try:
+        r = requests.post(url, json=payload, timeout=15)
+        if r.status_code >= 400:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Webhook returned HTTP {r.status_code}: {r.text[:500]}",
+            )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Webhook request failed: {exc}") from exc
+
+    return {"ok": True, "pushed": True, "webhook_status": r.status_code}
 
 
 # ── Text Normalization ───────────────────────────────────────────────────────
@@ -708,7 +769,7 @@ async def rag_answer(req: RagAnswerRequest):
     - dynamic: alerts/market (``build_dynamic_context``)
     - generation: RAG-folder-style assistant (Groq/Gemini/Ollama) when enabled, else chunk composition
     """
-    import rag_pg
+    from farmer_rag_stack.assistant import try_llm_assistant_response
 
     query_text = (req.text or "").strip()
     if not query_text:
@@ -734,49 +795,80 @@ async def rag_answer(req: RagAnswerRequest):
 
     hist = get_conversation_history(req.session_id, limit=6)
     hist_pairs = list(hist)
-    conv_msgs = [{"role": r, "content": (m or "").strip()} for r, m in hist_pairs if (m or "").strip()]
-    from farmer_rag_stack.context_utils import retrieval_query_for
-    from farmer_rag_stack.assistant import try_llm_assistant_response
-    from farmer_rag_stack.nlu_farmer import augment_retrieval_query_with_nlu, parse_farmer_nlu
-    from farmer_rag_stack.retrieval_ranking import rank_pg_hits
-    from chroma_retrieve import merge_pg_chroma_hits, retrieve_chroma_mirror_hits
 
-    farmer_nlu = parse_farmer_nlu(query_text)
-    rq = augment_retrieval_query_with_nlu(
-        retrieval_query_for(nlu.retrieval_query or query_text, conv_msgs),
-        farmer_nlu,
-    )
-    max_d = float(os.environ.get("RAG_PG_MAX_L2_DISTANCE", str(RAG_PG_MAX_L2_DISTANCE)))
-    pool = max(12, int(os.environ.get("RAG_PG_RETRIEVE_POOL", "40")))
-    hits, best = rag_pg.retrieve_for_query(rq, top_k=pool, max_l2_distance=max_d, region=user_region)
-    pg_hits = [h for h in hits if float(h.get("distance", 999)) <= max_d]
-    chroma_k = max(8, int(os.getenv("RAG_CHROMA_TOP_K", "18").strip() or "18"))
-    chroma_hits = retrieve_chroma_mirror_hits(rq, top_k=chroma_k)
-    hits = merge_pg_chroma_hits(pg_hits, chroma_hits)
-
-    def _retrieve_more_voice(q: str) -> list:
-        hh, _ = rag_pg.retrieve_for_query(q, top_k=pool, max_l2_distance=max_d, region=user_region)
-        return [h for h in hh if float(h.get("distance", 999)) <= max_d]
-
-    keep = max(4, int(os.environ.get("RAG_PG_FINAL_TOP_K", "6")))
-    if hits:
-        hits = rank_pg_hits(
-            query_text,
-            rq,
-            hits,
-            farmer_nlu,
-            retrieve_more=_retrieve_more_voice,
-            max_hits=max(keep, 8),
+    cache_allowed = not expert_delivery and not (dyn or "").strip()
+    cache_key = (
+        response_cache.make_rag_cache_key(
+            query_text=query_text,
+            phone_number=req.phone_number,
+            user_region=user_region or "",
         )
-        hits = hits[:keep]
+        if cache_allowed
+        else None
+    )
+    if cache_key:
+        cached = response_cache.get(cache_key)
+        if cached:
+            out_hit = dict(cached)
+            out_hit["meta"] = {"response_cache": "hit"}
+            return out_hit
+
+    t0 = time.perf_counter()
+    max_d = float(os.environ.get("RAG_PG_MAX_L2_DISTANCE", str(RAG_PG_MAX_L2_DISTANCE)))
+    hits, _rq, _farmer_nlu, best = ranked_hits_for_voice_query(
+        query_text=query_text,
+        nlu=nlu,
+        user_region=user_region,
+        hist_pairs=hist_pairs,
+        max_l2_distance=max_d,
+    )
+
+    # Pesticide / fertilizer / spray topics without any KB chunk: never improvise.
+    if (
+        chemical_safety.agrochemical_expert_only_enabled()
+        and chemical_safety.is_high_risk_agrochemical_query(query_text)
+        and not hits
+    ):
+        add_to_escalation(
+            query_text,
+            "Agrochemical-style query with no KB retrieval hits; expert-only path.",
+            phone_number=req.phone_number,
+            session_id=req.session_id,
+            reason_code="AGROCHEM_NO_KB",
+        )
+        body = chemical_safety.CANNED_AGROCHEM_ESCALATION_AM
+        final = f"{expert_delivery}\n\n{body}" if expert_delivery else body
+        final = normalize_text(final)
+        latency_ms = (time.perf_counter() - t0) * 1000
+        sla_h = int(os.getenv("ESCALATION_SLA_HOURS", "48") or "48")
+        trust = {
+            "sources": ["escalation"],
+            "kb_chunks_used": 0,
+            "sources_in_prompt": 0,
+            "latency_ms": round(latency_ms, 1),
+            "escalation_sla_target_hours": sla_h,
+            "human_review": True,
+            "grounding": "escalation",
+            "safety": {"agrochemical_expert_only": True, "reason": "no_kb_hits"},
+        }
+        final = maybe_append_trust_footer(final, sources=["escalation"])
+        return {
+            "response": final,
+            "references": [],
+            "best_distance": best,
+            "trust": trust,
+            "meta": {"response_cache": "bypass", "reason": "agrochemical_escalation"},
+        }
 
     profile_line = build_personalization_block(req.phone_number, profile)
     if user_region:
         profile_line = (profile_line or "") + f"የክልል ማጣሪያ፦ {user_region}።\n"
 
     answer = ""
+    used_llm = False
+    used_compose = False
     if hits:
-        answer = (
+        llm_try = (
             try_llm_assistant_response(
                 query_text=query_text,
                 session_id=req.session_id,
@@ -788,8 +880,13 @@ async def rag_answer(req: RagAnswerRequest):
             )
             or ""
         )
+        if llm_try.strip():
+            answer = llm_try
+            used_llm = True
     if not answer.strip() and hits:
         answer = compose_grounded_answer_no_llm(query_text, hits)
+        if (answer or "").strip():
+            used_compose = True
 
     if dyn and answer:
         final = f"{dyn}\n\n{answer}"
@@ -801,8 +898,9 @@ async def rag_answer(req: RagAnswerRequest):
     if expert_delivery:
         final = f"{expert_delivery}\n\n{final}"
 
+    escalated_empty = False
     if not final:
-        # Escalation for voice pipeline
+        escalated_empty = True
         add_to_escalation(
             query_text,
             "Empty response in voice pipeline.",
@@ -820,6 +918,31 @@ async def rag_answer(req: RagAnswerRequest):
     if voice_cap > 0 and len(final) > voice_cap:
         final = final[: max(0, voice_cap - 3)].rstrip() + "..."
 
+    final = normalize_text(final)
+
+    latency_ms = (time.perf_counter() - t0) * 1000
+    sla_h = int(os.getenv("ESCALATION_SLA_HOURS", "48") or "48")
+    src: list[str] = []
+    if escalated_empty:
+        src.append("escalation")
+    else:
+        if hits:
+            src.append("kb")
+        if (dyn or "").strip():
+            src.append("dynamic")
+        if expert_delivery:
+            src.append("expert_delivery")
+    trust = build_voice_trust_meta(
+        hits=hits,
+        used_llm_assistant=used_llm,
+        used_chunk_compose=used_compose,
+        sources=src,
+        escalated_empty=escalated_empty,
+        latency_ms=latency_ms,
+        sla_target_hours=sla_h,
+    )
+    final = maybe_append_trust_footer(final, sources=src)
+
     refs: list[dict] = []
     for h in hits[:3]:
         refs.append(
@@ -833,7 +956,12 @@ async def rag_answer(req: RagAnswerRequest):
             }
         )
 
-    return {"response": normalize_text(final), "references": refs, "best_distance": best}
+    out = {"response": final, "references": refs, "best_distance": best, "trust": trust}
+    if cache_key and not escalated_empty:
+        g = trust.get("grounding") if isinstance(trust, dict) else None
+        if hits and g in ("kb_llm", "kb_compose"):
+            response_cache.set(cache_key, out)
+    return out
 
 
 @app.post("/kb/ingest")
