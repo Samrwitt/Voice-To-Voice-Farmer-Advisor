@@ -39,5 +39,25 @@ data/
 models/asr/
 models/
 
+*.bi
+*.safetensors
+# Virtual environments
+venv/
+tests/venv/
+env/
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Large binaries
+*.dll
+*.exe
 *.bin
 *.safetensors
+
+# Test cache
+.pytest_cache/
