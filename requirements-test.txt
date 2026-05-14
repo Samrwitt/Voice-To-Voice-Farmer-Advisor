@@ -21,4 +21,4 @@ boto3
 langchain
 langchain-community
 websockets
-passlib[bcrypt]
+passlib[bcrypt]silero-vad
