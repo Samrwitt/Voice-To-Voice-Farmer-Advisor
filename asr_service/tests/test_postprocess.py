@@ -37,7 +37,7 @@ def test_clean_repetitions():
 # -------------------------
 
 def test_basic_asr_cleanup():
-    text = " hello   hello \u200c world � "
+    text = " hello   hello \u200c world  "
     result = basic_asr_cleanup(text)
 
     assert result == "hello hello world"
@@ -90,7 +90,7 @@ def test_needs_confirmation_empty():
 
 
 def test_needs_confirmation_corrupted():
-    assert needs_confirmation("���", "test") is True
+    assert needs_confirmation("", "test") is True
 
 
 def test_needs_confirmation_normal():

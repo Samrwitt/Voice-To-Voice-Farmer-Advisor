@@ -22,3 +22,7 @@ langchain
 langchain-community
 websockets
 passlib[bcrypt]silero-vad
+psycopg[binary]
+sentence-transformers
+pdfminer.six
+python-docx

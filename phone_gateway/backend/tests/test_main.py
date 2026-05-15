@@ -8,7 +8,7 @@ def test_health_check(client):
     assert response.json() == {"status": "ok", "service": "phone-gateway"}
 
 def test_calculate_audio_level():
-    from backend.main import calculate_pcm16_audio_level
+    from main import calculate_pcm16_audio_level
     
     # Silence (all zeros)
     silence = b"\x00" * 100
@@ -23,7 +23,7 @@ def test_calculate_audio_level():
     assert 0.0 <= level <= 1.0
 
 def test_dedupe_asr_transcripts():
-    from backend.main import dedupe_asr_transcripts
+    from main import dedupe_asr_transcripts
     
     transcripts = [
         {"utterance_path": "a.wav", "transcript": "hello"},
@@ -37,7 +37,7 @@ def test_dedupe_asr_transcripts():
     assert unique[1]["utterance_path"] == "b.wav"
 
 def test_build_asr_transcripts_from_active_call():
-    from backend.main import build_asr_transcripts_from_active_call
+    from main import build_asr_transcripts_from_active_call
     
     active_call = {
         "session_id": "test_s",
@@ -62,7 +62,7 @@ def test_build_asr_transcripts_from_active_call():
     assert transcripts[0]["transcript"] == "hello"
     assert transcripts[0]["session_id"] == "test_s"
 
-@patch("backend.main.create_or_get_caller")
+@patch("main.create_or_get_caller")
 def test_register_caller(mock_create, client):
     mock_create.return_value = {
         "caller_id": "c1",

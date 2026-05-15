@@ -5,8 +5,10 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock
 import os
 
-# Add phone_gateway to path so 'backend' package is importable
-sys.path.append(str(Path(__file__).resolve().parents[2]))
+# Add phone_gateway backend to path
+service_path = str(Path(__file__).resolve().parents[1])
+if service_path not in sys.path:
+    sys.path.insert(0, service_path)
 
 # Create dummy directory for StaticFiles if it doesn't exist
 os.makedirs("utterances_dummy", exist_ok=True)
@@ -19,7 +21,7 @@ with patch("sqlalchemy.create_engine"), \
      patch("backend.bootstrap.seed_default_admin"), \
      patch("os.getenv", side_effect=lambda k, d=None: "utterances_dummy" if k == "UTTERANCES_DIR" else d), \
      patch("fastapi.staticfiles.StaticFiles", return_value=MagicMock()):
-    from backend.main import app
+    from main import app
 
 @pytest.fixture
 def client():
