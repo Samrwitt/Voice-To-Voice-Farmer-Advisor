@@ -8,6 +8,9 @@ import re
 
 _AMH = re.compile(r"[\u1200-\u137F]")
 
+# Greeting read at call start (before ASR).
+GREETING_AM = "ጤና ይስጥልን! ግብርና ምክር አገልግሎት ነን ፤ ዛሬ ምን እንርዳዎ ?"
+
 
 def is_asr_gibberish(transcript: str | None, confidence: float | None = None) -> bool:
     t = (transcript or "").strip()
@@ -26,5 +29,5 @@ def is_asr_gibberish(transcript: str | None, confidence: float | None = None) ->
 
 
 GIBBERISH_REPLY_AM = (
-    "ይቅርታ፣ ጥያቄዎን በትክክል አልተረዳኩም። እባክዎ በአማርኛ እንደገና ይናገሩልኝ።"
+    "ጥያቄዎ ግልፅ አልሆነልኝም። እባክዎ ጥያቄውን ረጋ ብለዉ ይድገሙ።"
 )

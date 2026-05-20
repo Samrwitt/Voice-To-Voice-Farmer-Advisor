@@ -259,6 +259,54 @@ async def handle_completed_utterance(
             )
             return
 
+        # If transcript is "fuzzy" (ASR postprocess flagged it), ask user to repeat
+        # rather than escalating downstream on a potentially wrong query.
+        needs_confirmation = bool(asr_result.get("needs_confirmation"))
+        confirmation_prompt = (asr_result.get("confirmation_prompt") or "").strip()
+        unusual_words = asr_result.get("unusual_words") or []
+        if (
+            needs_confirmation
+            or (isinstance(unusual_words, list) and len(unusual_words) >= 4 and len(transcript) < 60)
+        ):
+            rag_answer = confirmation_prompt or GIBBERISH_REPLY_AM
+            print(
+                f"[ASR FUZZY] session={session_id}, needs_confirmation={needs_confirmation}, "
+                f"unusual_words={len(unusual_words)}, transcript={transcript!r}",
+                flush=True,
+            )
+            await safe_send(
+                websocket,
+                send_lock,
+                {
+                    "event": "rag_answer",
+                    "session_id": session_id,
+                    "utterance_path": utterance_path,
+                    "response": rag_answer,
+                    "references": [],
+                    "message": "Fuzzy ASR transcript; asking user to repeat/confirm",
+                },
+            )
+            await safe_send(
+                websocket,
+                send_lock,
+                {
+                    "event": "tts_started",
+                    "session_id": session_id,
+                    "utterance_path": utterance_path,
+                    "message": "Synthesizing voice response...",
+                },
+            )
+            session_state.playback_task = asyncio.create_task(
+                play_advisor_response(
+                    websocket=websocket,
+                    send_lock=send_lock,
+                    session_id=session_id,
+                    utterance_path=utterance_path,
+                    rag_answer=rag_answer,
+                )
+            )
+            return
+
         await safe_send(
             websocket,
             send_lock,
@@ -437,6 +485,34 @@ async def vad_websocket(
             "message": "Silero VAD is ready",
         },
     )
+
+    # ── Greeting ────────────────────────────────────────────────────────────
+    # Speak immediately when the call connects, before the farmer talks.
+    # Playback is cancellable via barge-in in the main loop.
+    try:
+        from transcript_quality import GREETING_AM
+
+        await safe_send(
+            websocket,
+            send_lock,
+            {
+                "event": "tts_started",
+                "session_id": session_id,
+                "utterance_path": f"greeting_{session_id}.wav",
+                "message": "Greeting caller...",
+            },
+        )
+        session_state.playback_task = asyncio.create_task(
+            play_advisor_response(
+                websocket=websocket,
+                send_lock=send_lock,
+                session_id=session_id,
+                utterance_path=f"greeting_{session_id}.wav",
+                rag_answer=GREETING_AM,
+            )
+        )
+    except Exception as e:
+        print(f"[GREETING ERROR] session={session_id}, error={e}", flush=True)
 
     print(
         f"[VAD READY] session={session_id}, "

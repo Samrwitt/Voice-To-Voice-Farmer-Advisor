@@ -27,6 +27,32 @@ import response_cache
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("logic_service")
 
+_AMH_RE = re.compile(r"[\u1200-\u137F]")
+
+
+def _looks_like_fuzzy_transcript(text: str) -> bool:
+    """
+    Defensive gate: if a fuzzy/garbled transcript slips through upstream,
+    do NOT escalate on it (ask the caller to repeat instead).
+    """
+    t = (text or "").strip()
+    if not t:
+        return True
+    if len(t) < 4:
+        return True
+    # Replacement chars / encoding noise
+    if "�" in t:
+        return True
+    # Too little Ethiopic signal for an Amharic-only system (for longer strings)
+    ethiopic = len(_AMH_RE.findall(t))
+    ratio = ethiopic / max(len(t), 1)
+    if len(t) >= 14 and ratio < 0.18:
+        return True
+    # Extremely repetitive
+    if len(t) > 18 and len(set(t)) <= 3:
+        return True
+    return False
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -292,6 +318,20 @@ def _generate_core_rag_response(query_text: str, phone_number: str, session_id: 
         resp = "እባክዎ ጥያቄዎን በአማርኛ ይናገሩ።"  # Please ask your question in Amharic.
         log_conversation(phone_number, session_id, "assistant", resp)
         return resp, "non_amharic", [], {}
+
+    # ── Fuzzy Transcript Gate (no escalation on garbage) ─────────────────────
+    if _looks_like_fuzzy_transcript(query_text):
+        resp = "ጥያቄዎ ግልፅ አልሆነልኝም። እባክዎ ጥያቄውን ረጋ ብለዉ ይድገሙ።"
+        log_conversation(phone_number, session_id, "assistant", resp)
+        log_interaction_record(
+            phone_number=phone_number,
+            session_id=session_id,
+            intent="unknown",
+            response_type="asr_fuzzy_repeat",
+            entities={},
+            confidence=0.0,
+        )
+        return resp, "asr_fuzzy_repeat", [], {}
 
     nlu = analyze_intent(query_text)
     logger.info("NLU intent=%s conf=%.2f entities=%s", nlu.primary_intent, nlu.confidence, nlu.entities)
