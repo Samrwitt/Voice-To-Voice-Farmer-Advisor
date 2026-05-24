@@ -27,7 +27,18 @@ def build_personalization_block(phone_number: str, profile: dict[str, Any] | Non
             lines.append(f"የእርሻ መጠን፦ {fs}")
     crops = profile.get("crops")
     if crops:
-        if isinstance(crops, list):
+        if isinstance(crops, dict):
+            # Show top crops by frequency.
+            try:
+                top = sorted(
+                    ((str(k), int(v or 0)) for k, v in crops.items()),
+                    key=lambda kv: kv[1],
+                    reverse=True,
+                )[:5]
+                crops_s = "፣ ".join(f"{k}({v})" for k, v in top if k)
+            except Exception:
+                crops_s = str(crops)
+        elif isinstance(crops, list):
             crops_s = "፣ ".join(str(x) for x in crops if x)
         else:
             crops_s = str(crops)

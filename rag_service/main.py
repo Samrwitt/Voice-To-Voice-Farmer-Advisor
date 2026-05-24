@@ -14,6 +14,7 @@ from database import (
     get_conversation_history, get_market_price, register_farmer,
     get_farmer_profile, get_alerts_for_region, set_session_state,
     get_session_state, insert_call_record, log_interaction_record,
+    update_farmer_kb_from_turn,
 )
 from nlu import analyze_intent, needs_slot_filling
 from dynamic_layer_runtime import build_dynamic_context
@@ -377,6 +378,66 @@ def _generate_core_rag_response(query_text: str, phone_number: str, session_id: 
     # ── Farmer Profile & Context ──────────────────────────────────────────────
     profile = get_farmer_profile(phone_number)
     farmer_location = (profile or {}).get("location") or "Unknown"
+
+    # ── Personalization confirmation states (crop/region) ─────────────────────
+    state = get_session_state(session_id)
+    if state and state.get("current_state") == "awaiting_profile_crop_confirm":
+        pending = state.get("pending_action") or ""
+        try:
+            payload = json.loads(pending) if isinstance(pending, str) else {}
+        except Exception:
+            payload = {}
+        guess = (payload.get("crop") or "").strip()
+        original_query = (payload.get("original_query") or "").strip()
+        if "አዎ" in query_text or "yes" in query_text.lower():
+            set_session_state(session_id, "active", None)
+            enriched = f"{original_query} {guess}".strip()
+            return generate_rag_response(enriched, phone_number, session_id)
+        if "አይ" in query_text or "no" in query_text.lower():
+            set_session_state(session_id, "active", None)
+            resp = "እሺ፣ ለምን ሰብል ነው ጥያቄዎ? (ስንዴ፣ ጤፍ፣ ቦሎቄ፣ ወዘተ.)"
+            log_conversation(phone_number, session_id, "assistant", resp)
+            log_interaction_record(
+                phone_number=phone_number,
+                session_id=session_id,
+                intent=nlu.primary_intent,
+                response_type="profile_crop_rejected",
+                entities=nlu.entities,
+                confidence=nlu.confidence,
+            )
+            return resp, "awaiting_slot", [], nlu.to_dict()
+        resp = "እባክዎን 'አዎ' ወይም 'አይ' ብለው ያረጋግጡ።"
+        log_conversation(phone_number, session_id, "assistant", resp)
+        return resp, "awaiting_profile_crop_confirm", [], nlu.to_dict()
+
+    if state and state.get("current_state") == "awaiting_profile_region_confirm":
+        pending = state.get("pending_action") or ""
+        try:
+            payload = json.loads(pending) if isinstance(pending, str) else {}
+        except Exception:
+            payload = {}
+        guess = (payload.get("region") or "").strip()
+        original_query = (payload.get("original_query") or "").strip()
+        if "አዎ" in query_text or "yes" in query_text.lower():
+            set_session_state(session_id, "active", None)
+            enriched = f"{original_query} {guess}".strip()
+            return generate_rag_response(enriched, phone_number, session_id)
+        if "አይ" in query_text or "no" in query_text.lower():
+            set_session_state(session_id, "active", None)
+            resp = "ለየትኛው አካባቢ ነው የሚፈልጉት? (ደጋ፣ ቆላ ወይም ወይና ደጋ)"
+            log_conversation(phone_number, session_id, "assistant", resp)
+            log_interaction_record(
+                phone_number=phone_number,
+                session_id=session_id,
+                intent=nlu.primary_intent,
+                response_type="profile_region_rejected",
+                entities=nlu.entities,
+                confidence=nlu.confidence,
+            )
+            return resp, "awaiting_slot", [], nlu.to_dict()
+        resp = "እባክዎን 'አዎ' ወይም 'አይ' ብለው ያረጋግጡ።"
+        log_conversation(phone_number, session_id, "assistant", resp)
+        return resp, "awaiting_profile_region_confirm", [], nlu.to_dict()
     
     # Identify the relevant region for RAG filtering
     # Priority: 1. NLU extracted region, 2. Profile region
@@ -485,6 +546,72 @@ def _generate_core_rag_response(query_text: str, phone_number: str, session_id: 
     # ── Slot Filling Check ────────────────────────────────────────────────────
     clarification = needs_slot_filling(query_text, state, nlu)
     if clarification:
+        # Profile-based smart slot fill: if crop missing and we have a strong guess, confirm it first.
+        if (
+            "ለምን ሰብል" in clarification
+            and profile
+            and isinstance((profile or {}).get("crops"), dict)
+        ):
+            crops_dict = (profile or {}).get("crops") or {}
+            try:
+                top = sorted(
+                    ((str(k), int(v or 0)) for k, v in crops_dict.items()),
+                    key=lambda kv: kv[1],
+                    reverse=True,
+                )
+            except Exception:
+                top = []
+            if top and top[0][1] >= 2:
+                guess = top[0][0]
+                prompt = f"በብዙ ጊዜ ስለ {guess} ትጠይቃላችሁ። ዛሬስ ስለ {guess} ነው? እባክዎ አዎ ወይም አይ ይበሉ።"
+                set_session_state(
+                    session_id,
+                    "awaiting_profile_crop_confirm",
+                    json.dumps({"crop": guess, "original_query": query_text}),
+                )
+                log_conversation(phone_number, session_id, "assistant", prompt)
+                log_interaction_record(
+                    phone_number=phone_number,
+                    session_id=session_id,
+                    intent=nlu.primary_intent,
+                    response_type="profile_crop_suggested",
+                    entities=nlu.entities,
+                    confidence=nlu.confidence,
+                )
+                return prompt, "awaiting_profile_crop_confirm", [], nlu.to_dict()
+
+        # Region guess confirm if missing and profile location maps clearly.
+        if (
+            "ለየትኛው አካባቢ" in clarification
+            and profile
+            and isinstance((profile or {}).get("location"), str)
+        ):
+            loc = str(profile.get("location") or "").lower()
+            guess = None
+            if any(k in loc for k in ["highland", "ደጋ"]):
+                guess = "ደጋ"
+            elif any(k in loc for k in ["lowland", "ቆላ"]):
+                guess = "ቆላ"
+            elif any(k in loc for k in ["midland", "ወይና"]):
+                guess = "ወይና ደጋ"
+            if guess:
+                prompt = f"ቦታዎ እንደ {guess} ይመስላል። ዛሬ የሚፈልጉት ለ {guess} ነው? እባክዎ አዎ ወይም አይ ይበሉ።"
+                set_session_state(
+                    session_id,
+                    "awaiting_profile_region_confirm",
+                    json.dumps({"region": guess, "original_query": query_text}),
+                )
+                log_conversation(phone_number, session_id, "assistant", prompt)
+                log_interaction_record(
+                    phone_number=phone_number,
+                    session_id=session_id,
+                    intent=nlu.primary_intent,
+                    response_type="profile_region_suggested",
+                    entities=nlu.entities,
+                    confidence=nlu.confidence,
+                )
+                return prompt, "awaiting_profile_region_confirm", [], nlu.to_dict()
+
         set_session_state(session_id, "awaiting_slot", query_text)
         log_conversation(phone_number, session_id, "assistant", clarification)
         log_interaction_record(
@@ -496,6 +623,85 @@ def _generate_core_rag_response(query_text: str, phone_number: str, session_id: 
             confidence=nlu.confidence,
         )
         return clarification, "awaiting_slot", [], nlu.to_dict()
+
+    # ── Optional profile-based context (even when not strictly required) ──────
+    # Best-practice: never silently inject assumptions; ask for confirmation.
+    # We only do this when:
+    # - It's an agronomy intent (not market_price/unknown)
+    # - The caller did NOT mention a crop/region already
+    # - The profile has a strong signal (top crop frequency >= 3)
+    if nlu.primary_intent not in ("market_price", "unknown") and profile:
+        # Crop context confirm
+        if not (nlu.entities or {}).get("crop_en") and isinstance((profile or {}).get("crops"), dict):
+            crops_dict = (profile or {}).get("crops") or {}
+            try:
+                top = sorted(
+                    ((str(k), int(v or 0)) for k, v in crops_dict.items()),
+                    key=lambda kv: kv[1],
+                    reverse=True,
+                )
+            except Exception:
+                top = []
+            if top and top[0][1] >= 3:
+                guess = top[0][0]
+                prompt = f"የቀድሞ ጥያቄዎችዎን እየተመለከትኩ ስለ {guess} ብዙ ጊዜ ትጠይቃላችሁ። ይህን ጥያቄ በ {guess} ላይ እንድተገናኝበት ይፈቅዳሉ? እባክዎ አዎ ወይም አይ ይበሉ።"
+                set_session_state(
+                    session_id,
+                    "awaiting_profile_crop_confirm",
+                    json.dumps({"crop": guess, "original_query": query_text}),
+                )
+                log_conversation(phone_number, session_id, "assistant", prompt)
+                log_interaction_record(
+                    phone_number=phone_number,
+                    session_id=session_id,
+                    intent=nlu.primary_intent,
+                    response_type="profile_crop_context_offer",
+                    entities=nlu.entities,
+                    confidence=nlu.confidence,
+                )
+                return prompt, "awaiting_profile_crop_confirm", [], nlu.to_dict()
+
+        # Region context confirm (only if we don't already have a region)
+        if not (nlu.entities or {}).get("region_en") and isinstance((profile or {}).get("location"), str):
+            loc = str(profile.get("location") or "").lower()
+            guess = None
+            if any(k in loc for k in ["highland", "ደጋ"]):
+                guess = "ደጋ"
+            elif any(k in loc for k in ["lowland", "ቆላ"]):
+                guess = "ቆላ"
+            elif any(k in loc for k in ["midland", "ወይና"]):
+                guess = "ወይና ደጋ"
+            if guess:
+                prompt = f"አካባቢዎ እንደ {guess} ተመዝግቧል። ይህን ጥያቄ ለ {guess} አካባቢ እንድተመለከት ይፈቅዳሉ? እባክዎ አዎ ወይም አይ ይበሉ።"
+                set_session_state(
+                    session_id,
+                    "awaiting_profile_region_confirm",
+                    json.dumps({"region": guess, "original_query": query_text}),
+                )
+                log_conversation(phone_number, session_id, "assistant", prompt)
+                log_interaction_record(
+                    phone_number=phone_number,
+                    session_id=session_id,
+                    intent=nlu.primary_intent,
+                    response_type="profile_region_context_offer",
+                    entities=nlu.entities,
+                    confidence=nlu.confidence,
+                )
+                return prompt, "awaiting_profile_region_confirm", [], nlu.to_dict()
+
+    # ── Profile learning (update after we pass gates and slot-filling) ────────
+    try:
+        update_farmer_kb_from_turn(
+            phone_number,
+            name=(profile or {}).get("name") or (profile or {}).get("full_name"),
+            location=(profile or {}).get("location"),
+            preferred_language=(profile or {}).get("preferred_language") or "am",
+            crop_en=(nlu.entities or {}).get("crop_en"),
+            region_en=(nlu.entities or {}).get("region_en") or user_region,
+            intent=nlu.primary_intent,
+        )
+    except Exception:
+        pass
 
     # ── Complex Query Escalation ──────────────────────────────────────────────
     sensitive_intents = {"pest_disease", "soil_fertility", "crop_production"}

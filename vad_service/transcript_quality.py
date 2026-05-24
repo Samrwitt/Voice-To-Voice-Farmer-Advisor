@@ -11,6 +11,11 @@ _AMH = re.compile(r"[\u1200-\u137F]")
 # Greeting read at call start (before ASR).
 GREETING_AM = "ጤና ይስጥልን! ግብርና ምክር አገልግሎት ነን ፤ ዛሬ ምን እንርዳዎ ?"
 
+# Reprompts / safe fallback copy (voice UX).
+SILENCE_REPROMPT_AM = "ድምፅዎት አልተሰማኝም። እባክዎ ጥያቄዎን አሁን ይናገሩ።"
+NOISE_REPROMPT_AM = "ድምፅ የተደባለቀ ይመስላል። እባክዎ ወደ ጸጥ ያለ ቦታ ተመልሰው ጥያቄዎን በግልፅ ይድገሙ።"
+MAX_RETRY_FALLBACK_AM = "ይቅርታ፣ ጥያቄዎን በግልፅ ለመስማት አልቻልኩም። እባክዎ ቆይተው እንደገና ይደውሉ ወይም ወደ ባለሙያ እንዲያስተላልፍ ይጠይቁ።"
+
 
 def is_asr_gibberish(transcript: str | None, confidence: float | None = None) -> bool:
     t = (transcript or "").strip()

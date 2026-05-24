@@ -1,7 +1,7 @@
 FROM farmer-advisor-base
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg espeak-ng \
     && rm -rf /var/lib/apt/lists/*
 
 COPY tts_service/requirements.txt /app/requirements.txt

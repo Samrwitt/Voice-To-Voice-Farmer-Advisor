@@ -1,6 +1,8 @@
 import json
 import asyncio
 import os
+import time
+from collections import deque
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 
@@ -22,6 +24,14 @@ VAD_THRESHOLD = float(os.getenv("VAD_THRESHOLD", "0.85"))
 VAD_MIN_SPEECH_MS = int(os.getenv("VAD_MIN_SPEECH_MS", "400"))
 ASR_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_ASR)
 PLAYBACK_LOCK = asyncio.Lock()
+
+# Voice UX policy (best-practice defaults; override via env).
+SILENCE_REPROMPT_SEC = float(os.getenv("SILENCE_REPROMPT_SEC", "15"))
+MAX_SILENCE_REPROMPTS = int(os.getenv("MAX_SILENCE_REPROMPTS", "2"))
+MAX_ASR_REPROMPTS = int(os.getenv("MAX_ASR_REPROMPTS", "3"))
+NOISE_TOGGLE_WINDOW_SEC = float(os.getenv("NOISE_TOGGLE_WINDOW_SEC", "6"))
+NOISE_TOGGLE_MAX_EVENTS = int(os.getenv("NOISE_TOGGLE_MAX_EVENTS", "8"))
+MAX_NOISE_REPROMPTS = int(os.getenv("MAX_NOISE_REPROMPTS", "2"))
 
 
 # ============================================================
@@ -64,6 +74,13 @@ async def safe_send(
 class SessionState:
     def __init__(self):
         self.playback_task = None
+        self.greeted = False
+        self.silence_reprompts = 0
+        self.noise_reprompts = 0
+        self.asr_reprompts = 0  # gibberish/fuzzy combined
+
+        self.last_user_activity_ts = time.time()
+        self._vad_toggle_ts = deque(maxlen=64)
 
 # ============================================================
 # Playback Handling
@@ -214,6 +231,7 @@ async def handle_completed_utterance(
             return
 
         from transcript_quality import GIBBERISH_REPLY_AM, is_asr_gibberish
+        from transcript_quality import MAX_RETRY_FALLBACK_AM
 
         conf = asr_result.get("confidence")
         try:
@@ -221,7 +239,11 @@ async def handle_completed_utterance(
         except (TypeError, ValueError):
             conf_f = None
         if is_asr_gibberish(transcript, conf_f):
-            rag_answer = GIBBERISH_REPLY_AM
+            session_state.asr_reprompts += 1
+            if session_state.asr_reprompts > MAX_ASR_REPROMPTS:
+                rag_answer = MAX_RETRY_FALLBACK_AM
+            else:
+                rag_answer = GIBBERISH_REPLY_AM
             print(
                 f"[ASR GIBBERISH] session={session_id}, transcript={transcript!r}, conf={conf_f}",
                 flush=True,
@@ -268,7 +290,11 @@ async def handle_completed_utterance(
             needs_confirmation
             or (isinstance(unusual_words, list) and len(unusual_words) >= 4 and len(transcript) < 60)
         ):
-            rag_answer = confirmation_prompt or GIBBERISH_REPLY_AM
+            session_state.asr_reprompts += 1
+            if session_state.asr_reprompts > MAX_ASR_REPROMPTS:
+                rag_answer = MAX_RETRY_FALLBACK_AM
+            else:
+                rag_answer = confirmation_prompt or GIBBERISH_REPLY_AM
             print(
                 f"[ASR FUZZY] session={session_id}, needs_confirmation={needs_confirmation}, "
                 f"unusual_words={len(unusual_words)}, transcript={transcript!r}",
@@ -489,30 +515,32 @@ async def vad_websocket(
     # ── Greeting ────────────────────────────────────────────────────────────
     # Speak immediately when the call connects, before the farmer talks.
     # Playback is cancellable via barge-in in the main loop.
-    try:
-        from transcript_quality import GREETING_AM
+    if not session_state.greeted:
+        session_state.greeted = True
+        try:
+            from transcript_quality import GREETING_AM
 
-        await safe_send(
-            websocket,
-            send_lock,
-            {
-                "event": "tts_started",
-                "session_id": session_id,
-                "utterance_path": f"greeting_{session_id}.wav",
-                "message": "Greeting caller...",
-            },
-        )
-        session_state.playback_task = asyncio.create_task(
-            play_advisor_response(
-                websocket=websocket,
-                send_lock=send_lock,
-                session_id=session_id,
-                utterance_path=f"greeting_{session_id}.wav",
-                rag_answer=GREETING_AM,
+            await safe_send(
+                websocket,
+                send_lock,
+                {
+                    "event": "tts_started",
+                    "session_id": session_id,
+                    "utterance_path": f"greeting_{session_id}.wav",
+                    "message": "Greeting caller...",
+                },
             )
-        )
-    except Exception as e:
-        print(f"[GREETING ERROR] session={session_id}, error={e}", flush=True)
+            session_state.playback_task = asyncio.create_task(
+                play_advisor_response(
+                    websocket=websocket,
+                    send_lock=send_lock,
+                    session_id=session_id,
+                    utterance_path=f"greeting_{session_id}.wav",
+                    rag_answer=GREETING_AM,
+                )
+            )
+        except Exception as e:
+            print(f"[GREETING ERROR] session={session_id}, error={e}", flush=True)
 
     print(
         f"[VAD READY] session={session_id}, "
@@ -538,6 +566,7 @@ async def vad_websocket(
                 if pcm_chunk:
                     chunk_count += 1
                     total_audio_bytes += len(pcm_chunk)
+                    session_state.last_user_activity_ts = time.time()
 
                     if chunk_count % 20 == 0:
                         print(
@@ -552,6 +581,9 @@ async def vad_websocket(
                 for event in events:
                     event_name = event.get("event")
                     utterance_path = event.get("utterance_path")
+                    now_ts = time.time()
+                    if event_name in ("speech_started", "speech_ended"):
+                        session_state._vad_toggle_ts.append(now_ts)
 
                     await safe_send(
                         websocket,
@@ -593,6 +625,96 @@ async def vad_websocket(
                                 session_state=session_state,
                                 phone_number=phone_number,
                             )
+
+                # ── Silence / noise reprompt policy (non-blocking) ───────────────
+                # Only check occasionally to avoid per-chunk overhead.
+                if chunk_count % 30 == 0:
+                    now_ts = time.time()
+
+                    # Noise: unstable VAD toggles inside a short window.
+                    if (
+                        session_state.noise_reprompts < MAX_NOISE_REPROMPTS
+                        and len(session_state._vad_toggle_ts) >= NOISE_TOGGLE_MAX_EVENTS
+                    ):
+                        oldest = session_state._vad_toggle_ts[0]
+                        if (now_ts - oldest) <= NOISE_TOGGLE_WINDOW_SEC:
+                            session_state.noise_reprompts += 1
+                            from transcript_quality import NOISE_REPROMPT_AM
+
+                            await safe_send(
+                                websocket,
+                                send_lock,
+                                {
+                                    "event": "rag_answer",
+                                    "session_id": session_id,
+                                    "utterance_path": f"noise_{session_id}_{session_state.noise_reprompts}.wav",
+                                    "response": NOISE_REPROMPT_AM,
+                                    "references": [],
+                                    "message": "Unstable VAD/noise detected; reprompting caller",
+                                },
+                            )
+                            await safe_send(
+                                websocket,
+                                send_lock,
+                                {
+                                    "event": "tts_started",
+                                    "session_id": session_id,
+                                    "utterance_path": f"noise_{session_id}_{session_state.noise_reprompts}.wav",
+                                    "message": "Synthesizing voice response...",
+                                },
+                            )
+                            session_state.playback_task = asyncio.create_task(
+                                play_advisor_response(
+                                    websocket=websocket,
+                                    send_lock=send_lock,
+                                    session_id=session_id,
+                                    utterance_path=f"noise_{session_id}_{session_state.noise_reprompts}.wav",
+                                    rag_answer=NOISE_REPROMPT_AM,
+                                )
+                            )
+                            session_state._vad_toggle_ts.clear()
+
+                    # Silence: no user activity for T seconds.
+                    silence_for = now_ts - session_state.last_user_activity_ts
+                    if (
+                        silence_for >= SILENCE_REPROMPT_SEC
+                        and session_state.silence_reprompts < MAX_SILENCE_REPROMPTS
+                    ):
+                        session_state.silence_reprompts += 1
+                        session_state.last_user_activity_ts = now_ts
+                        from transcript_quality import SILENCE_REPROMPT_AM
+
+                        await safe_send(
+                            websocket,
+                            send_lock,
+                            {
+                                "event": "rag_answer",
+                                "session_id": session_id,
+                                "utterance_path": f"silence_{session_id}_{session_state.silence_reprompts}.wav",
+                                "response": SILENCE_REPROMPT_AM,
+                                "references": [],
+                                "message": "Caller silence timeout; reprompting",
+                            },
+                        )
+                        await safe_send(
+                            websocket,
+                            send_lock,
+                            {
+                                "event": "tts_started",
+                                "session_id": session_id,
+                                "utterance_path": f"silence_{session_id}_{session_state.silence_reprompts}.wav",
+                                "message": "Synthesizing voice response...",
+                            },
+                        )
+                        session_state.playback_task = asyncio.create_task(
+                            play_advisor_response(
+                                websocket=websocket,
+                                send_lock=send_lock,
+                                session_id=session_id,
+                                utterance_path=f"silence_{session_id}_{session_state.silence_reprompts}.wav",
+                                rag_answer=SILENCE_REPROMPT_AM,
+                            )
+                        )
 
             # ============================================================
             # Text control message

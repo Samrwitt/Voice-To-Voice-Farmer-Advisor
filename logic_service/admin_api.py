@@ -39,6 +39,7 @@ from models import (
     CallSessionPG,
     ConversationMessage,
     Caller,
+    AuditLog,
     DashboardUser,
     Escalation,
     FarmerKB,
@@ -52,6 +53,37 @@ from models import (
 router = APIRouter(prefix="/admin", tags=["admin"])
 
 RAG_SERVICE_URL = os.getenv("RAG_SERVICE_URL", "http://rag-service:8000").rstrip("/")
+
+def _audit(
+    db: Session,
+    actor: Optional[DashboardUser],
+    action: str,
+    resource_type: str = "",
+    resource_id: str = "",
+    meta: Optional[dict] = None,
+) -> None:
+    """
+    Append-only audit log for privileged actions.
+    Prototype policy: fail-open (do not break admin UX), but always attempt persistence.
+    """
+    try:
+        db.add(
+            AuditLog(
+                actor_user_id=getattr(actor, "user_id", None),
+                actor_role=getattr(actor, "role", None),
+                action=action,
+                resource_type=resource_type or None,
+                resource_id=resource_id or None,
+                meta=meta or None,
+            )
+        )
+        db.commit()
+    except Exception as exc:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        print(f"[AUDIT ERROR] {exc}", flush=True)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -146,12 +178,29 @@ def login(req: LoginRequest, db: Session = Depends(get_db)):
 
     user = db.query(DashboardUser).filter(DashboardUser.email == email).first()
     if not user or not verify_password(req.password, user.password_hash):
+        _audit(
+            db,
+            None,
+            "admin_login_failed",
+            resource_type="dashboard_user",
+            resource_id=email or "",
+            meta={"reason": "invalid_credentials"},
+        )
         raise HTTPException(status_code=401, detail="Invalid email or password")
     if not user.is_active:
+        _audit(
+            db,
+            user,
+            "admin_login_failed",
+            resource_type="dashboard_user",
+            resource_id=user.user_id,
+            meta={"reason": "disabled"},
+        )
         raise HTTPException(status_code=403, detail="User account is disabled")
 
     user.last_login_at = datetime.utcnow()
     db.commit()
+    _audit(db, user, "admin_login_success", resource_type="dashboard_user", resource_id=user.user_id)
 
     token = create_access_token({
         "sub": user.user_id,
@@ -282,6 +331,14 @@ def create_user(
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
+    _audit(
+        db,
+        creator,
+        "create_user",
+        resource_type="dashboard_user",
+        resource_id=new_user.user_id,
+        meta={"role": new_user.role, "email": new_user.email},
+    )
     return _user_dict(new_user)
 
 

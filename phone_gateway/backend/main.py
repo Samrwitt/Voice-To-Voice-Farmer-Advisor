@@ -3,6 +3,7 @@ import json
 import os
 import uuid
 from pathlib import Path
+from datetime import datetime, timedelta
 
 import websockets
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, HTTPException
@@ -57,6 +58,8 @@ app = FastAPI(title="Phone Browser Telephony Gateway")
 # GET  /api/auth/users
 app.include_router(auth_router)
 
+CALL_RECORDING_RETENTION_DAYS = int(os.getenv("CALL_RECORDING_RETENTION_DAYS", "30") or "30")
+
 
 # ============================================================
 # CORS
@@ -91,6 +94,36 @@ FRONTEND_DIR = BASE_DIR / "frontend"
 
 app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
 app.mount("/static/utterances", StaticFiles(directory="/app/utterances"), name="utterances")
+
+async def _recording_retention_loop() -> None:
+    """
+    Best-practice privacy control: periodically delete old local call recordings.
+    S3/MinIO uploads are controlled separately by bucket lifecycle policies.
+    """
+    recordings_base = Path(os.getenv("RECORDINGS_DIR", "/app/recordings"))
+    audio_dir = recordings_base / "audio"
+    while True:
+        try:
+            if CALL_RECORDING_RETENTION_DAYS > 0 and audio_dir.exists():
+                cutoff = datetime.utcnow() - timedelta(days=CALL_RECORDING_RETENTION_DAYS)
+                deleted = 0
+                for p in audio_dir.glob("*"):
+                    try:
+                        if not p.is_file():
+                            continue
+                        mtime = datetime.utcfromtimestamp(p.stat().st_mtime)
+                        if mtime < cutoff:
+                            p.unlink(missing_ok=True)
+                            deleted += 1
+                    except Exception:
+                        continue
+                if deleted:
+                    print(f"[RETENTION] Deleted {deleted} old recordings (>{CALL_RECORDING_RETENTION_DAYS}d)", flush=True)
+        except Exception as exc:
+            print(f"[RETENTION] Cleanup error: {exc}", flush=True)
+
+        # Run daily.
+        await asyncio.sleep(24 * 60 * 60)
 
 
 class TtsSynthesizeBody(BaseModel):
@@ -429,7 +462,14 @@ def health_check():
     return {
         "status": "ok",
         "service": "phone-gateway",
+        "call_recording_retention_days": CALL_RECORDING_RETENTION_DAYS,
     }
+
+
+@app.on_event("startup")
+async def _startup_tasks():
+    # Start privacy retention loop.
+    asyncio.create_task(_recording_retention_loop())
 
 
 # ============================================================

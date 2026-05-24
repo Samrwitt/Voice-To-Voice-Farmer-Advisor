@@ -199,6 +199,11 @@ services:
         condition: service_completed_successfully
     ports:
       - "8009:8009"
+    environment:
+      # Offline-first; set TTS_PROVIDER=gtts and TTS_ENABLE_GTTS=1 to allow network TTS.
+      TTS_PROVIDER: ${TTS_PROVIDER:-espeak}
+      TTS_ENABLE_GTTS: ${TTS_ENABLE_GTTS:-0}
+      TTS_SAMPLE_RATE: ${TTS_SAMPLE_RATE:-16000}
 
   admin-dashboard:
     image: farmer-advisor-admin-dashboard

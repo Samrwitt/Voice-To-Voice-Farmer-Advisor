@@ -45,10 +45,31 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-# Allow the admin dashboard (any origin in dev; tighten for prod)
+ADMIN_DASHBOARD_ORIGIN = os.getenv(
+    "ADMIN_DASHBOARD_ORIGIN",
+    "http://localhost:3000",
+).strip()
+EXTRA_CORS_ORIGINS = [
+    o.strip()
+    for o in (os.getenv("EXTRA_CORS_ORIGINS", "") or "").split(",")
+    if o.strip()
+]
+
+# Allow the admin dashboard origins; avoid wildcard in production.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=list(
+        dict.fromkeys(
+            [
+                ADMIN_DASHBOARD_ORIGIN,
+                "http://localhost:3000",
+                "http://127.0.0.1:3000",
+                "http://localhost:3001",
+                "http://127.0.0.1:3001",
+                *EXTRA_CORS_ORIGINS,
+            ]
+        )
+    ),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

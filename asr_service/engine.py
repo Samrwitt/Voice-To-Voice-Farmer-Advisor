@@ -65,10 +65,27 @@ class ASREngine:
 
         segments = []
         texts = []
+        conf_parts: list[float] = []
 
         for segment in segments_iter:
             segment_text = segment.text.strip()
             texts.append(segment_text)
+
+            # Estimate transcription confidence from per-segment metrics when available.
+            # faster-whisper segments commonly expose avg_logprob / no_speech_prob.
+            try:
+                avg_logprob = getattr(segment, "avg_logprob", None)
+                no_speech_prob = getattr(segment, "no_speech_prob", None)
+                if isinstance(avg_logprob, (int, float)):
+                    # avg_logprob is typically <= 0; exp() maps to (0, 1].
+                    import math
+
+                    p = math.exp(float(avg_logprob))
+                    if isinstance(no_speech_prob, (int, float)):
+                        p = p * (1.0 - float(no_speech_prob))
+                    conf_parts.append(max(0.0, min(1.0, float(p))))
+            except Exception:
+                pass
 
             segments.append(
                 {
@@ -84,6 +101,18 @@ class ASREngine:
         latency = time.time() - start_time
         logger.info(f"Transcription completed in {latency:.2f}s. Result: {processed['final']}")
 
+        # Final confidence: prefer segment-derived confidence; fall back to language_probability.
+        try:
+            seg_conf = (sum(conf_parts) / len(conf_parts)) if conf_parts else None
+        except Exception:
+            seg_conf = None
+        lang_prob = float(info.language_probability)
+        if seg_conf is None:
+            final_conf = lang_prob
+        else:
+            # Combine language ID confidence with acoustic/token confidence.
+            final_conf = max(0.0, min(1.0, 0.35 * lang_prob + 0.65 * float(seg_conf)))
+
         return {
 
             "language": info.language,
@@ -97,7 +126,7 @@ class ASREngine:
             "final_transcript": processed["final"],
             "transcript": processed["final"],
             "text": processed["final"],
-            "confidence": float(info.language_probability), # Proxy for confidence
+            "confidence": float(final_conf),
             "engine": "whisper_local",
             "audio_id": Path(audio_path).stem,
 
