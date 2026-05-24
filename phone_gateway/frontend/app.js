@@ -12,11 +12,7 @@ let playbackStartTime = 0;
 const DEFAULT_SERVICE_NUMBER = "8028";
 const TARGET_SAMPLE_RATE = 16000;
 
-/** Played once per session when the server confirms the call (Amharic). */
-const CALL_GREETING_AM =
-  "ሰላም ይሁንልዎ። እኔ የግብርና አማካሪ ነኝ። በምን ጉዳይ ልርዳዎት እንደምትፈልጉ ይንገሩኝ።";
-
-let greetingPlayedSessionId = null;
+// Greeting played on start is now streamed by the backend VAD service
 
 let callerId = localStorage.getItem("caller_id");
 let callerName = localStorage.getItem("caller_name");
@@ -302,11 +298,6 @@ async function startCall() {
           if (sessionInfo) {
             sessionInfo.innerText = `Session: ${data.session_id}`;
           }
-          const sid = data.session_id || "";
-          if (sid && greetingPlayedSessionId !== sid) {
-            greetingPlayedSessionId = sid;
-            void playCallOpeningGreeting();
-          }
         }
 
         if (data.event === "speech_started") {
@@ -338,8 +329,6 @@ async function startCall() {
 
       cleanupAudio();
 
-      greetingPlayedSessionId = null;
-
       setStatus("Ended");
       activeCall = false;
       stopTimer();
@@ -352,40 +341,6 @@ async function startCall() {
   }
 }
 
-async function playCallOpeningGreeting() {
-  try {
-    setStatus("Advisor greeting…");
-    const res = await fetch("/api/tts/synthesize", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text: CALL_GREETING_AM }),
-    });
-    if (!res.ok) {
-      console.warn("Opening greeting TTS failed:", res.status);
-      if (activeCall) setStatus("Listening...");
-      return;
-    }
-    const raw = await res.arrayBuffer();
-    const copy = raw.slice(0);
-    if (!audioContext) {
-      audioContext = new (window.AudioContext || window.webkitAudioContext)();
-    }
-    if (audioContext.state === "suspended") {
-      await audioContext.resume();
-    }
-    const decoded = await audioContext.decodeAudioData(copy);
-    const src = audioContext.createBufferSource();
-    src.buffer = decoded;
-    src.connect(audioContext.destination);
-    src.onended = () => {
-      if (activeCall) setStatus("Listening...");
-    };
-    src.start();
-  } catch (e) {
-    console.warn("Opening greeting skipped:", e);
-    if (activeCall) setStatus("Listening...");
-  }
-}
 
 async function startPCMStreaming(stream) {
   if (!audioContext) {
