@@ -131,6 +131,13 @@ def init_db():
                   duration INTEGER NOT NULL,
                   timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
 
+    # Dynamic Knowledge Cache (for web search fallbacks)
+    c.execute('''CREATE TABLE IF NOT EXISTS dynamic_knowledge_cache
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  query TEXT UNIQUE NOT NULL,
+                  content TEXT NOT NULL,
+                  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+
     conn.commit()
     conn.close()
 
@@ -365,6 +372,28 @@ def get_market_price(crop_name: str, region: str = None):
     result = c.fetchone()
     conn.close()
     return result  # (price, unit, updated_at) or None
+
+def get_dynamic_knowledge(query: str):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT content FROM dynamic_knowledge_cache WHERE query = ?", (query.lower().strip(),))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return row[0]
+    return None
+
+def set_dynamic_knowledge(query: str, content: str):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        c.execute("INSERT INTO dynamic_knowledge_cache (query, content) VALUES (?, ?) ON CONFLICT(query) DO UPDATE SET content=excluded.content, updated_at=CURRENT_TIMESTAMP",
+                  (query.lower().strip(), content))
+        conn.commit()
+    except Exception as e:
+        print(f"Error setting dynamic knowledge: {e}")
+    finally:
+        conn.close()
 
 def register_farmer(phone_number: str, name: str, location: str, preferred_language: str = 'am'):
     conn = sqlite3.connect(DB_PATH)

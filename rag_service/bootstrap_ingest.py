@@ -16,20 +16,39 @@ def _iter_files(folder: Path) -> list[Path]:
     return sorted(out, key=lambda p: p.name.lower())
 
 
+def _ingest_folders() -> list[Path]:
+    raw = os.getenv("AUTO_INGEST_KB_DIRS", "").strip()
+    if not raw:
+        raw = os.getenv("AUTO_INGEST_KB_DIR", "")
+    parts = [p.strip() for p in raw.replace(";", ",").split(",") if p.strip()]
+    out: list[Path] = []
+    seen: set[str] = set()
+    for part in parts:
+        p = Path(part).expanduser()
+        key = str(p)
+        if key not in seen:
+            seen.add(key)
+            out.append(p)
+    return out
+
+
 def auto_ingest_if_empty() -> dict:
     """
     One-time bootstrap: ingest local KB files into Postgres+pgvector if the KB is empty.
     Controlled by:
       AUTO_INGEST_ON_STARTUP=true
       AUTO_INGEST_KB_DIR=/app/kb_documents/amharic
+      AUTO_INGEST_KB_DIRS=/app/kb_documents/amharic,/app/RAG/KB
     """
     enabled = os.getenv("AUTO_INGEST_ON_STARTUP", "false").lower() in ("1", "true", "yes")
     if not enabled:
         return {"enabled": False, "ingested": 0, "skipped": "disabled"}
 
-    folder = Path(os.getenv("AUTO_INGEST_KB_DIR", "")).expanduser()
-    if not folder or not folder.is_dir():
-        return {"enabled": True, "ingested": 0, "skipped": f"folder_not_found:{folder}"}
+    folders = _ingest_folders()
+    valid_folders = [p for p in folders if p.is_dir()]
+    missing_folders = [str(p) for p in folders if not p.is_dir()]
+    if not valid_folders:
+        return {"enabled": True, "ingested": 0, "skipped": f"folders_not_found:{missing_folders or folders}"}
 
     import rag_pg
     import psycopg
@@ -38,6 +57,17 @@ def auto_ingest_if_empty() -> dict:
 
     if not rag_pg.kb_pg_enabled():
         return {"enabled": True, "ingested": 0, "skipped": "pg_not_configured"}
+
+    model_path = Path(rag_pg.EMBEDDING_MODEL_NAME)
+    if model_path.is_absolute():
+        has_weights = any((model_path / name).exists() for name in ("model.safetensors", "pytorch_model.bin"))
+        if not model_path.exists() or not has_weights:
+            return {
+                "enabled": True,
+                "ingested": 0,
+                "skipped": "embedding_model_missing_or_incomplete",
+                "embedding_model": str(model_path),
+            }
 
     rag_pg.init_pg_schema()
 
@@ -81,7 +111,9 @@ def auto_ingest_if_empty() -> dict:
             return "\n".join(parts)
         return ""
 
-    files = _iter_files(folder)
+    files: list[Path] = []
+    for folder in valid_folders:
+        files.extend(_iter_files(folder))
     if not files:
         return {"enabled": True, "ingested": 0, "skipped": "no_files"}
 
@@ -205,9 +237,9 @@ def auto_ingest_if_empty() -> dict:
     return {
         "enabled": True,
         "ingested": ingested,
-        "folder": str(folder),
+        "folders": [str(p) for p in valid_folders],
+        "missing_folders": missing_folders,
         "files_seen": len(files),
         "embed_batch_size": batch_size,
         "max_files": max_files,
     }
-

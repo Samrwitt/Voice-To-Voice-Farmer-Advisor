@@ -4,8 +4,13 @@ from __future__ import annotations
 
 import os
 from typing import Any
+import time
 
 import httpx
+
+_WEATHER_CACHE: dict[str, tuple[float, str]] = {}
+CACHE_TTL_SEC = 3600.0  # 1 hour cache limit
+
 
 
 def _geocode(name: str) -> tuple[float, float, str] | None:
@@ -32,6 +37,13 @@ def fetch_weather_summary(location: str) -> str:
     loc = (location or "").strip()
     if not loc:
         return ""
+        
+    now = time.time()
+    if loc in _WEATHER_CACHE:
+        timestamp, cached_res = _WEATHER_CACHE[loc]
+        if now - timestamp < CACHE_TTL_SEC:
+            return cached_res
+
     try:
         geo = _geocode(loc)
         if not geo:
@@ -59,6 +71,8 @@ def fetch_weather_summary(location: str) -> str:
             f"እርጥበት (%)፦ {rh}" if rh is not None else "",
             f"ዝናብ (ሚሜ)፦ {pr}" if pr is not None else "",
         ]
-        return "\n".join(x for x in lines if x).strip()
+        res = "\n".join(x for x in lines if x).strip()
+        _WEATHER_CACHE[loc] = (now, res)
+        return res
     except Exception as e:
         return f"የአየር ሁኔታ አገልግሎት ላይ ስህተት፦ {e}"

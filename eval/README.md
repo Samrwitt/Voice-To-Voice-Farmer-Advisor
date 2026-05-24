@@ -39,9 +39,13 @@ Policy knobs (read in snapshot JSON `policy`):
 
 Optional Amharic disclaimer footer on KB answers: set `RAG_TRUST_FOOTER=1`.
 
-### Agrochemical safety (voice RAG)
+### Agrochemical safety & low-confidence escalation (voice RAG)
 
-When `RAG_AGROCHEM_EXPERT_ONLY=1` (default in `docker-compose` for `rag-service`), queries that look like pesticide / fertilizer / spray / dosing **with zero KB retrieval hits** get a fixed Amharic deferral to a human agronomist, an escalation row (`reason_code=AGROCHEM_NO_KB`), and `trust.safety` metadata instead of improvising from the LLM or dynamic-only context. Set to `0` for local dev without a KB.
+When `RAG_AGROCHEM_EXPERT_ONLY=1` (default in `docker-compose`), pesticide / fertilizer / spray / dose questions **without a confident KB match** escalate (`AGROCHEM_NO_KB`). A match requires in-threshold chunk distances **and** `best_distance <= RAG_PG_MAX_L2_DISTANCE` (weak Chroma-only junk with a high PG `best` still escalates).
+
+`RAG_VOICE_LOW_CONF_ESCALATE=1` (default) applies the same distance rule to **non-agrochemical** queries (`LOW_CONFIDENCE`).
+
+`POST /rag/answer` logs user/assistant turns to `conversation_history` so follow-up questions in the same `session_id` appear in `/rag/debug/context` (`session_history_count`, `recent_advisory_records`).
 
 `POST /ask` on **logic_service** forwards the same **`trust`** object when the answer came from `RAG_SERVICE_URL` `/rag/answer`, so browser and JSON clients—not only the VAD WebSocket—see grounding. The VAD service also attaches **`trust`** on the WebSocket `rag_answer` event when present.
 
@@ -62,6 +66,19 @@ When `RAG_AGROCHEM_EXPERT_ONLY=1` (default in `docker-compose` for `rag-service`
 ### Response cache (latency / cost)
 
 When **`RAG_RESPONSE_CACHE_TTL_SEC`** > 0, `/rag/answer` caches **KB-only** replies (no dynamic block, no expert delivery prefix) keyed by normalized query + phone + region. Cache hits include `"meta": { "response_cache": "hit" }`.
+
+## Team API keys (Groq / Gemini rate limits)
+
+Put every teammate's key in the **root** `.env` (see `.env.example`):
+
+```bash
+GROQ_API_KEYS=key1,key2,key3,key4,key5
+GEMINI_API_KEYS=key1,key2,key3,key4,key5
+RAG_LLM_BACKEND=groq
+GROQ_GEMINI_FALLBACK=1
+```
+
+The RAG service **rotates** keys round-robin per request. On HTTP **429/503**, that key is cooled down (~90s, `RAG_API_KEY_COOLDOWN_SEC`) and the **next** key is used. If all Groq keys are busy, it falls back to the Gemini pool (when `GROQ_GEMINI_FALLBACK=1`).
 
 ## Distribution (non-code)
 

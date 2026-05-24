@@ -14,6 +14,7 @@ from database import (
     get_conversation_history, get_market_price, register_farmer,
     get_farmer_profile, get_alerts_for_region, set_session_state,
     get_session_state, insert_call_record, log_interaction_record,
+    get_dynamic_knowledge, set_dynamic_knowledge
 )
 from nlu import analyze_intent, needs_slot_filling
 from dynamic_layer_runtime import build_dynamic_context
@@ -23,6 +24,7 @@ from trust_meta import build_voice_trust_meta, maybe_append_trust_footer
 from rag_retrieval import ranked_hits_for_voice_query
 import chemical_safety
 import response_cache
+import voice_guards
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("logic_service")
@@ -113,6 +115,13 @@ class RagAnswerRequest(BaseModel):
     session_id: str = "default_session"
 
 
+class RagDebugContextRequest(BaseModel):
+    text: str
+    phone_number: str = "Unknown"
+    session_id: str = "debug_session"
+    retrieve: bool = True
+
+
 def _require_metrics_token(authorization: Optional[str] = Header(None)) -> None:
     tok = os.getenv("RAG_METRICS_TOKEN", "").strip()
     if not tok:
@@ -185,6 +194,125 @@ def api_ops_notify():
         raise HTTPException(status_code=502, detail=f"Webhook request failed: {exc}") from exc
 
     return {"ok": True, "pushed": True, "webhook_status": r.status_code}
+
+
+@app.get("/rag/diagnostics", dependencies=[Depends(_require_metrics_token)])
+def rag_diagnostics():
+    """Readiness snapshot for KB ingestion, dynamic data, sources, and voice wiring."""
+    from pathlib import Path
+
+    def _pdfs(folder: str) -> list[str]:
+        p = Path(folder)
+        if not p.is_dir():
+            return []
+        return sorted(x.name for x in p.glob("*.pdf") if x.is_file())
+
+    local_dirs = [
+        os.getenv("AUTO_INGEST_KB_DIR", "/app/kb_documents/amharic"),
+        *[
+            x.strip()
+            for x in os.getenv("AUTO_INGEST_KB_DIRS", "").replace(";", ",").split(",")
+            if x.strip()
+        ],
+        "RAG/KB",
+        "kb_documents/amharic",
+    ]
+    seen_dirs: list[str] = []
+    local_pdfs: dict[str, list[str]] = {}
+    for d in local_dirs:
+        if d and d not in seen_dirs:
+            seen_dirs.append(d)
+            rows = _pdfs(d)
+            if rows:
+                local_pdfs[d] = rows
+
+    pg = {"enabled": False, "approved_documents": 0, "approved_chunks": 0, "documents": []}
+    embedding = {
+        "model": os.getenv("KB_EMBEDDING_MODEL", "paraphrase-multilingual-MiniLM-L12-v2"),
+        "path_exists": None,
+        "weights_present": None,
+    }
+    try:
+        import rag_pg
+        model_path = Path(rag_pg.EMBEDDING_MODEL_NAME)
+        embedding["model"] = rag_pg.EMBEDDING_MODEL_NAME
+        embedding["path_exists"] = model_path.exists() if model_path.is_absolute() else None
+        embedding["weights_present"] = (
+            any((model_path / name).exists() for name in ("model.safetensors", "pytorch_model.bin"))
+            if model_path.is_absolute()
+            else None
+        )
+        pg["enabled"] = bool(rag_pg.kb_pg_enabled())
+        if rag_pg.kb_pg_enabled():
+            pg["approved_documents"] = rag_pg.count_documents()
+            pg["approved_chunks"] = rag_pg.count_approved_chunks()
+            import psycopg
+
+            with psycopg.connect(rag_pg.POSTGRES_URL) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT original_filename, title, status
+                        FROM rag_kb_documents
+                        ORDER BY original_filename NULLS LAST, title
+                        LIMIT 500;
+                        """
+                    )
+                    pg["documents"] = [
+                        {"original_filename": r[0], "title": r[1], "status": r[2]}
+                        for r in (cur.fetchall() or [])
+                    ]
+    except Exception as exc:
+        pg["error"] = str(exc)
+
+    ingested_names = {
+        str(d.get("original_filename") or "").strip()
+        for d in pg.get("documents", [])
+        if d.get("status") == "approved"
+    }
+    all_pdf_names = {name for names in local_pdfs.values() for name in names}
+    missing_pdf_names = sorted(name for name in all_pdf_names if name not in ingested_names)
+
+    return {
+        "kb_ingestion": {
+            "embedding": embedding,
+            "local_pdf_count": len(all_pdf_names),
+            "local_pdf_dirs": {k: len(v) for k, v in local_pdfs.items()},
+            "approved_pg_documents": pg.get("approved_documents"),
+            "approved_pg_chunks": pg.get("approved_chunks"),
+            "missing_local_pdfs_in_pg_by_filename": missing_pdf_names[:200],
+            "auto_ingest_dirs": os.getenv("AUTO_INGEST_KB_DIRS") or os.getenv("AUTO_INGEST_KB_DIR"),
+            "auto_ingest_max_files": os.getenv("AUTO_INGEST_MAX_FILES"),
+        },
+        "dynamic_data": {
+            "cache_table": "dynamic_knowledge_cache",
+            "weather": {"provider": "Open-Meteo", "cache_ttl_sec": os.getenv("RAG_WEATHER_CACHE_TTL_SEC", "7200")},
+            "soil": {"provider": "SoilGrids/ISRIC", "cache_ttl_sec": os.getenv("RAG_SOIL_CACHE_TTL_SEC", str(180 * 24 * 3600))},
+            "market": {
+                "current_provider": "local market_prices table with mock demo fallback",
+                "nmis_live_adapter": False,
+                "planned_sources": ["NMIS", "ECX", "ESS", "FAO", "manual CSV/Excel"],
+            },
+        },
+        "voice_pipeline": {
+            "asr_to_rag": "vad_service calls POST /rag/answer with ASR transcript",
+            "rag_to_tts": "vad_service sends response text to tts_service /synthesize",
+            "rag_service_url_env": os.getenv("RAG_SERVICE_URL", "not set in rag-service"),
+            "tts_url": TTS_URL,
+            "stt_url": STT_URL,
+        },
+        "nlu": {
+            "current": "rule-based multilingual NLU",
+            "afroxlmr_loaded": False,
+            "afroxlmr_plugin_boundary": "farmer_rag_stack.smart_advisory.classify_intent_and_entities",
+        },
+        "performance": {
+            "response_cache_ttl_sec": os.getenv("RAG_RESPONSE_CACHE_TTL_SEC", "0"),
+            "smart_pipeline": os.getenv("RAG_SMART_PIPELINE", "1"),
+            "final_backend": os.getenv("RAG_SMART_FINAL_BACKEND", "gemini"),
+            "web_mode": os.getenv("RAG_WEB_MODE", "off"),
+        },
+    }
 
 
 # ── Text Normalization ───────────────────────────────────────────────────────
@@ -502,6 +630,32 @@ def _generate_core_rag_response(query_text: str, phone_number: str, session_id: 
                 )
                 return resp, "market_price", [], nlu.to_dict()
             else:
+                dyn_key = f"market_price_{crop_name}_{farmer_location}"
+                cached = get_dynamic_knowledge(dyn_key)
+                if cached:
+                    log_conversation(phone_number, session_id, "assistant", cached)
+                    log_interaction_record(phone_number, session_id, "market_price", "market_price_dynamic", nlu.entities, nlu.confidence)
+                    return cached, "market_price_dynamic", [], nlu.to_dict()
+
+                from farmer_rag_stack.rag_tools import web_search
+                from farmer_rag_stack.query_llm import run_sync_llm
+                from farmer_rag_stack.llm_providers import effective_llm_backend
+                
+                snippets = web_search.fetch_web_snippets(f"current market price {crop_name} {farmer_location} Ethiopia", max_results=3)
+                if snippets:
+                    web_text = web_search.format_web_block(snippets)
+                    prompt = f"መመሪያ: ከታች ካለው መረጃ የ {crop_name} የአሁኑን የገበያ ዋጋ ፈልግ እና በአጭሩ በአማርኛ ንገረኝ። ዋጋ ከሌለ 'አልተገኘም' በል።\n\nመረጃ:\n{web_text}"
+                    msgs = [{"role": "user", "content": prompt}]
+                    try:
+                        ans, _ = run_sync_llm(effective_llm_backend(), msgs, fast=True)
+                        if "አልተገኘም" not in ans and len(ans) > 5:
+                            set_dynamic_knowledge(dyn_key, ans)
+                            log_conversation(phone_number, session_id, "assistant", ans)
+                            log_interaction_record(phone_number, session_id, "market_price", "market_price_dynamic", nlu.entities, nlu.confidence)
+                            return ans, "market_price_dynamic", [], nlu.to_dict()
+                    except Exception:
+                        pass
+
                 resp = f"ለ{crop_name} ዋጋ መረጃ አሁን የለም። ቆይተው ይደውሉ።"
                 log_conversation(phone_number, session_id, "assistant", resp)
                 log_interaction_record(
@@ -565,10 +719,35 @@ def _generate_core_rag_response(query_text: str, phone_number: str, session_id: 
         hits = merge_pg_chroma_hits(pg_hits, chroma_hits)
 
         if not hits:
+            dyn_key = f"soil_kb_{query_text}"
+            cached = get_dynamic_knowledge(dyn_key)
+            if cached:
+                log_conversation(phone_number, session_id, "assistant", cached)
+                log_interaction_record(phone_number, session_id, intent, "dynamic_kb_answer", nlu.entities, nlu.confidence)
+                return cached, "dynamic_kb_answer", [], nlu.to_dict()
+
+            from farmer_rag_stack.rag_tools import web_search
+            from farmer_rag_stack.query_llm import run_sync_llm
+            from farmer_rag_stack.llm_providers import effective_llm_backend
+            snippets = web_search.fetch_web_snippets(f"Ethiopia agriculture {query_text}", max_results=4)
+            if snippets:
+                web_text = web_search.format_web_block(snippets)
+                prompt = f"መመሪያ: ከታች ካለው የድር መረጃ በመነሳት ለጥያቄው አጭር እና ትክክለኛ ምላሽ በአማርኛ ስጥ። መረጃው የማይጠቅም ከሆነ 'መረጃ የለም' በል።\n\nጥያቄ: {query_text}\n\nመረጃ:\n{web_text}"
+                msgs = [{"role": "user", "content": prompt}]
+                try:
+                    ans, _ = run_sync_llm(effective_llm_backend(), msgs, fast=True)
+                    if "መረጃ የለም" not in ans and len(ans) > 10:
+                        set_dynamic_knowledge(dyn_key, ans)
+                        log_conversation(phone_number, session_id, "assistant", ans)
+                        log_interaction_record(phone_number, session_id, intent, "dynamic_kb_answer", nlu.entities, nlu.confidence)
+                        return ans, "dynamic_kb_answer", [], nlu.to_dict()
+                except Exception:
+                    pass
+
             logger.info(f"No results found for query: {query_text}. Escalating.")
             add_to_escalation(
                 query_text,
-                "No relevant KB documents found.",
+                "No relevant KB documents found and web fallback yielded no useful info.",
                 phone_number=phone_number,
                 session_id=session_id,
                 reason_code="NO_KB_HITS"
@@ -761,6 +940,67 @@ async def process_query(query: Query):
     return out
 
 
+def _voice_escalation_response(
+    *,
+    query_text: str,
+    phone_number: str,
+    session_id: str,
+    expert_delivery: str,
+    body: str,
+    reason_code: str,
+    escalation_context: str,
+    best_distance: float,
+    hits: list,
+    t0: float,
+    safety: dict | None = None,
+    meta_reason: str,
+    nlu,
+) -> dict:
+    add_to_escalation(
+        query_text,
+        escalation_context,
+        phone_number=phone_number,
+        session_id=session_id,
+        reason_code=reason_code,
+        confidence=float(best_distance) if best_distance is not None else None,
+        entities=getattr(nlu, "entities", None),
+    )
+    final = f"{expert_delivery}\n\n{body}" if expert_delivery else body
+    final = normalize_text(final)
+    log_conversation(phone_number, session_id, "assistant", final)
+    log_interaction_record(
+        phone_number=phone_number,
+        session_id=session_id,
+        intent=getattr(nlu, "primary_intent", None),
+        response_type="escalated_low_confidence"
+        if reason_code == "LOW_CONFIDENCE"
+        else "escalated_agrochemical",
+        entities=getattr(nlu, "entities", None),
+        confidence=getattr(nlu, "confidence", None),
+    )
+    latency_ms = (time.perf_counter() - t0) * 1000
+    sla_h = int(os.getenv("ESCALATION_SLA_HOURS", "48") or "48")
+    trust = {
+        "sources": ["escalation"],
+        "kb_chunks_used": len(hits or []),
+        "sources_in_prompt": 0,
+        "latency_ms": round(latency_ms, 1),
+        "escalation_sla_target_hours": sla_h,
+        "human_review": True,
+        "grounding": "escalation",
+    }
+    if safety:
+        trust["safety"] = safety
+    final = maybe_append_trust_footer(final, sources=["escalation"])
+    return {
+        "response": final,
+        "references": [],
+        "best_distance": best_distance,
+        "trust": trust,
+        "meta": {"response_cache": "bypass", "reason": meta_reason},
+    }
+
+
 @app.post("/rag/answer")
 async def rag_answer(req: RagAnswerRequest):
     """
@@ -770,10 +1010,13 @@ async def rag_answer(req: RagAnswerRequest):
     - generation: RAG-folder-style assistant (Groq/Gemini/Ollama) when enabled, else chunk composition
     """
     from farmer_rag_stack.assistant import try_llm_assistant_response
+    from farmer_rag_stack.smart_advisory import run_smart_advisory
 
     query_text = (req.text or "").strip()
     if not query_text:
         raise HTTPException(status_code=400, detail="Empty query")
+
+    log_conversation(req.phone_number, req.session_id, "user", query_text)
 
     nlu = analyze_intent(query_text)
     expert_delivery = check_and_deliver_expert_responses(req.phone_number)
@@ -811,54 +1054,80 @@ async def rag_answer(req: RagAnswerRequest):
         if cached:
             out_hit = dict(cached)
             out_hit["meta"] = {"response_cache": "hit"}
+            cached_resp = (out_hit.get("response") or "").strip()
+            if cached_resp:
+                log_conversation(req.phone_number, req.session_id, "assistant", cached_resp)
             return out_hit
 
     t0 = time.perf_counter()
     max_d = float(os.environ.get("RAG_PG_MAX_L2_DISTANCE", str(RAG_PG_MAX_L2_DISTANCE)))
-    hits, _rq, _farmer_nlu, best = ranked_hits_for_voice_query(
-        query_text=query_text,
-        nlu=nlu,
-        user_region=user_region,
-        hist_pairs=hist_pairs,
-        max_l2_distance=max_d,
-    )
+    try:
+        hits, _rq, _farmer_nlu, best = ranked_hits_for_voice_query(
+            query_text=query_text,
+            nlu=nlu,
+            user_region=user_region,
+            hist_pairs=hist_pairs,
+            max_l2_distance=max_d,
+        )
+    except (FileNotFoundError, OSError) as exc:
+        logger.error("RAG embedding model is missing: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "embedding_model_missing_or_incomplete",
+                "message": str(exc),
+                "fix": "Run `python download_models.py`, or set KB_EMBEDDING_MODEL to an existing SentenceTransformer path/model.",
+            },
+        ) from exc
 
-    # Pesticide / fertilizer / spray topics without any KB chunk: never improvise.
+    agro_max = chemical_safety.agrochemical_max_l2_distance(max_d)
+    kb_grounded = voice_guards.kb_grounded_for_voice(hits, best, max_d)
+    agro_kb_grounded = voice_guards.kb_grounded_for_voice(hits, best, agro_max)
+    is_agro = chemical_safety.is_high_risk_agrochemical_query(query_text)
+
     if (
         chemical_safety.agrochemical_expert_only_enabled()
-        and chemical_safety.is_high_risk_agrochemical_query(query_text)
-        and not hits
+        and is_agro
+        and not agro_kb_grounded
     ):
-        add_to_escalation(
-            query_text,
-            "Agrochemical-style query with no KB retrieval hits; expert-only path.",
+        reason = "no_kb_hits" if not hits else "low_kb_confidence"
+        return _voice_escalation_response(
+            query_text=query_text,
             phone_number=req.phone_number,
             session_id=req.session_id,
+            expert_delivery=expert_delivery,
+            body=chemical_safety.CANNED_AGROCHEM_ESCALATION_AM,
             reason_code="AGROCHEM_NO_KB",
+            escalation_context=(
+                f"Agrochemical query; expert-only path ({reason}, best_distance={best:.3f}, max={agro_max})."
+            ),
+            best_distance=best,
+            hits=hits,
+            t0=t0,
+            safety={"agrochemical_expert_only": True, "reason": reason},
+            meta_reason="agrochemical_escalation",
+            nlu=nlu,
         )
-        body = chemical_safety.CANNED_AGROCHEM_ESCALATION_AM
-        final = f"{expert_delivery}\n\n{body}" if expert_delivery else body
-        final = normalize_text(final)
-        latency_ms = (time.perf_counter() - t0) * 1000
-        sla_h = int(os.getenv("ESCALATION_SLA_HOURS", "48") or "48")
-        trust = {
-            "sources": ["escalation"],
-            "kb_chunks_used": 0,
-            "sources_in_prompt": 0,
-            "latency_ms": round(latency_ms, 1),
-            "escalation_sla_target_hours": sla_h,
-            "human_review": True,
-            "grounding": "escalation",
-            "safety": {"agrochemical_expert_only": True, "reason": "no_kb_hits"},
-        }
-        final = maybe_append_trust_footer(final, sources=["escalation"])
-        return {
-            "response": final,
-            "references": [],
-            "best_distance": best,
-            "trust": trust,
-            "meta": {"response_cache": "bypass", "reason": "agrochemical_escalation"},
-        }
+
+    if voice_guards.voice_low_conf_escalation_enabled() and not kb_grounded and not is_agro:
+        return _voice_escalation_response(
+            query_text=query_text,
+            phone_number=req.phone_number,
+            session_id=req.session_id,
+            expert_delivery=expert_delivery,
+            body=voice_guards.GENERIC_LOW_CONFIDENCE_ESCALATION_AM,
+            reason_code="LOW_CONFIDENCE",
+            escalation_context=(
+                f"Voice path: no confident KB match (best_distance={best:.3f}, max={max_d})."
+            ),
+            best_distance=best,
+            hits=hits,
+            t0=t0,
+            meta_reason="low_confidence_escalation",
+            nlu=nlu,
+        )
+
+    hits = voice_guards.confident_kb_hits(hits, max_d)
 
     profile_line = build_personalization_block(req.phone_number, profile)
     if user_region:
@@ -867,22 +1136,44 @@ async def rag_answer(req: RagAnswerRequest):
     answer = ""
     used_llm = False
     used_compose = False
-    if hits:
-        llm_try = (
-            try_llm_assistant_response(
-                query_text=query_text,
-                session_id=req.session_id,
-                hits=hits,
-                user_context=profile_line,
-                alerts_text="",
-                dynamic_block=dyn or "",
+    smart_context = None
+    smart_tool_trace = []
+    if os.environ.get("RAG_SMART_PIPELINE", "1").strip().lower() not in ("0", "false", "no", "off"):
+        try:
+            smart = run_smart_advisory(
+                question=query_text,
+                phone_number=req.phone_number,
+                nlu=nlu,
+                profile=profile,
                 history_pairs=hist_pairs,
+                hits=hits,
+                local_market_price_func=get_market_price,
             )
-            or ""
-        )
-        if llm_try.strip():
-            answer = llm_try
-            used_llm = True
+            if smart.answer:
+                answer = smart.answer
+                used_llm = smart.used_llm
+                smart_context = smart.context
+                smart_tool_trace = smart.tool_trace
+        except Exception as exc:
+            logger.warning("Smart advisory pipeline failed; falling back to legacy RAG path: %s", exc)
+
+    if hits:
+        if not answer.strip():
+            llm_try = (
+                try_llm_assistant_response(
+                    query_text=query_text,
+                    session_id=req.session_id,
+                    hits=hits,
+                    user_context=profile_line,
+                    alerts_text="",
+                    dynamic_block=dyn or "",
+                    history_pairs=hist_pairs,
+                )
+                or ""
+            )
+            if llm_try.strip():
+                answer = llm_try
+                used_llm = True
     if not answer.strip() and hits:
         answer = compose_grounded_answer_no_llm(query_text, hits)
         if (answer or "").strip():
@@ -928,6 +1219,8 @@ async def rag_answer(req: RagAnswerRequest):
     else:
         if hits:
             src.append("kb")
+        if smart_tool_trace:
+            src.append("tools")
         if (dyn or "").strip():
             src.append("dynamic")
         if expert_delivery:
@@ -957,11 +1250,98 @@ async def rag_answer(req: RagAnswerRequest):
         )
 
     out = {"response": final, "references": refs, "best_distance": best, "trust": trust}
+    if smart_tool_trace:
+        out["tool_trace"] = smart_tool_trace
+    if smart_context and os.environ.get("RAG_RETURN_SMART_CONTEXT", "0").strip().lower() in ("1", "true", "yes", "on"):
+        out["smart_context"] = smart_context
     if cache_key and not escalated_empty:
         g = trust.get("grounding") if isinstance(trust, dict) else None
         if hits and g in ("kb_llm", "kb_compose"):
             response_cache.set(cache_key, out)
+    if final:
+        log_conversation(req.phone_number, req.session_id, "assistant", final)
+        log_interaction_record(
+            phone_number=req.phone_number,
+            session_id=req.session_id,
+            intent=getattr(nlu, "primary_intent", None),
+            response_type="escalated_empty" if escalated_empty else "rag_answer",
+            entities=getattr(nlu, "entities", None),
+            confidence=getattr(nlu, "confidence", None),
+        )
     return out
+
+
+@app.post("/rag/debug/context", dependencies=[Depends(_require_metrics_token)])
+async def rag_debug_context(req: RagDebugContextRequest):
+    """
+    Build the exact structured context used by the smart advisory pipeline,
+    without calling Gemini. Useful for chat/session tests and cost-free debugging.
+    """
+    from farmer_rag_stack.smart_advisory import build_smart_context_only
+
+    query_text = (req.text or "").strip()
+    if not query_text:
+        raise HTTPException(status_code=400, detail="Empty query")
+
+    nlu = analyze_intent(query_text)
+    profile = get_farmer_profile(req.phone_number)
+    user_region = nlu.entities.get("region_en")
+    if not user_region and profile:
+        loc = str(profile.get("location", "")).lower()
+        if any(k in loc for k in ["highland", "ደጋ"]):
+            user_region = "highland"
+        elif any(k in loc for k in ["lowland", "ቆላ"]):
+            user_region = "lowland"
+        elif any(k in loc for k in ["midland", "ወይና"]):
+            user_region = "midland"
+
+    hist_pairs = list(get_conversation_history(req.session_id, limit=8))
+    hits: list[dict] = []
+    best = 999.0
+    retrieval_query = ""
+    if req.retrieve:
+        max_d = float(os.environ.get("RAG_PG_MAX_L2_DISTANCE", str(RAG_PG_MAX_L2_DISTANCE)))
+        try:
+            hits, retrieval_query, _farmer_nlu, best = ranked_hits_for_voice_query(
+                query_text=query_text,
+                nlu=nlu,
+                user_region=user_region,
+                hist_pairs=hist_pairs,
+                max_l2_distance=max_d,
+            )
+        except (FileNotFoundError, OSError) as exc:
+            logger.error("RAG embedding model is missing: %s", exc)
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "embedding_model_missing_or_incomplete",
+                    "message": str(exc),
+                    "fix": "Run `python download_models.py`, or set KB_EMBEDDING_MODEL to an existing SentenceTransformer path/model.",
+                },
+            ) from exc
+
+    context, tool_trace, kb_refs = build_smart_context_only(
+        question=query_text,
+        phone_number=req.phone_number,
+        nlu=nlu,
+        profile=profile,
+        history_pairs=hist_pairs,
+        hits=hits,
+        local_market_price_func=get_market_price,
+    )
+    return {
+        "context": context,
+        "tool_trace": tool_trace,
+        "references": kb_refs[:5],
+        "retrieval": {
+            "enabled": req.retrieve,
+            "query": retrieval_query,
+            "best_distance": best,
+            "hit_count": len(hits),
+            "user_region": user_region,
+        },
+        "session_history_count": len(hist_pairs),
+    }
 
 
 @app.post("/kb/ingest")

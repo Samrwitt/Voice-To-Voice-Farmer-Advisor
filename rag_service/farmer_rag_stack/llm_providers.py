@@ -1,11 +1,12 @@
 """Hosted LLM backends (Groq, Gemini) + helpers. Ollama stays in query.py.
 
-Groq → Gemini: when ``RAG_LLM_BACKEND`` is groq and Groq returns 429/503, ``groq_*_with_gemini_fallback``
-calls Gemini if a Gemini-compatible key is set: ``GEMINI_API_KEY`` (preferred), or ``GOOGLE_API_KEY`` /
-``GENAI_API_KEY`` (disable with ``GROQ_GEMINI_FALLBACK=0``). Also falls back on HTTP 413 if Groq rejects payload size.
+**Multiple team keys:** set ``GROQ_API_KEYS`` and/or ``GEMINI_API_KEYS`` (comma-separated) so each
+teammate's free-tier key is rotated round-robin; on 429/503 the next key is tried automatically.
+
+Groq → Gemini: when ``RAG_LLM_BACKEND`` is groq and all Groq keys fail, ``groq_*_with_gemini_fallback``
+calls Gemini (also pooled via ``GEMINI_API_KEYS`` / ``GEMINI_API_KEY``). Disable with ``GROQ_GEMINI_FALLBACK=0``.
 
 When both hosted calls fail, ``query.py`` can fall back to local Ollama (``RAG_HOSTED_FALLBACK_OLLAMA``).
-Gemini 429: brief retries (``GEMINI_RETRY_ATTEMPTS``) then that Ollama path if enabled.
 """
 
 from __future__ import annotations
@@ -18,6 +19,14 @@ import time
 from pathlib import Path
 
 import httpx
+
+from .api_key_pool import (
+    gemini_api_keys,
+    gemini_pool,
+    groq_api_keys,
+    groq_pool,
+    run_with_key_pool,
+)
 
 
 def load_dotenv_if_present() -> None:
@@ -42,12 +51,19 @@ def load_dotenv_if_present() -> None:
 
 
 def gemini_api_key() -> str:
-    """First non-empty key among common Google AI Studio / Gemini env names."""
-    for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GENAI_API_KEY"):
-        v = os.environ.get(name, "").strip()
-        if v:
-            return v
-    return ""
+    """First configured Gemini key (pool or legacy single-key env)."""
+    keys = gemini_api_keys()
+    return keys[0] if keys else ""
+
+
+def _is_rate_limit_error(exc: BaseException) -> bool:
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in (429, 503)
+    if isinstance(exc, RuntimeError):
+        s = str(exc)
+        if "429" in s or "503" in s or "ወሰን" in s or "Too Many Requests" in s:
+            return True
+    return False
 
 
 def effective_llm_backend() -> str:
@@ -59,10 +75,10 @@ def effective_llm_backend() -> str:
     if os.environ.get("RAG_LOCAL_FIRST", "").strip().lower() in ("1", "true", "yes", "ollama"):
         if os.environ.get("USE_OLLAMA", "1").strip().lower() in ("1", "true", "yes"):
             return "ollama"
-    if os.environ.get("GROQ_API_KEY", "").strip():
-        return "groq"
-    if gemini_api_key():
+    if gemini_api_keys():
         return "gemini"
+    if groq_api_keys():
+        return "groq"
     if os.environ.get("USE_OLLAMA", "1").strip() in ("1", "true", "yes"):
         return "ollama"
     if os.environ.get("OPENAI_API_KEY", "").strip():
@@ -108,6 +124,7 @@ def openai_style_chat(
     api_key: str,
     model: str,
     timeout_sec: float = 120.0,
+    max_attempts: int | None = None,
 ) -> str:
     url = base_url.rstrip("/") + "/v1/chat/completions"
     headers = {
@@ -122,7 +139,10 @@ def openai_style_chat(
     }
     tmo = httpx.Timeout(connect=30.0, read=timeout_sec, write=120.0, pool=10.0)
     is_groq = "api.groq.com" in base_url
-    attempts = _groq_retry_attempts() if is_groq else 1
+    if max_attempts is not None:
+        attempts = max(1, max_attempts)
+    else:
+        attempts = _groq_retry_attempts() if is_groq else 1
     data: dict | None = None
     for attempt in range(attempts):
         with httpx.Client(timeout=tmo) as client:
@@ -153,28 +173,30 @@ def groq_chat_messages(
     fast: bool,
     timeout_sec: float,
 ) -> str:
-    key = os.environ.get("GROQ_API_KEY", "").strip()
-    if not key:
-        raise RuntimeError("GROQ_API_KEY missing")
-    return openai_style_chat(
-        messages,
-        base_url="https://api.groq.com/openai/v1",
-        api_key=key,
-        model=groq_model(fast),
-        timeout_sec=timeout_sec,
-    )
+    pool = groq_pool()
+    if pool.empty():
+        raise RuntimeError("GROQ_API_KEY / GROQ_API_KEYS missing")
+
+    def _one(key: str, _idx: int) -> str:
+        return openai_style_chat(
+            messages,
+            base_url="https://api.groq.com/openai/v1",
+            api_key=key,
+            model=groq_model(fast),
+            timeout_sec=timeout_sec,
+            max_attempts=2,
+        )
+
+    return run_with_key_pool(pool, _one, is_rate_limit=_is_rate_limit_error)
 
 
-def iter_groq_chat(
+def _iter_groq_stream_with_key(
     messages: list[dict],
     *,
+    key: str,
     fast: bool,
     timeout_sec: float,
 ):
-    key = os.environ.get("GROQ_API_KEY", "").strip()
-    if not key:
-        yield "[groq] GROQ_API_KEY missing"
-        return
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {key}",
@@ -188,38 +210,58 @@ def iter_groq_chat(
         "stream": True,
     }
     tmo = httpx.Timeout(connect=30.0, read=timeout_sec, write=120.0, pool=10.0)
-    attempts = _groq_retry_attempts()
     with httpx.Client(timeout=tmo) as client:
-        for attempt in range(attempts):
-            with client.stream("POST", url, json=payload, headers=headers) as response:
-                if response.status_code in (429, 503) and attempt + 1 < attempts:
-                    response.read()
-                    time.sleep(_groq_backoff_sec(attempt))
+        with client.stream("POST", url, json=payload, headers=headers) as response:
+            if response.status_code in (429, 503):
+                response.read()
+                raise RuntimeError(f"Groq HTTP {response.status_code}")
+            if response.status_code >= 400:
+                response.read()
+                response.raise_for_status()
+            for line in response.iter_lines():
+                if not line or not line.startswith("data: "):
                     continue
-                if response.status_code >= 400:
-                    response.read()
-                    if response.status_code == 429:
-                        raise RuntimeError(_groq_rate_limit_hint())
-                    if response.status_code == 503 and attempt + 1 >= attempts:
-                        raise RuntimeError(
-                            "Groq ሰርቨር (503) — እንደገና ይሞክሩ ወይም ተለዋጭ LLM ይጠቀሙ።"
-                        )
-                    response.raise_for_status()
-                for line in response.iter_lines():
-                    if not line or not line.startswith("data: "):
-                        continue
-                    data_s = line[6:].strip()
-                    if data_s == "[DONE]":
-                        break
-                    try:
-                        data = json.loads(data_s)
-                    except json.JSONDecodeError:
-                        continue
-                    delta = (data.get("choices") or [{}])[0].get("delta") or {}
-                    piece = delta.get("content") or ""
-                    if piece:
-                        yield piece
-                return
+                data_s = line[6:].strip()
+                if data_s == "[DONE]":
+                    break
+                try:
+                    data = json.loads(data_s)
+                except json.JSONDecodeError:
+                    continue
+                delta = (data.get("choices") or [{}])[0].get("delta") or {}
+                piece = delta.get("content") or ""
+                if piece:
+                    yield piece
+
+
+def iter_groq_chat(
+    messages: list[dict],
+    *,
+    fast: bool,
+    timeout_sec: float,
+):
+    pool = groq_pool()
+    if pool.empty():
+        yield "[groq] GROQ_API_KEY / GROQ_API_KEYS missing"
+        return
+
+    last_exc: BaseException | None = None
+    for idx in pool.ordered_indices():
+        key = pool.key_at(idx)
+        try:
+            yield from _iter_groq_stream_with_key(
+                messages, key=key, fast=fast, timeout_sec=timeout_sec
+            )
+            return
+        except BaseException as exc:
+            last_exc = exc
+            if _is_rate_limit_error(exc):
+                pool.mark_rate_limited(idx)
+                continue
+            raise
+    if last_exc is not None:
+        raise RuntimeError(_groq_rate_limit_hint()) from last_exc
+    yield "[groq] all API keys rate-limited"
 
 
 def _messages_to_gemini_contents(messages: list[dict]) -> tuple[str, list[dict]]:
@@ -256,15 +298,13 @@ def _gemini_backoff_sec(attempt_index: int, response_text: str) -> float:
     return min(cap, base * (2**attempt_index) + random.uniform(0.0, 0.5))
 
 
-def gemini_chat_messages(
+def _gemini_chat_with_key(
     messages: list[dict],
     *,
+    key: str,
     fast: bool,
     timeout_sec: float,
 ) -> str:
-    key = gemini_api_key()
-    if not key:
-        raise RuntimeError("No Gemini API key (set GEMINI_API_KEY or GOOGLE_API_KEY)")
     system_text, contents = _messages_to_gemini_contents(messages)
     if not contents:
         raise RuntimeError("No user/model messages for Gemini")
@@ -283,15 +323,17 @@ def gemini_chat_messages(
     if system_text:
         body["systemInstruction"] = {"parts": [{"text": system_text}]}
     tmo = httpx.Timeout(connect=30.0, read=timeout_sec, write=120.0, pool=10.0)
-    attempts = _gemini_retry_attempts()
+    per_key_attempts = min(2, _gemini_retry_attempts())
     last_detail = ""
-    for attempt in range(attempts):
+    for attempt in range(per_key_attempts):
         with httpx.Client(timeout=tmo) as client:
             r = client.post(url, json=body)
-        if r.status_code == 429 and attempt + 1 < attempts:
+        if r.status_code in (429, 503) and attempt + 1 < per_key_attempts:
             last_detail = (r.text or "")[:2000]
             time.sleep(_gemini_backoff_sec(attempt, last_detail))
             continue
+        if r.status_code in (429, 503):
+            raise RuntimeError(f"Gemini HTTP {r.status_code}: {(r.text or '')[:500]}")
         if r.status_code >= 400:
             detail = (r.text or "")[:2000]
             raise RuntimeError(f"Gemini HTTP {r.status_code}: {detail}")
@@ -305,66 +347,82 @@ def gemini_chat_messages(
     raise RuntimeError(f"Gemini: exhausted retries ({last_detail})")
 
 
-def groq_gemini_fallback_enabled() -> bool:
-    if os.environ.get("GROQ_GEMINI_FALLBACK", "1").strip().lower() in (
+def gemini_chat_messages(
+    messages: list[dict],
+    *,
+    fast: bool,
+    timeout_sec: float,
+) -> str:
+    pool = gemini_pool()
+    if pool.empty():
+        raise RuntimeError("No Gemini API key (set GEMINI_API_KEYS or GEMINI_API_KEY)")
+
+    def _one(key: str, _idx: int) -> str:
+        return _gemini_chat_with_key(messages, key=key, fast=fast, timeout_sec=timeout_sec)
+
+    return run_with_key_pool(pool, _one, is_rate_limit=_is_rate_limit_error)
+
+
+def gemini_groq_fallback_enabled() -> bool:
+    if os.environ.get("GEMINI_GROQ_FALLBACK", "1").strip().lower() in (
         "0",
         "false",
         "no",
         "off",
     ):
         return False
-    return bool(gemini_api_key())
+    return bool(groq_api_keys())
 
 
-def should_fallback_groq_to_gemini(exc: BaseException) -> bool:
-    if not groq_gemini_fallback_enabled():
+def should_fallback_gemini_to_groq(exc: BaseException) -> bool:
+    if not gemini_groq_fallback_enabled():
         return False
     if isinstance(exc, httpx.HTTPStatusError):
-        return exc.response.status_code in (429, 503, 413)
+        return exc.response.status_code in (429, 503, 400)
     if isinstance(exc, RuntimeError):
         s = str(exc)
-        if "429" in s or "503" in s or "413" in s:
+        if "429" in s or "503" in s or "400" in s:
             return True
-        if "Too Many Requests" in s or "Payload Too Large" in s or "ወሰን" in s:
+        if "Too Many Requests" in s or "Quota" in s or "Exceeded" in s:
             return True
     return False
 
 
-def groq_chat_messages_with_gemini_fallback(
+def gemini_chat_messages_with_groq_fallback(
     messages: list[dict],
     *,
     fast: bool,
     timeout_sec: float,
 ) -> tuple[str, str]:
-    """Returns (reply_text, backend_used): ``groq`` or ``gemini`` when Groq hits 429/503/413."""
+    """Returns (reply_text, backend_used): ``gemini`` or ``groq`` when Gemini hits 429/503/400."""
     try:
         return (
-            groq_chat_messages(messages, fast=fast, timeout_sec=timeout_sec),
-            "groq",
+            gemini_chat_messages(messages, fast=fast, timeout_sec=timeout_sec),
+            "gemini",
         )
     except (RuntimeError, httpx.HTTPStatusError) as e:
-        if should_fallback_groq_to_gemini(e):
+        if should_fallback_gemini_to_groq(e):
             return (
-                gemini_chat_messages(messages, fast=fast, timeout_sec=timeout_sec),
-                "gemini",
+                groq_chat_messages(messages, fast=fast, timeout_sec=timeout_sec),
+                "groq",
             )
         raise
 
 
-def iter_groq_chat_with_gemini_fallback(
+def iter_gemini_chat_with_groq_fallback(
     messages: list[dict],
     *,
     fast: bool,
     timeout_sec: float,
 ):
-    """Stream Groq tokens, or one Gemini completion if Groq fails with 429/503/413."""
+    """Stream Gemini completion, or fallback to Groq if Gemini fails with 429/503/400."""
     try:
-        yield from iter_groq_chat(messages, fast=fast, timeout_sec=timeout_sec)
+        # Since Gemini implementation doesn't stream here (it returns full), yield full
+        yield gemini_chat_messages(messages, fast=fast, timeout_sec=timeout_sec)
     except (RuntimeError, httpx.HTTPStatusError) as e:
-        if should_fallback_groq_to_gemini(e):
-            yield gemini_chat_messages(messages, fast=fast, timeout_sec=timeout_sec)
+        if should_fallback_gemini_to_groq(e):
+            yield from iter_groq_chat(messages, fast=fast, timeout_sec=timeout_sec)
             return
         raise
-
 
 load_dotenv_if_present()
