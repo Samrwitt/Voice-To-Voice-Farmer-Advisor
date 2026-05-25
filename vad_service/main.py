@@ -1,6 +1,9 @@
 import json
 import asyncio
+import audioop
 import os
+import re
+import time
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 
@@ -20,6 +23,9 @@ app = FastAPI(title="Silero VAD Service")
 MAX_CONCURRENT_ASR = int(os.getenv("MAX_CONCURRENT_ASR", "2"))
 VAD_THRESHOLD = float(os.getenv("VAD_THRESHOLD", "0.85"))
 VAD_MIN_SPEECH_MS = int(os.getenv("VAD_MIN_SPEECH_MS", "400"))
+VAD_TTS_MAX_SENTENCES = int(os.getenv("VAD_TTS_MAX_SENTENCES", "1"))
+VAD_TTS_MAX_CHARS = int(os.getenv("VAD_TTS_MAX_CHARS", "220"))
+VAD_AUDIO_LOG_EVERY = int(os.getenv("VAD_AUDIO_LOG_EVERY", "0"))
 ASR_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_ASR)
 PLAYBACK_LOCK = asyncio.Lock()
 
@@ -65,6 +71,44 @@ class SessionState:
     def __init__(self):
         self.playback_task = None
 
+
+def split_tts_sentences(text: str) -> list[str]:
+    return [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[።?!])\s+", text.strip())
+        if sentence.strip()
+    ]
+
+
+def compact_voice_tts_text(text: str) -> str:
+    """Keep spoken answers short so phone calls do not wait on many TTS calls."""
+    normalized = re.sub(r"\s+", " ", (text or "")).strip()
+    if not normalized:
+        return ""
+
+    answer_matches = re.findall(
+        r"ምላሽ[፦:]\s*(.*?)(?=(?:\(\d+\)\s*ጥያቄ|ጥያቄ[፦:]|$))",
+        normalized,
+    )
+    if answer_matches:
+        normalized = " ".join(part.strip() for part in answer_matches if part.strip())
+    else:
+        normalized = re.sub(
+            r"^ከሰነዶች\s+የተገኘው\s+መረጃ\s+እንደሚከተለው\s+ነው።\s*",
+            "",
+            normalized,
+        )
+
+    sentences = split_tts_sentences(normalized)
+    if VAD_TTS_MAX_SENTENCES > 0 and sentences:
+        normalized = " ".join(sentences[:VAD_TTS_MAX_SENTENCES])
+
+    if VAD_TTS_MAX_CHARS > 0 and len(normalized) > VAD_TTS_MAX_CHARS:
+        normalized = normalized[:VAD_TTS_MAX_CHARS].rstrip()
+
+    return normalized
+
+
 # ============================================================
 # Playback Handling
 # ============================================================
@@ -75,6 +119,7 @@ async def play_advisor_response(
     session_id: str,
     utterance_path: str,
     rag_answer: str,
+    playback_sample_rate: int = 16000,
 ):
     """
     Synthesizes and streams audio for a RAG answer.
@@ -82,11 +127,18 @@ async def play_advisor_response(
     """
     async with PLAYBACK_LOCK:
         try:
-            print(f"[TTS STARTING] text_len={len(rag_answer)}, path={utterance_path}", flush=True)
+            spoken_answer = compact_voice_tts_text(rag_answer)
+            if not spoken_answer:
+                return
+
+            print(
+                f"[TTS STARTING] full_text_len={len(rag_answer)}, "
+                f"spoken_text_len={len(spoken_answer)}, path={utterance_path}",
+                flush=True,
+            )
             # ── Sentence-level Streaming ──
-            import re
             # Split by Amharic and common sentence delimiters
-            sentences = re.split(r'(?<=[።?!])\s+', rag_answer.strip())
+            sentences = split_tts_sentences(spoken_answer)
             
             print(f"[STREAMING] Total sentences: {len(sentences)}", flush=True)
             
@@ -99,26 +151,51 @@ async def play_advisor_response(
                 # Use a unique path for each sentence to avoid collisions
                 sentence_path = f"{utterance_path}_s{i}.wav"
                 
+                started_at = time.monotonic()
                 tts_path = await synthesize_speech(
                     text=sentence,
                     utterance_path=sentence_path
+                )
+                print(
+                    f"[SENTENCE {i+1} SYNTH DONE] seconds={time.monotonic() - started_at:.2f}",
+                    flush=True,
                 )
                 
                 if tts_path:
                     try:
                         import wave
                         with wave.open(tts_path, "rb") as wf:
-                            # Stream raw frames
-                            chunk_size = 1024
-                            data = wf.readframes(chunk_size)
+                            source_sample_rate = wf.getframerate()
+                            channels = wf.getnchannels()
+                            sample_width = wf.getsampwidth()
+                            frames_per_chunk = max(1, source_sample_rate // 50)
+                            rate_state = None
+                            data = wf.readframes(frames_per_chunk)
                             while data:
+                                if sample_width != 2:
+                                    data = audioop.lin2lin(data, sample_width, 2)
+
+                                if channels == 2:
+                                    data = audioop.tomono(data, 2, 0.5, 0.5)
+                                elif channels != 1:
+                                    raise ValueError(f"Unsupported TTS channel count: {channels}")
+
+                                if source_sample_rate != playback_sample_rate:
+                                    data, rate_state = audioop.ratecv(
+                                        data,
+                                        2,
+                                        1,
+                                        source_sample_rate,
+                                        playback_sample_rate,
+                                        rate_state,
+                                    )
+
                                 sent = await safe_send(websocket, send_lock, data)
                                 if not sent:
                                     break
-                                
-                                # Small delay to prevent network congestion
-                                await asyncio.sleep(0.01)
-                                data = wf.readframes(chunk_size)
+
+                                await asyncio.sleep(len(data) / (2 * playback_sample_rate))
+                                data = wf.readframes(frames_per_chunk)
                                 
                         print(f"[SENTENCE {i+1} DONE] Streamed.", flush=True)
                     except Exception as e:
@@ -145,6 +222,7 @@ async def handle_completed_utterance(
     utterance_path: str,
     session_state: SessionState,
     phone_number: str = "Unknown",
+    playback_sample_rate: int = 16000,
 ):
     """
     Runs ASR for one completed utterance.
@@ -260,6 +338,7 @@ async def handle_completed_utterance(
                     session_id=session_id,
                     utterance_path=utterance_path,
                     rag_answer=rag_answer,
+                    playback_sample_rate=playback_sample_rate,
                 )
             )
             return
@@ -308,6 +387,7 @@ async def handle_completed_utterance(
                     session_id=session_id,
                     utterance_path=utterance_path,
                     rag_answer=rag_answer,
+                    playback_sample_rate=playback_sample_rate,
                 )
             )
             return
@@ -380,7 +460,7 @@ async def handle_completed_utterance(
             },
         )
 
-        print(f"[TTS STARTING] text_len={len(rag_answer)}, path={utterance_path}", flush=True)
+        print(f"[TTS QUEUED] text_len={len(rag_answer)}, path={utterance_path}", flush=True)
         # ── Start Playback in background ──
         # We store it in session_state so the VAD loop can cancel it if barge-in occurs.
         session_state.playback_task = asyncio.create_task(
@@ -390,6 +470,7 @@ async def handle_completed_utterance(
                 session_id=session_id,
                 utterance_path=utterance_path,
                 rag_answer=rag_answer,
+                playback_sample_rate=playback_sample_rate,
             )
         )
 
@@ -426,6 +507,7 @@ def start_asr_task(
     utterance_path: str,
     session_state: SessionState,
     phone_number: str = "Unknown",
+    playback_sample_rate: int = 16000,
 ):
     """
     Start ASR in the background.
@@ -442,6 +524,7 @@ def start_asr_task(
             utterance_path=utterance_path,
             session_state=session_state,
             phone_number=phone_number,
+            playback_sample_rate=playback_sample_rate,
         )
     )
 
@@ -528,7 +611,7 @@ async def vad_websocket(
                     chunk_count += 1
                     total_audio_bytes += len(pcm_chunk)
 
-                    if chunk_count % 20 == 0:
+                    if VAD_AUDIO_LOG_EVERY > 0 and chunk_count % VAD_AUDIO_LOG_EVERY == 0:
                         print(
                             f"[VAD AUDIO RECEIVED] session={session_id}, "
                             f"chunks={chunk_count}, "
@@ -581,6 +664,7 @@ async def vad_websocket(
                                 utterance_path=utterance_path,
                                 session_state=session_state,
                                 phone_number=phone_number,
+                                playback_sample_rate=sample_rate,
                             )
 
             # ============================================================
@@ -636,6 +720,7 @@ async def vad_websocket(
                                 utterance_path=utterance_path,
                                 session_state=session_state,
                                 phone_number=phone_number,
+                                playback_sample_rate=sample_rate,
                             )
 
                         if active_asr_tasks:
@@ -678,6 +763,7 @@ async def vad_websocket(
                                 utterance_path=utterance_path,
                                 session_state=session_state,
                                 phone_number=phone_number,
+                                playback_sample_rate=sample_rate,
                             )
 
                         if active_asr_tasks:

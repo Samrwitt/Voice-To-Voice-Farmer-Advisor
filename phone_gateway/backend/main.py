@@ -18,6 +18,10 @@ from backend.sessions import create_session, end_session
 from backend.recorder import AudioRecorder
 from backend.callers import create_or_get_caller
 from backend.auth.routes import router as auth_router
+from backend.sip_audio import (
+    start_sip_audiosocket_server,
+    stop_sip_audiosocket_server,
+)
 
 from backend.monitor_state import (
     start_call_monitor,
@@ -48,7 +52,7 @@ seed_default_admin()
 # FastAPI App
 # ============================================================
 
-app = FastAPI(title="Phone Browser Telephony Gateway")
+app = FastAPI(title="SIP Telephony Gateway")
 
 # Auth routes:
 # POST /api/auth/login
@@ -429,7 +433,18 @@ def health_check():
     return {
         "status": "ok",
         "service": "phone-gateway",
+        "telephony": "sip-audiosocket",
     }
+
+
+@app.on_event("startup")
+async def startup_sip_audiosocket():
+    await start_sip_audiosocket_server()
+
+
+@app.on_event("shutdown")
+async def shutdown_sip_audiosocket():
+    await stop_sip_audiosocket_server()
 
 
 # ============================================================

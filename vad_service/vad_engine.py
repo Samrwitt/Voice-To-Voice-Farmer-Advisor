@@ -14,7 +14,7 @@ class SileroStreamingVAD:
     Streaming Silero VAD engine.
 
     Expected input:
-    - 16 kHz
+    - 8 kHz or 16 kHz
     - mono
     - signed 16-bit PCM bytes
 
@@ -36,6 +36,9 @@ class SileroStreamingVAD:
         output_dir: str = "utterances",
     ):
         self.session_id = session_id
+        if sample_rate not in (8000, 16000):
+            raise ValueError(f"Unsupported VAD sample_rate={sample_rate}; expected 8000 or 16000")
+
         self.sample_rate = sample_rate
         self.threshold = threshold
 
@@ -43,9 +46,8 @@ class SileroStreamingVAD:
         self.speech_end_silence_ms = speech_end_silence_ms
         self.speech_pad_ms = speech_pad_ms
 
-        # Silero commonly works well with 512 samples at 16 kHz.
-        # 512 samples = 32 ms at 16 kHz.
-        self.window_samples = 512
+        # Silero expects 256 samples at 8 kHz and 512 samples at 16 kHz.
+        self.window_samples = 256 if sample_rate == 8000 else 512
         self.window_bytes = self.window_samples * 2
 
         self.model = load_silero_vad()

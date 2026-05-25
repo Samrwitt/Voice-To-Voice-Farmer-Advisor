@@ -4,8 +4,9 @@ import wave
 
 
 class AudioRecorder:
-    def __init__(self, session_id: str):
+    def __init__(self, session_id: str, sample_rate: int = 16000):
         self.session_id = session_id
+        self.sample_rate = sample_rate
 
         recordings_base = os.getenv("RECORDINGS_DIR", "recordings")
         self.recordings_dir = Path(recordings_base) / "audio"
@@ -30,7 +31,7 @@ class AudioRecorder:
             with wave.open(str(wav_path), "wb") as wf:
                 wf.setnchannels(1)
                 wf.setsampwidth(2)  # PCM16
-                wf.setframerate(16000)
+                wf.setframerate(self.sample_rate)
                 wf.writeframes(pcm_bytes)
             return str(wav_path)
         except Exception:

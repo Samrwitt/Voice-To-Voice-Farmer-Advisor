@@ -17,6 +17,8 @@ logger = logging.getLogger("tts_service")
 app = FastAPI()
 
 TARGET_SAMPLE_RATE = int(os.getenv("TTS_SAMPLE_RATE", "16000"))
+TTS_ATEMPO = min(2.0, max(0.5, float(os.getenv("TTS_ATEMPO", "1.35"))))
+TTS_VOLUME = min(3.0, max(0.1, float(os.getenv("TTS_VOLUME", "1.5"))))
 
 
 class TTSRequest(BaseModel):
@@ -55,7 +57,7 @@ async def synthesize(req: TTSRequest):
                 "-i",
                 mp3_path,
                 "-af",
-                "atempo=1.2,volume=1.5",
+                f"atempo={TTS_ATEMPO},volume={TTS_VOLUME}",
                 "-ac",
                 "1",
                 "-ar",
