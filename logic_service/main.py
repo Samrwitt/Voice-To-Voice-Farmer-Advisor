@@ -83,7 +83,7 @@ app.include_router(admin_router)
 
 # ── Config (externalized) ────────────────────────────────────────────────────
 RAG_DISTANCE_THRESHOLD = float(os.environ.get("RAG_DISTANCE_THRESHOLD", "1.2"))
-TTS_URL = os.environ.get("TTS_URL", "http://tts_service:8002/synthesize")
+TTS_URL = os.environ.get("TTS_URL", "http://tts-service:8000/synthesize")
 STT_URL = os.environ.get("STT_URL", "http://stt_service:8000/transcribe")
 
 # ── LLM Initialization ───────────────────────────────────────────────────────
@@ -442,7 +442,7 @@ async def system_check():
         results["stt_service"] = f"error: {e}"
 
     try:
-        tts_check = os.environ.get("TTS_URL", "http://tts_service:8002").replace("/synthesize", "") + "/docs"
+        tts_check = os.environ.get("TTS_URL", "http://tts-service:8000/synthesize").replace("/synthesize", "") + "/docs"
         resp = requests.get(tts_check, timeout=3)
         results["tts_service"] = "ok" if resp.status_code == 200 else f"status {resp.status_code}"
     except Exception as e:

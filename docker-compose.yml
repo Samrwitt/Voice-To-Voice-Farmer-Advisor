@@ -174,6 +174,7 @@ services:
       # Service health probes used by /admin/system-status
       VAD_HEALTH_URL: "http://vad-service:8010/health"
       ASR_HEALTH_URL: "http://asr-service:8001/docs"
+      TTS_URL: "http://tts-service:8000/synthesize"
       TTS_HEALTH_URL: "http://tts-service:8000/docs"
       PHONE_GATEWAY_URL: "http://phone-gateway:8000/health"
 
