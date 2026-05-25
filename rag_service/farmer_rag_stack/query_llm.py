@@ -11,8 +11,8 @@ import httpx
 
 from .llm_providers import (
     gemini_chat_messages,
-    groq_chat_messages_with_gemini_fallback,
-    iter_groq_chat_with_gemini_fallback,
+    gemini_chat_messages_with_groq_fallback,
+    iter_gemini_chat_with_groq_fallback,
     openai_style_chat,
 )
 
@@ -243,10 +243,10 @@ def hosted_llm_timeout(fast: bool) -> float:
 def run_sync_llm(backend: str, msgs: list[dict], fast: bool) -> tuple[str, str]:
     """Single non-streaming LLM call. Returns (answer_text, llm_used)."""
     t = hosted_llm_timeout(fast)
-    if backend == "groq":
-        return groq_chat_messages_with_gemini_fallback(msgs, fast=fast, timeout_sec=t)
     if backend == "gemini":
-        return gemini_chat_messages(msgs, fast=fast, timeout_sec=t), "gemini"
+        return gemini_chat_messages_with_groq_fallback(msgs, fast=fast, timeout_sec=t)
+    if backend == "groq":
+        return gemini_chat_messages_with_groq_fallback(msgs, fast=fast, timeout_sec=t)
     if backend == "openai":
         base = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com")
         key = os.environ.get("OPENAI_API_KEY", "").strip()
@@ -280,11 +280,11 @@ def run_sync_llm(backend: str, msgs: list[dict], fast: bool) -> tuple[str, str]:
 
 def iter_primary_llm(backend: str, msgs: list[dict], fast: bool) -> Iterator[str]:
     t = hosted_llm_timeout(fast)
-    if backend == "groq":
-        yield from iter_groq_chat_with_gemini_fallback(msgs, fast=fast, timeout_sec=t)
-        return
     if backend == "gemini":
-        yield gemini_chat_messages(msgs, fast=fast, timeout_sec=t)
+        yield from iter_gemini_chat_with_groq_fallback(msgs, fast=fast, timeout_sec=t)
+        return
+    if backend == "groq":
+        yield from iter_gemini_chat_with_groq_fallback(msgs, fast=fast, timeout_sec=t)
         return
     if backend == "openai":
         base = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com")

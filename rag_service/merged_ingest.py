@@ -48,6 +48,16 @@ def sync_merged_qa() -> dict[str, Any]:
     if not rag_pg.kb_pg_enabled():
         return {"ok": False, "skipped": "pg_not_configured"}
 
+    model_path = Path(rag_pg.EMBEDDING_MODEL_NAME)
+    if model_path.is_absolute():
+        has_weights = any((model_path / name).exists() for name in ("model.safetensors", "pytorch_model.bin"))
+        if not model_path.exists() or not has_weights:
+            return {
+                "ok": False,
+                "skipped": "embedding_model_missing_or_incomplete",
+                "embedding_model": str(model_path),
+            }
+
     import psycopg
 
     rag_pg.init_pg_schema()

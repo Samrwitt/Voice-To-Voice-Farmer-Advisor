@@ -37,3 +37,14 @@ CANNED_AGROCHEM_ESCALATION_AM = (
     "ለመድሐኒት መጠን፣ የመርጨት ጊዜ፣ መገናኛና የደህንነት ጥያቄዎች ከዚህ ስልክ አጠቃላይ መረጃ ብቻ ሙሉ መልስ ልንሰጥ አንችልም። "
     "እባክዎን የገበር ልማት ባለሙያ፣ ኮኦፕ ወይም የአካባቢ ተቋም ይጠይቁ። ጥያቄዎን ለባለሙያ አስተላልፈናል።"
 )
+
+
+def agrochemical_max_l2_distance(default_max: float) -> float:
+    """Stricter retrieval bar for chemical/dose questions (optional)."""
+    raw = os.getenv("RAG_AGROCHEM_MAX_L2_DISTANCE", "").strip()
+    if not raw:
+        return default_max
+    try:
+        return min(default_max, float(raw))
+    except ValueError:
+        return default_max

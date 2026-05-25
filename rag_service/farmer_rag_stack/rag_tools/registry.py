@@ -53,4 +53,34 @@ def ollama_style_schemas() -> list[dict[str, Any]]:
                 },
             },
         },
+        {
+            "type": "function",
+            "function": {
+                "name": "soil_data",
+                "description": "Fetch long-lived soil properties for coordinates from SoilGrids.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "latitude": {"type": "number"},
+                        "longitude": {"type": "number"},
+                    },
+                    "required": ["latitude", "longitude"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "market_price",
+                "description": "Read local or demo market price data for a crop and market/location.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "crop": {"type": "string"},
+                        "location_or_market": {"type": "string"},
+                    },
+                    "required": ["crop"],
+                },
+            },
+        },
     ]

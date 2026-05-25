@@ -131,6 +131,13 @@ def init_db():
                   duration INTEGER NOT NULL,
                   timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
 
+    # Dynamic Knowledge Cache (for web search fallbacks)
+    c.execute('''CREATE TABLE IF NOT EXISTS dynamic_knowledge_cache
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  query TEXT UNIQUE NOT NULL,
+                  content TEXT NOT NULL,
+                  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+
     conn.commit()
     conn.close()
 
@@ -366,6 +373,28 @@ def get_market_price(crop_name: str, region: str = None):
     conn.close()
     return result  # (price, unit, updated_at) or None
 
+def get_dynamic_knowledge(query: str):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT content FROM dynamic_knowledge_cache WHERE query = ?", (query.lower().strip(),))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return row[0]
+    return None
+
+def set_dynamic_knowledge(query: str, content: str):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        c.execute("INSERT INTO dynamic_knowledge_cache (query, content) VALUES (?, ?) ON CONFLICT(query) DO UPDATE SET content=excluded.content, updated_at=CURRENT_TIMESTAMP",
+                  (query.lower().strip(), content))
+        conn.commit()
+    except Exception as e:
+        print(f"Error setting dynamic knowledge: {e}")
+    finally:
+        conn.close()
+
 def register_farmer(phone_number: str, name: str, location: str, preferred_language: str = 'am'):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -486,132 +515,6 @@ def get_farmer_profile(phone_number: str):
             "registered_at": row[3],
         }
     return None
-
-def update_farmer_kb_from_turn(
-    phone_number: str,
-    *,
-    name: str | None = None,
-    location: str | None = None,
-    preferred_language: str | None = None,
-    crop_en: str | None = None,
-    region_en: str | None = None,
-    intent: str | None = None,
-) -> None:
-    """
-    Persist lightweight personalization signals for future calls.
-    Stores only non-sensitive, aggregated info:
-      - location/language (if available)
-      - crop frequency counts
-      - recent intent/region + interaction counters (inside notes as JSON string)
-    """
-    p = (phone_number or "").strip()
-    if not p or p == "Unknown":
-        return
-
-    keys = _phone_lookup_keys(p)
-    if not keys:
-        return
-
-    now = datetime.utcnow().isoformat() + "Z"
-
-    if not _pg_enabled():
-        # SQLite fallback is intentionally minimal.
-        return
-
-    try:
-        import psycopg
-
-        with psycopg.connect(POSTGRES_URL) as conn:
-            with conn.cursor() as cur:
-                # Load existing row (if any)
-                cur.execute(
-                    """
-                    SELECT name, location, preferred_language, crops, farm_size, notes
-                    FROM farmers_kb
-                    WHERE phone_number = ANY(%s)
-                    LIMIT 1;
-                    """,
-                    (keys,),
-                )
-                row = cur.fetchone()
-
-                existing = {
-                    "name": None,
-                    "location": None,
-                    "preferred_language": None,
-                    "crops": {},
-                    "farm_size": None,
-                    "notes": {},
-                }
-                if row:
-                    existing["name"] = row[0]
-                    existing["location"] = row[1]
-                    existing["preferred_language"] = row[2]
-                    existing["crops"] = row[3] or {}
-                    existing["farm_size"] = row[4]
-                    raw_notes = row[5]
-                    if raw_notes:
-                        try:
-                            existing["notes"] = json.loads(raw_notes) if isinstance(raw_notes, str) else raw_notes
-                        except Exception:
-                            existing["notes"] = {"raw": str(raw_notes)}
-
-                # Merge updates
-                out_name = (name or existing["name"] or None)
-                out_loc = (location or existing["location"] or None)
-                out_lang = (preferred_language or existing["preferred_language"] or "am")
-
-                crops_obj = existing["crops"]
-                if isinstance(crops_obj, list):
-                    crops_obj = {str(x): 1 for x in crops_obj if x}
-                if not isinstance(crops_obj, dict):
-                    crops_obj = {}
-                if crop_en:
-                    k = str(crop_en)
-                    try:
-                        crops_obj[k] = int(crops_obj.get(k) or 0) + 1
-                    except Exception:
-                        crops_obj[k] = 1
-
-                notes_obj = existing["notes"] if isinstance(existing["notes"], dict) else {}
-                try:
-                    notes_obj["last_seen_at"] = now
-                    if intent:
-                        notes_obj["last_intent"] = str(intent)
-                    if region_en:
-                        notes_obj["last_region"] = str(region_en)
-                    notes_obj["interactions"] = int(notes_obj.get("interactions") or 0) + 1
-                except Exception:
-                    notes_obj = {"last_seen_at": now, "interactions": 1}
-
-                # UPSERT
-                cur.execute(
-                    """
-                    INSERT INTO farmers_kb
-                      (phone_number, name, location, preferred_language, crops, farm_size, notes, registered_at, updated_at)
-                    VALUES
-                      (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
-                    ON CONFLICT (phone_number) DO UPDATE SET
-                      name = COALESCE(EXCLUDED.name, farmers_kb.name),
-                      location = COALESCE(EXCLUDED.location, farmers_kb.location),
-                      preferred_language = COALESCE(EXCLUDED.preferred_language, farmers_kb.preferred_language),
-                      crops = COALESCE(EXCLUDED.crops, farmers_kb.crops),
-                      notes = COALESCE(EXCLUDED.notes, farmers_kb.notes),
-                      updated_at = NOW();
-                    """,
-                    (
-                        p,
-                        out_name,
-                        out_loc,
-                        out_lang,
-                        json.dumps(crops_obj),
-                        existing["farm_size"],
-                        json.dumps(notes_obj),
-                    ),
-                )
-            conn.commit()
-    except Exception as exc:
-        print(f"[DB] update_farmer_kb_from_turn failed: {exc}", flush=True)
 
 def create_alert(target_region: str, alert_message: str, severity: str = "warning"):
     conn = sqlite3.connect(DB_PATH)
