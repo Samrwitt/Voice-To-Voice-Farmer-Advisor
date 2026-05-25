@@ -24,6 +24,7 @@ from trust_meta import build_voice_trust_meta, maybe_append_trust_footer
 from rag_retrieval import ranked_hits_for_voice_query
 import chemical_safety
 import response_cache
+import scenario_router
 import voice_guards
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -113,6 +114,7 @@ class RagAnswerRequest(BaseModel):
     text: str
     phone_number: str = "Unknown"
     session_id: str = "default_session"
+    asr: Optional[dict] = None
 
 
 class RagDebugContextRequest(BaseModel):
@@ -962,7 +964,112 @@ def _voice_escalation_response(
         "references": [],
         "best_distance": best_distance,
         "trust": trust,
-        "meta": {"response_cache": "bypass", "reason": meta_reason},
+        "meta": {
+            "response_cache": "bypass",
+            "reason": meta_reason,
+            "scenario": "safety_agrochemical" if reason_code == "AGROCHEM_NO_KB" else "low_confidence",
+        },
+    }
+
+
+def _voice_clarification_response(
+    *,
+    query_text: str,
+    phone_number: str,
+    session_id: str,
+    prompt: str,
+    nlu,
+    t0: float,
+    scenario: str,
+    missing_slots: list[str] | None = None,
+    expert_delivery: str = "",
+    asr_meta: dict | None = None,
+) -> dict:
+    set_session_state(session_id, "awaiting_slot", query_text)
+    final = f"{expert_delivery}\n\n{prompt}" if expert_delivery else prompt
+    final = normalize_text(final)
+    log_conversation(phone_number, session_id, "assistant", final)
+    log_interaction_record(
+        phone_number=phone_number,
+        session_id=session_id,
+        intent=getattr(nlu, "primary_intent", None),
+        response_type="awaiting_slot",
+        entities=getattr(nlu, "entities", None),
+        confidence=getattr(nlu, "confidence", None),
+    )
+    latency_ms = (time.perf_counter() - t0) * 1000
+    trust = {
+        "sources": ["clarification"],
+        "kb_chunks_used": 0,
+        "sources_in_prompt": 0,
+        "latency_ms": round(latency_ms, 1),
+        "human_review": False,
+        "grounding": "clarification",
+    }
+    if asr_meta:
+        trust["asr"] = {
+            "confidence": asr_meta.get("confidence"),
+            "needs_confirmation": asr_meta.get("needs_confirmation"),
+            "transcript_fix_backend": asr_meta.get("transcript_fix_backend"),
+            "unusual_words": asr_meta.get("unusual_words") or [],
+        }
+    return {
+        "response": final,
+        "references": [],
+        "best_distance": None,
+        "trust": trust,
+        "meta": {
+            "response_cache": "bypass",
+            "reason": "clarification",
+            "scenario": scenario,
+            "missing_slots": missing_slots or [],
+        },
+    }
+
+
+def _voice_safe_fallback_response(
+    *,
+    query_text: str,
+    phone_number: str,
+    session_id: str,
+    nlu,
+    t0: float,
+    scenario: str,
+    retrieval_diag: dict | None = None,
+) -> dict:
+    final = (
+        "ጥያቄዎን በትክክል ለመርዳት ተጨማሪ መረጃ ያስፈልገኛል። "
+        "እባክዎን ሰብሉን፣ አካባቢውን እና ዋናውን ችግኝ በአንድ አጭር ዓረፍተ ነገር ይንገሩኝ።"
+    )
+    set_session_state(session_id, "awaiting_slot", query_text)
+    log_conversation(phone_number, session_id, "assistant", final)
+    log_interaction_record(
+        phone_number=phone_number,
+        session_id=session_id,
+        intent=getattr(nlu, "primary_intent", None),
+        response_type="clarification_fallback",
+        entities=getattr(nlu, "entities", None),
+        confidence=getattr(nlu, "confidence", None),
+    )
+    latency_ms = (time.perf_counter() - t0) * 1000
+    return {
+        "response": final,
+        "references": [],
+        "best_distance": (retrieval_diag or {}).get("best_distance"),
+        "trust": {
+            "sources": ["clarification"],
+            "kb_chunks_used": 0,
+            "sources_in_prompt": 0,
+            "latency_ms": round(latency_ms, 1),
+            "human_review": False,
+            "grounding": "clarification",
+        },
+        "meta": {
+            "response_cache": "bypass",
+            "reason": "clarification_fallback",
+            "scenario": scenario,
+            "retrieval": retrieval_diag or {},
+        },
     }
 
 
@@ -977,11 +1084,17 @@ async def rag_answer(req: RagAnswerRequest):
     from farmer_rag_stack.assistant import try_llm_assistant_response
     from farmer_rag_stack.smart_advisory import run_smart_advisory
 
+    t0 = time.perf_counter()
     query_text = (req.text or "").strip()
     if not query_text:
         raise HTTPException(status_code=400, detail="Empty query")
 
-    log_conversation(req.phone_number, req.session_id, "user", query_text)
+    state = get_session_state(req.session_id)
+    if state and state.get("current_state") == "awaiting_slot":
+        original_query = state.get("pending_action", "")
+        if original_query:
+            query_text = f"{original_query} {query_text}".strip()
+        set_session_state(req.session_id, "active", None)
 
     nlu = analyze_intent(query_text)
     expert_delivery = check_and_deliver_expert_responses(req.phone_number)
@@ -1003,6 +1116,49 @@ async def rag_answer(req: RagAnswerRequest):
 
     hist = get_conversation_history(req.session_id, limit=6)
     hist_pairs = list(hist)
+    log_conversation(req.phone_number, req.session_id, "user", query_text)
+
+    asr_meta = req.asr if isinstance(req.asr, dict) else {}
+    if asr_meta.get("needs_confirmation"):
+        prompt = (
+            (asr_meta.get("confirmation_prompt") or "").strip()
+            or f"የሰማሁት ይህ ነው፦ {query_text}። ትክክል ነው?"
+        )
+        return _voice_clarification_response(
+            query_text=query_text,
+            phone_number=req.phone_number,
+            session_id=req.session_id,
+            prompt=prompt,
+            nlu=nlu,
+            t0=t0,
+            scenario="asr_confirmation",
+            missing_slots=["asr_confirmation"],
+            expert_delivery=expert_delivery,
+            asr_meta=asr_meta,
+        )
+
+    is_agro = chemical_safety.is_high_risk_agrochemical_query(query_text)
+    scenario_decision = scenario_router.classify_voice_scenario(
+        text=query_text,
+        nlu=nlu,
+        profile=profile,
+        user_region=user_region,
+        history_pairs=hist_pairs,
+        is_agrochemical=is_agro,
+    )
+    if scenario_decision.needs_clarification and scenario_decision.clarification_prompt:
+        return _voice_clarification_response(
+            query_text=query_text,
+            phone_number=req.phone_number,
+            session_id=req.session_id,
+            prompt=scenario_decision.clarification_prompt,
+            nlu=nlu,
+            t0=t0,
+            scenario=scenario_decision.scenario,
+            missing_slots=scenario_decision.missing_slots,
+            expert_delivery=expert_delivery,
+            asr_meta=asr_meta,
+        )
 
     cache_allowed = not expert_delivery and not (dyn or "").strip()
     cache_key = (
@@ -1018,16 +1174,17 @@ async def rag_answer(req: RagAnswerRequest):
         cached = response_cache.get(cache_key)
         if cached:
             out_hit = dict(cached)
-            out_hit["meta"] = {"response_cache": "hit"}
+            meta = dict(out_hit.get("meta") or {})
+            meta["response_cache"] = "hit"
+            out_hit["meta"] = meta
             cached_resp = (out_hit.get("response") or "").strip()
             if cached_resp:
                 log_conversation(req.phone_number, req.session_id, "assistant", cached_resp)
             return out_hit
 
-    t0 = time.perf_counter()
     max_d = float(os.environ.get("RAG_PG_MAX_L2_DISTANCE", str(RAG_PG_MAX_L2_DISTANCE)))
     try:
-        hits, _rq, _farmer_nlu, best = ranked_hits_for_voice_query(
+        hits, _rq, _farmer_nlu, best, retrieval_diag = ranked_hits_for_voice_query(
             query_text=query_text,
             nlu=nlu,
             user_region=user_region,
@@ -1048,7 +1205,6 @@ async def rag_answer(req: RagAnswerRequest):
     agro_max = chemical_safety.agrochemical_max_l2_distance(max_d)
     kb_grounded = voice_guards.kb_grounded_for_voice(hits, best, max_d)
     agro_kb_grounded = voice_guards.kb_grounded_for_voice(hits, best, agro_max)
-    is_agro = chemical_safety.is_high_risk_agrochemical_query(query_text)
 
     if (
         chemical_safety.agrochemical_expert_only_enabled()
@@ -1074,7 +1230,12 @@ async def rag_answer(req: RagAnswerRequest):
             nlu=nlu,
         )
 
-    if voice_guards.voice_low_conf_escalation_enabled() and not kb_grounded and not is_agro:
+    if (
+        scenario_decision.allow_low_conf_escalation
+        and voice_guards.voice_low_conf_escalation_enabled()
+        and not kb_grounded
+        and not is_agro
+    ):
         return _voice_escalation_response(
             query_text=query_text,
             phone_number=req.phone_number,
@@ -1092,7 +1253,19 @@ async def rag_answer(req: RagAnswerRequest):
             nlu=nlu,
         )
 
-    hits = voice_guards.confident_kb_hits(hits, max_d)
+    confident_hits = voice_guards.confident_kb_hits(hits, max_d)
+    if scenario_decision.route_hint in {"market", "weather"} and not kb_grounded:
+        hits = []
+        retrieval_diag["weak_kb_used"] = False
+    elif confident_hits:
+        hits = confident_hits
+        retrieval_diag["weak_kb_used"] = False
+    elif hits and scenario_decision.route_hint not in {"clarify_or_fallback", "market", "weather"}:
+        hits = hits[:3]
+        retrieval_diag["weak_kb_used"] = True
+    else:
+        hits = []
+        retrieval_diag["weak_kb_used"] = False
 
     profile_line = build_personalization_block(req.phone_number, profile)
     if user_region:
@@ -1156,6 +1329,16 @@ async def rag_answer(req: RagAnswerRequest):
 
     escalated_empty = False
     if not final:
+        if scenario_decision.scenario != "safety_agrochemical":
+            return _voice_safe_fallback_response(
+                query_text=query_text,
+                phone_number=req.phone_number,
+                session_id=req.session_id,
+                nlu=nlu,
+                t0=t0,
+                scenario=scenario_decision.scenario,
+                retrieval_diag=retrieval_diag,
+            )
         escalated_empty = True
         add_to_escalation(
             query_text,
@@ -1199,6 +1382,23 @@ async def rag_answer(req: RagAnswerRequest):
         latency_ms=latency_ms,
         sla_target_hours=sla_h,
     )
+    trust["scenario"] = scenario_decision.scenario
+    trust["retrieval"] = {
+        "best_distance": best,
+        "kb_grounded": kb_grounded,
+        "weak_kb_used": retrieval_diag.get("weak_kb_used", False),
+        "pg_raw_count": retrieval_diag.get("pg_raw_count", 0),
+        "pg_filtered_count": retrieval_diag.get("pg_filtered_count", 0),
+        "chroma_count": retrieval_diag.get("chroma_count", 0),
+        "final_count": retrieval_diag.get("final_count", len(hits)),
+    }
+    if asr_meta:
+        trust["asr"] = {
+            "confidence": asr_meta.get("confidence"),
+            "needs_confirmation": asr_meta.get("needs_confirmation"),
+            "transcript_fix_backend": asr_meta.get("transcript_fix_backend"),
+            "unusual_words": asr_meta.get("unusual_words") or [],
+        }
     final = maybe_append_trust_footer(final, sources=src)
 
     refs: list[dict] = []
@@ -1214,7 +1414,17 @@ async def rag_answer(req: RagAnswerRequest):
             }
         )
 
-    out = {"response": final, "references": refs, "best_distance": best, "trust": trust}
+    out = {
+        "response": final,
+        "references": refs,
+        "best_distance": best,
+        "trust": trust,
+        "meta": {
+            "response_cache": "miss" if cache_key else "bypass",
+            "scenario": scenario_decision.to_dict(),
+            "retrieval": retrieval_diag,
+        },
+    }
     if smart_tool_trace:
         out["tool_trace"] = smart_tool_trace
     if smart_context and os.environ.get("RAG_RETURN_SMART_CONTEXT", "0").strip().lower() in ("1", "true", "yes", "on"):
@@ -1264,10 +1474,11 @@ async def rag_debug_context(req: RagDebugContextRequest):
     hits: list[dict] = []
     best = 999.0
     retrieval_query = ""
+    retrieval_diag: dict = {}
     if req.retrieve:
         max_d = float(os.environ.get("RAG_PG_MAX_L2_DISTANCE", str(RAG_PG_MAX_L2_DISTANCE)))
         try:
-            hits, retrieval_query, _farmer_nlu, best = ranked_hits_for_voice_query(
+            hits, retrieval_query, _farmer_nlu, best, retrieval_diag = ranked_hits_for_voice_query(
                 query_text=query_text,
                 nlu=nlu,
                 user_region=user_region,
@@ -1304,6 +1515,7 @@ async def rag_debug_context(req: RagDebugContextRequest):
             "best_distance": best,
             "hit_count": len(hits),
             "user_region": user_region,
+            "diagnostics": retrieval_diag if req.retrieve else {},
         },
         "session_history_count": len(hist_pairs),
     }

@@ -51,6 +51,12 @@ def _check_rubric(case_id: str, resp: dict, latency_ms: float, rubric: dict) -> 
     errs: list[str] = []
     text = (resp.get("response") or "").strip()
     trust = resp.get("trust") or {}
+    meta = resp.get("meta") or {}
+    scenario = meta.get("scenario") or {}
+    if isinstance(scenario, dict):
+        scenario_name = scenario.get("scenario")
+    else:
+        scenario_name = scenario
 
     if rubric.get("min_response_len"):
         if len(text) < int(rubric["min_response_len"]):
@@ -60,9 +66,9 @@ def _check_rubric(case_id: str, resp: dict, latency_ms: float, rubric: dict) -> 
     if mx is not None and latency_ms > float(mx):
         errs.append(f"{case_id}: latency {latency_ms:.0f}ms > {mx}ms")
 
-    for s in rubric.get("expect_substrings_any") or []:
-        if s and s not in text:
-            errs.append(f"{case_id}: expected substring missing (any): {s!r}")
+    any_expected = [s for s in (rubric.get("expect_substrings_any") or []) if s]
+    if any_expected and not any(s in text for s in any_expected):
+        errs.append(f"{case_id}: expected one substring from {any_expected!r}")
 
     for s in rubric.get("expect_substrings_all") or []:
         if s and s not in text:
@@ -78,9 +84,29 @@ def _check_rubric(case_id: str, resp: dict, latency_ms: float, rubric: dict) -> 
         if g in ng:
             errs.append(f"{case_id}: trust.grounding={g!r} in forbidden {ng}")
 
+    eg = rubric.get("expect_trust_grounding")
+    if eg:
+        g = trust.get("grounding")
+        if g != eg:
+            errs.append(f"{case_id}: trust.grounding expected {eg!r} got {g!r}")
+
     for key, val in (rubric.get("expect_trust_contains") or {}).items():
         if trust.get(key) != val:
             errs.append(f"{case_id}: trust.{key} expected {val!r} got {trust.get(key)!r}")
+
+    min_refs = rubric.get("min_references")
+    if min_refs is not None:
+        n = len(resp.get("references") or [])
+        if n < int(min_refs):
+            errs.append(f"{case_id}: references {n} < {min_refs}")
+
+    exp_scenario = rubric.get("expect_scenario")
+    if exp_scenario and scenario_name != exp_scenario:
+        errs.append(f"{case_id}: scenario expected {exp_scenario!r} got {scenario_name!r}")
+
+    exp_meta_reason = rubric.get("expect_meta_reason")
+    if exp_meta_reason and meta.get("reason") != exp_meta_reason:
+        errs.append(f"{case_id}: meta.reason expected {exp_meta_reason!r} got {meta.get('reason')!r}")
 
     return errs
 
@@ -92,7 +118,7 @@ def main() -> int:
         type=Path,
         default=Path(__file__).resolve().parent / "golden_questions.json",
     )
-    ap.add_argument("--phone", default=os.getenv("EVAL_PHONE", "eval_bot"))
+    ap.add_argument("--phone", default=os.getenv("EVAL_PHONE") or f"eval_bot_{int(time.time())}")
     ap.add_argument("--session-prefix", default="eval_session")
     args = ap.parse_args()
 
@@ -130,6 +156,11 @@ def main() -> int:
                 "ok": not bool(errs),
                 "latency_ms": round(wall_ms, 1),
                 "trust_latency_ms": trust.get("latency_ms"),
+                "grounding": trust.get("grounding"),
+                "scenario": ((resp.get("meta") or {}).get("scenario") or {}).get("scenario")
+                if isinstance((resp.get("meta") or {}).get("scenario"), dict)
+                else (resp.get("meta") or {}).get("scenario"),
+                "references": len(resp.get("references") or []),
                 "response_preview": (resp.get("response") or "")[:160],
             }
         )

@@ -16,8 +16,6 @@ from config import (
     NO_REPEAT_NGRAM_SIZE,
     USE_VAD,
     CONDITION_ON_PREVIOUS_TEXT,
-    SPEECHBRAIN_SOURCE,
-    SPEECHBRAIN_SAVEDIR,
 )
 from postprocess import postprocess_asr_transcript
 
@@ -132,70 +130,12 @@ class WhisperASREngine:
         )
 
 
-class SpeechBrainASREngine:
-    engine_name = "speechbrain"
-
-    def __init__(self):
-        try:
-            from speechbrain.inference.ASR import EncoderASR
-        except ImportError:
-            try:
-                from speechbrain.pretrained import EncoderASR
-            except ImportError as e:
-                raise ImportError(
-                    "speechbrain is not installed. Check asr_service/requirements.txt."
-                ) from e
-
-        savedir = SPEECHBRAIN_SAVEDIR
-        savedir.mkdir(parents=True, exist_ok=True)
-
-        device = DEVICE if DEVICE in ("cpu", "cuda", "mps") else "cpu"
-        logger.info(
-            "Loading SpeechBrain ASR from %s (savedir=%s, device=%s)",
-            SPEECHBRAIN_SOURCE,
-            savedir,
-            device,
-        )
-        self.model = EncoderASR.from_hparams(
-            source=SPEECHBRAIN_SOURCE,
-            savedir=str(savedir),
-            run_opts={"device": device},
-        )
-        logger.info("SpeechBrain ASR loaded successfully.")
-
-    def transcribe(self, audio_path: str | Path) -> dict:
-        start_time = time.time()
-        path = Path(audio_path)
-        if not path.is_file():
-            raise FileNotFoundError(f"Audio file not found: {audio_path}")
-
-        logger.info("SpeechBrain transcribing: %s", audio_path)
-        transcript = self.model.transcribe_file(str(path))
-        if isinstance(transcript, list):
-            transcript = " ".join(str(x) for x in transcript)
-        raw_transcript = str(transcript).strip()
-
-        latency = time.time() - start_time
-        logger.info("SpeechBrain done in %.2fs: %s", latency, raw_transcript[:120])
-
-        return _format_transcription_result(
-            audio_path=audio_path,
-            raw_transcript=raw_transcript,
-            engine=self.engine_name,
-            language=LANGUAGE,
-            language_probability=0.9,
-            latency=latency,
-        )
-
-
 def create_asr_engine():
     mode = ASR_ENGINE
     if mode in ("whisper", "whisper_local"):
         return WhisperASREngine()
-    if mode == "speechbrain":
-        return SpeechBrainASREngine()
     raise ValueError(
-        f"Unsupported ASR_ENGINE='{mode}'. Use whisper_local or speechbrain."
+        f"Unsupported ASR_ENGINE='{mode}'. Use whisper_local."
     )
 
 
