@@ -25,5 +25,6 @@ curl -sS -X POST "${ASR_URL}/transcribe" \
   | python3 -m json.tool
 
 echo ""
-echo "Tip: compare raw vs final in the JSON (raw_transcript vs transcript)."
+echo "Tip: compare raw_transcript, semantic_corrected_transcript, transcript_fix_backend, final_transcript."
+echo "Text-only typo test (no Whisper): ./scripts/test_asr_typo_fix.sh"
 echo "Tune ASR in asr_service/config.py and postprocess.py if text is off."

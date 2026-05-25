@@ -1,10 +1,10 @@
 import logging
 import time
 from pathlib import Path
-
-from faster_whisper import WhisperModel
+from typing import Any
 
 from config import (
+    ASR_ENGINE,
     MODEL_DIR,
     DEVICE,
     COMPUTE_TYPE,
@@ -16,38 +16,79 @@ from config import (
     NO_REPEAT_NGRAM_SIZE,
     USE_VAD,
     CONDITION_ON_PREVIOUS_TEXT,
+    SPEECHBRAIN_SOURCE,
+    SPEECHBRAIN_SAVEDIR,
 )
-
 from postprocess import postprocess_asr_transcript
 
 logger = logging.getLogger("asr-engine")
 logging.basicConfig(level=logging.INFO)
 
 
-class ASREngine:
-    def __init__(self):
-        model_path = Path(MODEL_DIR)
+def _format_transcription_result(
+    *,
+    audio_path: str | Path,
+    raw_transcript: str,
+    engine: str,
+    language: str = LANGUAGE,
+    language_probability: float = 0.9,
+    segments: list[dict[str, Any]] | None = None,
+    latency: float | None = None,
+) -> dict:
+    processed = postprocess_asr_transcript(raw_transcript)
+    if latency is None:
+        latency = 0.0
+    if segments is None:
+        segments = (
+            [{"start": 0.0, "end": float(latency), "text": raw_transcript}]
+            if raw_transcript
+            else []
+        )
+    return {
+        "language": language,
+        "language_probability": float(language_probability),
+        "raw_transcript": processed["raw"],
+        "cleaned_transcript": processed["cleaned"],
+        "homophone_normalized_transcript": processed["homophone_normalized"],
+        "pronunciation_normalized_transcript": processed["pronunciation_normalized"],
+        "domain_corrected_transcript": processed["domain_corrected"],
+        "semantic_corrected_transcript": processed.get("semantic_corrected"),
+        "transcript_fix_backend": processed.get("transcript_fix_backend"),
+        "final_transcript": processed["final"],
+        "transcript": processed["final"],
+        "text": processed["final"],
+        "confidence": float(language_probability),
+        "engine": engine,
+        "audio_id": Path(audio_path).stem,
+        "unusual_words": processed["unusual_words"],
+        "needs_confirmation": processed["needs_confirmation"],
+        "confirmation_prompt": processed["confirmation_prompt"],
+        "segments": segments,
+        "latency_seconds": latency,
+    }
 
+
+class WhisperASREngine:
+    engine_name = "whisper_local"
+
+    def __init__(self):
+        from faster_whisper import WhisperModel
+
+        model_path = Path(MODEL_DIR)
         if not model_path.exists():
-            logger.error(f"ASR model folder not found: {MODEL_DIR}")
             raise FileNotFoundError(f"ASR model folder not found: {MODEL_DIR}")
 
-        logger.info(f"Loading ASR model from: {MODEL_DIR}")
-        logger.info(f"Device: {DEVICE}")
-        logger.info(f"Compute type: {COMPUTE_TYPE}")
-
+        logger.info("Loading Whisper ASR from: %s (device=%s)", MODEL_DIR, DEVICE)
         self.model = WhisperModel(
             str(model_path),
             device=DEVICE,
             compute_type=COMPUTE_TYPE,
         )
-
-        logger.info("ASR model loaded successfully.")
-
+        logger.info("Whisper ASR loaded successfully.")
 
     def transcribe(self, audio_path: str | Path) -> dict:
         start_time = time.time()
-        logger.info(f"Transcribing audio file: {audio_path}")
+        logger.info("Whisper transcribing: %s", audio_path)
 
         segments_iter, info = self.model.transcribe(
             str(audio_path),
@@ -65,11 +106,9 @@ class ASREngine:
 
         segments = []
         texts = []
-
         for segment in segments_iter:
             segment_text = segment.text.strip()
             texts.append(segment_text)
-
             segments.append(
                 {
                     "start": float(segment.start),
@@ -79,34 +118,88 @@ class ASREngine:
             )
 
         raw_transcript = " ".join(texts).strip()
-        processed = postprocess_asr_transcript(raw_transcript)
+        latency = time.time() - start_time
+        logger.info("Whisper done in %.2fs: %s", latency, raw_transcript[:120])
+
+        return _format_transcription_result(
+            audio_path=audio_path,
+            raw_transcript=raw_transcript,
+            engine=self.engine_name,
+            language=info.language,
+            language_probability=float(info.language_probability),
+            segments=segments,
+            latency=latency,
+        )
+
+
+class SpeechBrainASREngine:
+    engine_name = "speechbrain"
+
+    def __init__(self):
+        try:
+            from speechbrain.inference.ASR import EncoderASR
+        except ImportError:
+            try:
+                from speechbrain.pretrained import EncoderASR
+            except ImportError as e:
+                raise ImportError(
+                    "speechbrain is not installed. Check asr_service/requirements.txt."
+                ) from e
+
+        savedir = SPEECHBRAIN_SAVEDIR
+        savedir.mkdir(parents=True, exist_ok=True)
+
+        device = DEVICE if DEVICE in ("cpu", "cuda", "mps") else "cpu"
+        logger.info(
+            "Loading SpeechBrain ASR from %s (savedir=%s, device=%s)",
+            SPEECHBRAIN_SOURCE,
+            savedir,
+            device,
+        )
+        self.model = EncoderASR.from_hparams(
+            source=SPEECHBRAIN_SOURCE,
+            savedir=str(savedir),
+            run_opts={"device": device},
+        )
+        logger.info("SpeechBrain ASR loaded successfully.")
+
+    def transcribe(self, audio_path: str | Path) -> dict:
+        start_time = time.time()
+        path = Path(audio_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+
+        logger.info("SpeechBrain transcribing: %s", audio_path)
+        transcript = self.model.transcribe_file(str(path))
+        if isinstance(transcript, list):
+            transcript = " ".join(str(x) for x in transcript)
+        raw_transcript = str(transcript).strip()
 
         latency = time.time() - start_time
-        logger.info(f"Transcription completed in {latency:.2f}s. Result: {processed['final']}")
+        logger.info("SpeechBrain done in %.2fs: %s", latency, raw_transcript[:120])
 
-        return {
-
-            "language": info.language,
-            "language_probability": float(info.language_probability),
-
-            "raw_transcript": processed["raw"],
-            "cleaned_transcript": processed["cleaned"],
-            "homophone_normalized_transcript": processed["homophone_normalized"],
-            "pronunciation_normalized_transcript": processed["pronunciation_normalized"],
-            "domain_corrected_transcript": processed["domain_corrected"],
-            "final_transcript": processed["final"],
-            "transcript": processed["final"],
-            "text": processed["final"],
-            "confidence": float(info.language_probability), # Proxy for confidence
-            "engine": "whisper_local",
-            "audio_id": Path(audio_path).stem,
+        return _format_transcription_result(
+            audio_path=audio_path,
+            raw_transcript=raw_transcript,
+            engine=self.engine_name,
+            language=LANGUAGE,
+            language_probability=0.9,
+            latency=latency,
+        )
 
 
+def create_asr_engine():
+    mode = ASR_ENGINE
+    if mode in ("whisper", "whisper_local"):
+        return WhisperASREngine()
+    if mode == "speechbrain":
+        return SpeechBrainASREngine()
+    raise ValueError(
+        f"Unsupported ASR_ENGINE='{mode}'. Use whisper_local or speechbrain."
+    )
 
-            "unusual_words": processed["unusual_words"],
-            "needs_confirmation": processed["needs_confirmation"],
-            "confirmation_prompt": processed["confirmation_prompt"],
 
-            "segments": segments,
-            "latency_seconds": latency,
-        }
+# Backward-compatible alias used by main.py
+class ASREngine:
+    def __new__(cls):
+        return create_asr_engine()

@@ -3,7 +3,8 @@ import requests
 from rapidfuzz import process, fuzz
 
 from domain_terms import DOMAIN_TERMS
-from config import USE_OLLAMA, OLLAMA_URL, OLLAMA_MODEL
+from config import USE_HOSTED_LLM_FIX, USE_OLLAMA, OLLAMA_URL, OLLAMA_MODEL
+from hosted_llm_fix import hosted_fix_enabled, semantic_correction_hosted
 
 
 
@@ -227,16 +228,36 @@ def semantic_correction_ollama(text: str) -> str:
         return text
 
 
+def _apply_semantic_correction(domain_corrected: str) -> tuple[str, str | None, str | None]:
+    """
+    Returns ``(final_text, semantic_corrected_or_none, fix_backend)``.
+    fix_backend: groq | gemini | ollama | none
+    """
+    use_hosted = USE_HOSTED_LLM_FIX in ("1", "true", "yes", "on") or (
+        USE_HOSTED_LLM_FIX == "auto" and hosted_fix_enabled()
+    )
+    if use_hosted:
+        try:
+            fixed, backend = semantic_correction_hosted(domain_corrected)
+            if backend and backend != "none" and fixed.strip():
+                return fixed, fixed, backend
+        except Exception as exc:
+            print(f"Hosted ASR fix failed, falling back: {exc}")
+
+    if USE_OLLAMA:
+        fixed = semantic_correction_ollama(domain_corrected)
+        return fixed, fixed, "ollama"
+
+    return domain_corrected, None, None
+
+
 def postprocess_asr_transcript(raw_text: str) -> dict:
     cleaned = basic_asr_cleanup(raw_text)
     homophone_normalized = normalize_amharic_homophones(cleaned)
     pronunciation_normalized = normalize_amharic_pronunciation(homophone_normalized)
     domain_corrected = correct_domain_terms(pronunciation_normalized)
 
-    # Use LLM for semantic correction if enabled
-    final_text = domain_corrected
-    if USE_OLLAMA:
-        final_text = semantic_correction_ollama(domain_corrected)
+    final_text, semantic_corrected, fix_backend = _apply_semantic_correction(domain_corrected)
 
     unusual_words = detect_unusual_words(final_text)
     confirm = needs_confirmation(raw_text, final_text)
@@ -247,7 +268,8 @@ def postprocess_asr_transcript(raw_text: str) -> dict:
         "homophone_normalized": homophone_normalized,
         "pronunciation_normalized": pronunciation_normalized,
         "domain_corrected": domain_corrected,
-        "semantic_corrected": final_text if USE_OLLAMA else None,
+        "semantic_corrected": semantic_corrected,
+        "transcript_fix_backend": fix_backend,
         "final": final_text,
         "transcript": final_text,
         "text": final_text,

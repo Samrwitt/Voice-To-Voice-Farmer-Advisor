@@ -45,16 +45,54 @@ REGION_KEYWORDS: dict[str, str] = {
 CROP_ENTITY_WORDS = set(CROP_KEYWORDS.keys())
 REGION_ENTITY_WORDS = set(REGION_KEYWORDS.keys())
 
+# Explicit market/price terms only — bare "ስንት" matches fertilizer dose questions too.
 MARKET_KEYWORDS = [
     "ዋጋ",
     "ስንት ነው",
-    "ስንት",
     "ገበያ",
     "price",
     "market",
     "cost",
     "ብር",
+    "ሽያጭ",
 ]
+
+# Dose / application questions often use "ስንት" + "መጠን" without asking market price.
+_NON_MARKET_DOSE_SIGNALS = [
+    "ማዳበሪያ",
+    "fertilizer",
+    "urea",
+    "dap",
+    "npk",
+    "compost",
+    "nutrient",
+    "መጠን",
+    "dose",
+    "dosage",
+    "spray",
+    "መርጨት",
+    "application rate",
+]
+
+
+def _is_market_price_intent(text: str, lower: str) -> bool:
+    """True when the farmer is asking commodity/market price, not rate/dose."""
+    if not any(k in lower or k in text for k in MARKET_KEYWORDS):
+        return False
+    has_dose = any(s in lower or s in text for s in _NON_MARKET_DOSE_SIGNALS)
+    strong_market = (
+        "ዋጋ",
+        "ገበያ",
+        "price",
+        "market",
+        "cost",
+        "ብር",
+        "ሽያጭ",
+        "ስንት ነው",
+    )
+    if has_dose and not any(m in lower or m in text for m in strong_market):
+        return False
+    return True
 
 AGRI_INTENT_KEYWORDS = [
     "ማዳበሪያ",
@@ -251,7 +289,7 @@ def analyze_intent(text: str) -> NLUResult:
     lower = stripped.lower()
 
     # Market price (separate data path in main)
-    if any(k in lower for k in MARKET_KEYWORDS) or any(k in stripped for k in MARKET_KEYWORDS):
+    if _is_market_price_intent(stripped, lower):
         conf = 0.88 if entities.get("crop_en") else 0.72
         return NLUResult("market_price", conf, entities, stripped)
 

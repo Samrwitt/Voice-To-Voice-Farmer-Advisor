@@ -17,6 +17,8 @@ class ASRResponse(BaseModel):
     homophone_normalized_transcript: str
     pronunciation_normalized_transcript: str
     domain_corrected_transcript: str
+    semantic_corrected_transcript: Optional[str] = None
+    transcript_fix_backend: Optional[str] = None
     final_transcript: str
     transcript: str
     text: str
@@ -37,3 +39,8 @@ class ASRResponse(BaseModel):
 class FileTranscribeRequest(BaseModel):
     filename: str
     language: str = "am"
+
+
+class PostprocessTextRequest(BaseModel):
+    """Simulate Whisper output to test Groq/Gemini typo fix without audio."""
+    text: str

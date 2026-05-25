@@ -475,43 +475,8 @@ def _generate_core_rag_response(query_text: str, phone_number: str, session_id: 
         if any(k in loc for k in ["highland", "ደጋ"]): user_region = "highland"
         elif any(k in loc for k in ["lowland", "ቆላ"]): user_region = "lowland"
         elif any(k in loc for k in ["midland", "ወይና"]): user_region = "midland"
-        
-    # ── Slot Filling Logic ────────────────────────────────────────────────────
+
     intent = nlu.primary_intent
-    if intent in REQUIRED_SLOTS:
-        missing_slots = []
-        for slot in REQUIRED_SLOTS[intent]:
-            # Check both current NLU and session state
-            val = nlu.entities.get(slot) or get_session_state(session_id, f"slot_{slot}")
-            if not val:
-                missing_slots.append(slot)
-            else:
-                # Save found slot to session for future turns
-                set_session_state(session_id, f"slot_{slot}", val)
-
-        if missing_slots:
-            # Ask for the first missing slot
-            next_slot = missing_slots[0]
-            prompt_text = SLOT_PROMPTS.get(next_slot, f"እባክዎን {next_slot} ይንገሩኝ።")
-            log_conversation(phone_number, session_id, "assistant", prompt_text)
-            log_interaction_record(
-                phone_number=phone_number,
-                session_id=session_id,
-                intent=intent,
-                response_type="slot_filling",
-                entities=nlu.entities,
-                confidence=nlu.confidence,
-            )
-            # Save the intent we are pursuing
-            set_session_state(session_id, "pending_intent", intent)
-            return prompt_text, "slot_filling", [], nlu.to_dict()
-
-    # If we are here, slots are filled. Check if we just finished filling slots.
-    pending_intent = get_session_state(session_id, "pending_intent")
-    if pending_intent:
-        intent = pending_intent
-        set_session_state(session_id, "pending_intent", None)
-
     user_context = build_personalization_block(phone_number, profile)
     if user_region:
         user_context = (user_context or "") + f"የክልል ማጣሪያ / ቦታ፦ {user_region}።\n"

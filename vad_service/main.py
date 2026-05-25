@@ -192,6 +192,8 @@ async def handle_completed_utterance(
                 "session_id": session_id,
                 "utterance_path": utterance_path,
                 "transcript": asr_result.get("transcript"),
+                "transcript_raw": asr_result.get("raw_transcript"),
+                "transcript_fix_backend": asr_result.get("transcript_fix_backend"),
                 "confidence": asr_result.get("confidence"),
                 "engine": asr_result.get("engine"),
                 "audio_id": asr_result.get("audio_id"),
