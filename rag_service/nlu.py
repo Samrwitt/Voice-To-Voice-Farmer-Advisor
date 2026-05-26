@@ -17,6 +17,7 @@ Out of scope:
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -626,6 +627,37 @@ def _build_retrieval_query(question: str, intent: str) -> str:
 # -----------------------------------------------------------------------------
 # Public API
 # -----------------------------------------------------------------------------
+def normalize_asr_farmer_query(text: str) -> str:
+    """Normalize common ASR garbles before intent routing and escalation checks."""
+    normalized = re.sub(r"\s+", " ", (text or "").strip())
+    if not normalized:
+        return ""
+
+    replacements = (
+        (r"\bየ?አስ\s+ቫር\s+አ\s+ሲዳን\b", "የአፈር አሲዳማነት"),
+        (r"\bየ?አፈር?\s+ራሲ\s+ዳማነት\b", "የአፈር አሲዳማነት"),
+        (r"\bየ?አሰ\s+ፊዳብ\b", "የአፈር አሲዳማነት"),
+        (r"\bአ\s+ሲዳን\b|\bአሲዳን\b|\bሲዳን\b", "አሲዳማነት"),
+        (r"\bማጅመት\b|\bመጅመት\b|\bማጅኘት\b", "ምልክት"),
+        (r"\bከምኑ\b", "ከምን"),
+        (r"\bበውን\b", "በምን"),
+        (r"\bተወቃል\b", "ይታወቃል"),
+    )
+    for pattern, replacement in replacements:
+        normalized = re.sub(pattern, replacement, normalized)
+
+    compact = normalized.replace(" ", "")
+    soilish = any(token in compact for token in ("የአፈር", "አፈር", "አስቫር", "አሰፊዳብ", "ፊዳብ"))
+    acidish = any(token in compact for token in ("አሲዳ", "ሲዳ", "ዳማነት", "ራሲዳማነት", "ፊዳብ"))
+    questionish = any(token in compact for token in ("ይታወቃል", "ታወቃል", "ምልክት", "በምን", "ከምን"))
+    if soilish and acidish:
+        if questionish:
+            return "የአፈር አሲዳማነት ምልክት በምን ይታወቃል"
+        return "የአፈር አሲዳማነት"
+
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
 def analyze_intent(text: str) -> NLUResult:
     """
     Classify farmer question intent and build a retrieval query.
@@ -633,7 +665,7 @@ def analyze_intent(text: str) -> NLUResult:
     The confidence value is a rule-confidence estimate, not a trained probability.
     It is used for routing/fallback decisions only.
     """
-    stripped = (text or "").strip()
+    stripped = normalize_asr_farmer_query(text)
     if not stripped:
         return NLUResult("unknown", 0.0, {}, "")
 

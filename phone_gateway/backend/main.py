@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import socket
+import time
 import uuid
 from pathlib import Path
 
@@ -13,7 +14,11 @@ from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 import httpx
 
-from backend.ami_utils import ami_action as _ami_action, sip_endpoint_for_alert as _sip_endpoint_for_alert
+from backend.ami_utils import (
+    ami_action as _ami_action,
+    ami_contacts_include_endpoint,
+    sip_endpoint_for_alert as _sip_endpoint_for_alert,
+)
 from backend.database import Base, engine, SessionLocal
 from backend.models import Caller
 from backend.sessions import create_session, end_session
@@ -202,6 +207,28 @@ def _ami_originate_alert_call(call_id: str, endpoint: str) -> str:
     audiosocket_port = os.getenv("SIP_ALERT_AUDIOSOCKET_PORT", "9093")
     channel = f"PJSIP/{endpoint}"
 
+    def _recv_until(marker: str | None = None, timeout_sec: float = 2.0) -> str:
+        deadline = time.monotonic() + timeout_sec
+        chunks: list[bytes] = []
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            sock.settimeout(min(0.5, remaining))
+            try:
+                chunk = sock.recv(8192)
+            except TimeoutError:
+                break
+            if not chunk:
+                break
+            chunks.append(chunk)
+            text = b"".join(chunks).decode("utf-8", errors="ignore")
+            if marker and marker in text:
+                return text
+            if not marker and "\r\n\r\n" in text:
+                return text
+        return b"".join(chunks).decode("utf-8", errors="ignore")
+
     with socket.create_connection((host, port), timeout=5) as sock:
         sock.settimeout(5)
         try:
@@ -218,9 +245,18 @@ def _ami_originate_alert_call(call_id: str, endpoint: str) -> str:
                 }
             )
         )
-        login_resp = sock.recv(4096).decode("utf-8", errors="ignore")
+        login_resp = _recv_until(timeout_sec=3.0)
         if "Success" not in login_resp:
             raise RuntimeError(f"AMI login failed: {login_resp.strip()[:200]}")
+
+        if os.getenv("SIP_CHECK_ENDPOINT_CONTACTS", "1").strip().lower() in ("1", "true", "yes", "on"):
+            sock.sendall(_ami_action({"Action": "Command", "Command": "pjsip show contacts"}))
+            contacts_resp = _recv_until("--END COMMAND--", timeout_sec=3.0)
+            if not ami_contacts_include_endpoint(contacts_resp, endpoint):
+                raise RuntimeError(
+                    f"SIP endpoint '{endpoint}' has no registered contacts. "
+                    "Open/register the softphone before expert callback calls can ring."
+                )
 
         sock.sendall(
             _ami_action(
@@ -236,7 +272,7 @@ def _ami_originate_alert_call(call_id: str, endpoint: str) -> str:
                 }
             )
         )
-        originate_resp = sock.recv(4096).decode("utf-8", errors="ignore")
+        originate_resp = _recv_until(timeout_sec=3.0)
         sock.sendall(_ami_action({"Action": "Logoff"}))
         if "Error" in originate_resp:
             raise RuntimeError(originate_resp.strip()[:300])

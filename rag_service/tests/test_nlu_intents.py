@@ -6,7 +6,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from escalation_policy import is_out_of_domain
-from nlu import analyze_intent
+from nlu import analyze_intent, normalize_asr_farmer_query
 import scenario_router
 from farmer_rag_stack.nlu_farmer import parse_farmer_nlu
 from farmer_rag_stack.smart_advisory import classify_intent_and_entities
@@ -66,6 +66,24 @@ def test_amharic_soil_acidity_is_soil_fertility_intent():
     assert nlu.primary_intent == "soil_fertility"
     assert nlu.confidence >= 0.6
     assert is_out_of_domain("የአፈር አሲዳማነት ምንድን ነው", nlu) is False
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "የአስ ቫር አ ሲዳን ማጅመት ከምኑ ይታወቃል",
+        "የአፈር ራሲ ዳማነት በምን ተወቃል",
+        "የአሰ ፊዳብ ማጅኘት በውን ይታወቃል",
+    ],
+)
+def test_soil_acidity_asr_garbles_do_not_escalate_as_out_of_domain(text):
+    normalized = normalize_asr_farmer_query(text)
+    nlu = analyze_intent(text)
+
+    assert "የአፈር አሲዳማነት" in normalized
+    assert nlu.primary_intent == "soil_fertility"
+    assert nlu.confidence >= 0.6
+    assert is_out_of_domain(text, nlu) is False
 
 
 def test_soil_ph_routes_to_soil_retrieval():

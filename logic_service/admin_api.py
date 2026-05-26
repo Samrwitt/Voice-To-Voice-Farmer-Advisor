@@ -909,7 +909,7 @@ def _trigger_expert_response_call_after_session_end(
         if time.monotonic() >= deadline:
             print(
                 f"[EXPERT CALLBACK] delayed callback timed out for escalation {escalation_id}; "
-                "expert response remains saved for next farmer call"
+                "expert response remains saved for callback retry/manual playback"
             )
             return
         time.sleep(poll)
@@ -1081,8 +1081,8 @@ async def upload_expert_audio(
         except OSError:
             pass
 
-    # Optional: Upload to S3 as a backup, but keep the shared local WAV path in
-    # the DB so the VAD service can play it during the farmer's next call.
+    # Optional: upload to S3 as a backup, but keep the shared local WAV path in
+    # the DB so phone-gateway can play it during the outbound expert callback.
     final_path = file_path
     if s3_enabled():
         from s3_client import upload_file as s3_upload

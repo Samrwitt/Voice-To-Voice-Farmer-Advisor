@@ -59,10 +59,22 @@ def classify_confirmation_reply(text: str) -> str:
         "incorrect",
     )
 
-    tokens = set(normalized.split())
-    if any(term == normalized or term in tokens or term in normalized for term in no_terms):
+    tokens = normalized.split()
+    token_set = set(tokens)
+    first_token = tokens[0] if tokens else ""
+
+    def matches_reply(term: str) -> bool:
+        if term == normalized or term in token_set:
+            return True
+        # Accept short ASR suffixes at the start only, e.g. "አውም".
+        if first_token.startswith(term) and len(first_token) <= len(term) + 2:
+            return True
+        # Multi-word phrases can be recognized as a leading phrase.
+        return " " in term and normalized.startswith(f"{term} ")
+
+    if any(matches_reply(term) for term in no_terms):
         return "no"
-    if any(term == normalized or term in tokens or term in normalized for term in yes_terms):
+    if any(matches_reply(term) for term in yes_terms):
         return "yes"
 
     return "unknown"

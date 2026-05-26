@@ -12,6 +12,7 @@ from confirmation import (
     normalize_confidence_score,
     transcript_quality_confidence,
 )
+from postprocess import postprocess_asr_transcript
 
 
 def test_needs_confirmation_for_replacement_character():
@@ -64,3 +65,20 @@ def test_transcript_quality_confidence_penalizes_uncertain_text():
         unusual_words=["ቢ", "ምኖረወጡ"],
         confidence=confidence,
     ) is True
+
+
+def test_soil_acidity_asr_phrase_is_structured_before_rag():
+    variants = [
+        "የአስ ቫር አ ሲዳን ማጅመት ከምኑ ይታወቃል",
+        "የአፈ ራሲ ዳማነት በምን ተወቃል",
+        "የአፈር ራሲ ዳማነት በምን ተወቃል",
+        "የአሰ ፊዳብ ማጅኘት በውን ይታወቃል",
+    ]
+
+    for text in variants:
+        result = postprocess_asr_transcript(text)
+
+        assert "የአፈር" in result["final"]
+        assert "አሲዳማነት" in result["final"]
+        assert "ምልክት" in result["final"]
+        assert result["needs_confirmation"] is False

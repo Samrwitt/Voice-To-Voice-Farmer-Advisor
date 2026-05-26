@@ -14,7 +14,8 @@ BASE_DOMAIN_TERMS = [
     "ቦሎቄ", "አተር", "ምርት", "ሰብል", "እህል", "ጥራጥሬ", "ቅባት ሰብል",
 
     # Soil, fertility, and water
-    "አፈር", "የአፈር ለምነት", "ማዳበሪያ", "ዩሪያ", "ዳፕ", "ኮምፖስት",
+    "አፈር", "የአፈር", "የአፈር ለምነት", "የአፈር አሲዳማነት", "አሲዳማነት",
+    "አፈር አሲዳማነት", "ፒኤች", "ኖራ", "ምልክት", "ማዳበሪያ", "ዩሪያ", "ዳፕ", "ኮምፖስት",
     "ናይትሮጅን", "ፎስፈረስ", "ፖታሽየም", "ዘር", "ችግኝ", "መስኖ",
     "ውሃ", "እርጥበት", "የውሃ ጥበቃ", "እርከን", "ተፋሰስ",
 
@@ -30,7 +31,7 @@ BASE_DOMAIN_TERMS = [
     # Common English/transliterated agricultural terms that Whisper may emit
     "wheat", "maize", "teff", "barley", "sorghum", "coffee", "fertilizer",
     "urea", "dap", "compost", "irrigation", "pest", "disease", "market",
-    "price", "soil", "seed", "harvest", "post harvest",
+    "price", "soil", "soil acidity", "acidic soil", "soil ph", "seed", "harvest", "post harvest",
 ]
 
 

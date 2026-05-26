@@ -139,6 +139,37 @@ def normalize_amharic_pronunciation(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def correct_known_agri_phrases(text: str) -> str:
+    """Repair common multi-word ASR splits that single-token fuzzy matching misses."""
+    normalized = re.sub(r"\s+", " ", (text or "").strip())
+    if not normalized:
+        return ""
+
+    # Example observed from SIP audio:
+    # "የአስ ቫር አ ሲዳን ማጅመት ከምኑ ይታወቃል"
+    # should be routed as "የአፈር አሲዳማነት ምልክት ከምን ይታወቃል".
+    normalized = re.sub(r"\bየ?አስ\s+ቫር\s+አ\s+ሲዳን\b", "የአፈር አሲዳማነት", normalized)
+    normalized = re.sub(r"\bየ?አፈር?\s+ራሲ\s+ዳማነት\b", "የአፈር አሲዳማነት", normalized)
+    normalized = re.sub(r"\bየ?አሰ\s+ፊዳብ\b", "የአፈር አሲዳማነት", normalized)
+    normalized = re.sub(r"\bየ?አስ\s+ቫር\b", "የአፈር", normalized)
+    normalized = re.sub(r"\bአ\s+ሲዳን\b|\bአሲዳን\b|\bሲዳን\b", "አሲዳማነት", normalized)
+    normalized = re.sub(r"\bማጅመት\b|\bመጅመት\b|\bማጅኘት\b", "ምልክት", normalized)
+    normalized = re.sub(r"\bከምኑ\b", "ከምን", normalized)
+    normalized = re.sub(r"\bበውን\b", "በምን", normalized)
+    normalized = re.sub(r"\bተወቃል\b", "ይታወቃል", normalized)
+
+    compact = normalized.replace(" ", "")
+    soilish = any(token in compact for token in ("የአፈር", "አፈር", "አስቫር", "አሰፊዳብ", "ፊዳብ"))
+    acidish = any(token in compact for token in ("አሲዳ", "ሲዳ", "ዳማነት", "ራሲዳማነት", "ፊዳብ"))
+    questionish = any(token in compact for token in ("ይታወቃል", "ታወቃል", "ምልክት", "በምን", "ከምን"))
+    if soilish and acidish:
+        if questionish:
+            return "የአፈር አሲዳማነት ምልክት በምን ይታወቃል"
+        return "የአፈር አሲዳማነት"
+
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
 def correct_domain_terms_with_meta(text: str, threshold: int | None = None) -> tuple[str, dict]:
     if threshold is None:
         threshold = int(os.getenv("ASR_DOMAIN_TERM_FUZZY_THRESHOLD", "84") or "84")
@@ -282,7 +313,8 @@ def postprocess_asr_transcript(raw_text: str, acoustic_confidence: float | None 
     cleaned = basic_asr_cleanup(raw_text)
     homophone_normalized = normalize_amharic_homophones(cleaned)
     pronunciation_normalized = normalize_amharic_pronunciation(homophone_normalized)
-    domain_corrected, fuzzy_meta = correct_domain_terms_with_meta(pronunciation_normalized)
+    phrase_corrected = correct_known_agri_phrases(pronunciation_normalized)
+    domain_corrected, fuzzy_meta = correct_domain_terms_with_meta(phrase_corrected)
 
     final_text, semantic_corrected, fix_backend = _apply_semantic_correction(domain_corrected)
 
@@ -307,6 +339,7 @@ def postprocess_asr_transcript(raw_text: str, acoustic_confidence: float | None 
         "cleaned": cleaned,
         "homophone_normalized": homophone_normalized,
         "pronunciation_normalized": pronunciation_normalized,
+        "phrase_corrected": phrase_corrected,
         "domain_corrected": domain_corrected,
         "semantic_corrected": semantic_corrected,
         "transcript_fix_backend": fix_backend,

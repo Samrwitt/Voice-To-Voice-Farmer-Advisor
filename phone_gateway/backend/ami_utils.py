@@ -12,6 +12,14 @@ def sip_endpoint_for_alert(phone_number: str) -> str:
     return raw or default_endpoint
 
 
+def ami_contacts_include_endpoint(response: str, endpoint: str) -> bool:
+    endpoint = (endpoint or "").strip()
+    if not endpoint:
+        return False
+    marker = f"{endpoint}/"
+    return "Contact:" in (response or "") and marker in response
+
+
 def ami_action(headers: dict[str, str]) -> bytes:
     lines = [f"{key}: {value}" for key, value in headers.items()]
     return ("\r\n".join(lines) + "\r\n\r\n").encode("utf-8")

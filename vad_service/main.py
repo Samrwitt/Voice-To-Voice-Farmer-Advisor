@@ -223,63 +223,6 @@ async def play_advisor_response(
         except Exception as e:
             print(f"[PLAYBACK ERROR] session={session_id}, error={e}", flush=True)
 
-
-async def play_recorded_expert_response(
-    websocket: WebSocket,
-    send_lock: asyncio.Lock,
-    session_id: str,
-    audio_path: str,
-    playback_sample_rate: int = 16000,
-) -> bool:
-    """Stream a DA/expert recorded WAV answer back into the active call."""
-    path = (audio_path or "").strip()
-    if not path or path.startswith("s3://") or not os.path.exists(path):
-        print(f"[EXPERT AUDIO SKIPPED] session={session_id}, path={path}", flush=True)
-        return False
-
-    async with PLAYBACK_LOCK:
-        try:
-            import wave
-
-            print(f"[EXPERT AUDIO START] session={session_id}, path={path}", flush=True)
-            with wave.open(path, "rb") as wf:
-                source_sample_rate = wf.getframerate()
-                channels = wf.getnchannels()
-                sample_width = wf.getsampwidth()
-                frames_per_chunk = max(1, source_sample_rate // 50)
-                rate_state = None
-                data = wf.readframes(frames_per_chunk)
-                while data:
-                    if sample_width != 2:
-                        data = audioop.lin2lin(data, sample_width, 2)
-
-                    if channels == 2:
-                        data = audioop.tomono(data, 2, 0.5, 0.5)
-                    elif channels != 1:
-                        raise ValueError(f"Unsupported expert audio channel count: {channels}")
-
-                    if source_sample_rate != playback_sample_rate:
-                        data, rate_state = audioop.ratecv(
-                            data,
-                            2,
-                            1,
-                            source_sample_rate,
-                            playback_sample_rate,
-                            rate_state,
-                        )
-
-                    sent = await safe_send(websocket, send_lock, data)
-                    if not sent:
-                        return False
-
-                    await asyncio.sleep(len(data) / (2 * playback_sample_rate))
-                    data = wf.readframes(frames_per_chunk)
-            print(f"[EXPERT AUDIO DONE] session={session_id}", flush=True)
-            return True
-        except Exception as e:
-            print(f"[EXPERT AUDIO ERROR] session={session_id}, error={e}", flush=True)
-            return False
-
 # ============================================================
 # ASR / RAG Handling
 # ============================================================
@@ -623,10 +566,6 @@ async def handle_completed_utterance(
         )
 
         rag_answer = rag_result.get("response")
-        expert_delivery = rag_result.get("expert_delivery") if isinstance(rag_result, dict) else None
-        expert_audio_path = ""
-        if isinstance(expert_delivery, dict):
-            expert_audio_path = str(expert_delivery.get("audio_path") or "").strip()
 
         await safe_send(
             websocket,
@@ -651,36 +590,9 @@ async def handle_completed_utterance(
             flush=True,
         )
 
-        # ── Expert Recorded Audio Step ───────────────────────────────────────
-        # If an asynchronously answered escalation has a voice recording, play
-        # the expert's real audio first, then continue with the current answer.
-        played_expert_audio = False
-        if expert_audio_path:
-            await safe_send(
-                websocket,
-                send_lock,
-                {
-                    "event": "expert_audio_started",
-                    "session_id": session_id,
-                    "utterance_path": utterance_path,
-                    "message": "Playing recorded expert response...",
-                },
-            )
-            played_expert_audio = await play_recorded_expert_response(
-                websocket=websocket,
-                send_lock=send_lock,
-                session_id=session_id,
-                audio_path=expert_audio_path,
-                playback_sample_rate=playback_sample_rate,
-            )
-
         # ── TTS Step ─────────────────────────────────────────────────────────
         if not rag_answer:
             return
-        if played_expert_audio:
-            rag_answer = (rag_result.get("current_response") or "").strip()
-            if not rag_answer:
-                return
 
         await safe_send(
             websocket,

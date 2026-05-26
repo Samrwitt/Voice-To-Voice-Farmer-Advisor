@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from typing import Any
 
 
@@ -66,6 +67,26 @@ AGRICULTURE_DOMAIN_SIGNALS = (
     "weather",
 )
 
+NON_AGRICULTURE_DOMAIN_SIGNALS = (
+    "መኪና",
+    "ጥገና",
+    "መድሃኒት",
+    "ሆስፒታል",
+    "ባንክ",
+    "ፖለቲካ",
+    "car",
+    "vehicle",
+    "doctor",
+    "medicine",
+    "hospital",
+    "bank",
+    "politics",
+)
+
+
+def _looks_amharic(text: str) -> bool:
+    return bool(re.search(r"[\u1200-\u137f]", text or ""))
+
 
 def user_requested_escalation(text: str) -> bool:
     q = (text or "").strip().lower()
@@ -93,6 +114,14 @@ def is_out_of_domain(text: str, nlu: Any) -> bool:
         return False
 
     intent = getattr(nlu, "primary_intent", "unknown")
+    if intent != "unknown":
+        return False
+
+    # Unknown Amharic speech is often ASR damage. Let RAG retrieval or a
+    # clarification path run before deciding this is outside agriculture.
+    if _looks_amharic(q) and not any(signal in q for signal in NON_AGRICULTURE_DOMAIN_SIGNALS):
+        return False
+
     confidence = float(getattr(nlu, "confidence", 0.0) or 0.0)
     threshold = float(os.getenv("RAG_OUT_OF_DOMAIN_NLU_CONFIDENCE", "0.35") or "0.35")
-    return intent == "unknown" and confidence <= threshold
+    return confidence <= threshold

@@ -23,6 +23,12 @@ def test_classify_confirmation_reply_accepts_asr_yes_variants():
         assert classify_confirmation_reply(text) == "yes"
 
 
+def test_classify_confirmation_reply_does_not_match_inside_unrelated_words():
+    assert classify_confirmation_reply("የአፈር አይነት") == "unknown"
+    assert classify_confirmation_reply("በቆሎ አውጪ ተባይ") == "unknown"
+    assert classify_confirmation_reply("አውም ትክክል") == "yes"
+
+
 def test_classify_confirmation_reply_uses_raw_asr_when_final_is_unclear():
     result = {
         "transcript": "አ ወ",

@@ -17,7 +17,7 @@ from database import (
     get_dynamic_knowledge, set_dynamic_knowledge,
     get_farmer_memory_context, consume_answered_expert_response
 )
-from nlu import analyze_intent, needs_slot_filling
+from nlu import analyze_intent, needs_slot_filling, normalize_asr_farmer_query
 from dynamic_layer_runtime import build_dynamic_context
 from farmer_persona import build_personalization_block
 from escalation_policy import (
@@ -26,6 +26,7 @@ from escalation_policy import (
     is_out_of_domain,
     user_requested_escalation,
 )
+from expert_delivery_policy import maybe_consume_answered_expert_response
 from greeting_utils import (
     GREETING_ACK_AM,
     GREETING_ONLY_FOLLOWUP_AM,
@@ -395,14 +396,18 @@ def _format_expert_delivery_text(delivery: dict | None) -> str:
     if delivery.get("audio_path"):
         return (
             f"ቀደም ብለው ስለ '{query}' ላቀረቡት ጥያቄ የተቀረጸ የባለሙያ መልስ ዝግጁ ነው። "
-            "መልሱን አሁን እንጫወታለን።"
+            "መልሱ በተመደበው የመመለሻ ጥሪ ይጫወታል።"
         )
     return ""
 
 
+def _maybe_consume_answered_expert_response(phone_number: str) -> dict | None:
+    return maybe_consume_answered_expert_response(phone_number, consume_answered_expert_response)
+
+
 def check_and_deliver_expert_responses(phone_number: str) -> str:
-    """Compatibility wrapper for text-only clients."""
-    return _format_expert_delivery_text(consume_answered_expert_response(phone_number))
+    """Expert responses are delivered by outbound callback, not inline RAG."""
+    return _format_expert_delivery_text(_maybe_consume_answered_expert_response(phone_number))
 
 
 # ── Core RAG Pipeline ────────────────────────────────────────────────────────
@@ -430,6 +435,11 @@ def _generate_core_rag_response(query_text: str, phone_number: str, session_id: 
     - intent: outcome label for routing (often same as NLU primary_intent for KB turns).
     - nlu_dict: { primary_intent, confidence, entities } from analyze_intent.
     """
+    raw_query_text = query_text
+    query_text = normalize_asr_farmer_query(query_text)
+    if query_text != (raw_query_text or "").strip():
+        logger.info("Normalized ASR query before RAG: %r -> %r", raw_query_text, query_text)
+
     # ── Language Check ────────────────────────────────────────────────────────
     if query_text.strip() and not is_amharic(query_text):
         resp = "እባክዎ ጥያቄዎን በአማርኛ ይናገሩ።"  # Please ask your question in Amharic.
@@ -575,7 +585,8 @@ def _generate_core_rag_response(query_text: str, phone_number: str, session_id: 
 
     # ── Complex Query Escalation ──────────────────────────────────────────────
     sensitive_intents = {"pest_disease", "soil_fertility", "crop_production"}
-    if intent in sensitive_intents and nlu.confidence < 0.6:
+    complex_threshold = float(os.getenv("RAG_COMPLEX_ESCALATION_CONFIDENCE", "0.45") or "0.45")
+    if intent in sensitive_intents and nlu.confidence < complex_threshold:
         logger.warning(f"Complex query detected (intent={intent} conf={nlu.confidence}). Escalating.")
         add_to_escalation(
             query_text,
@@ -1125,6 +1136,10 @@ async def rag_answer(req: RagAnswerRequest):
 
     asr_meta = req.asr if isinstance(req.asr, dict) else {}
     had_greeting, query_text = split_greeting_from_query(raw_query_text)
+    normalized_query_text = normalize_asr_farmer_query(query_text)
+    if normalized_query_text and normalized_query_text != query_text:
+        logger.info("Normalized voice ASR query before RAG: %r -> %r", query_text, normalized_query_text)
+        query_text = normalized_query_text
     if not query_text:
         final = f"{GREETING_ACK_AM} {GREETING_ONLY_FOLLOWUP_AM}"
         set_session_state(req.session_id, "active", None)
@@ -1152,7 +1167,7 @@ async def rag_answer(req: RagAnswerRequest):
         set_session_state(req.session_id, "active", None)
 
     nlu = analyze_intent(query_text)
-    expert_delivery_payload = consume_answered_expert_response(req.phone_number)
+    expert_delivery_payload = _maybe_consume_answered_expert_response(req.phone_number)
     expert_delivery = _format_expert_delivery_text(expert_delivery_payload)
     
     crop_name = getattr(nlu, "entities", {}).get("crop_en") if nlu else None

@@ -840,8 +840,8 @@ def consume_answered_expert_response(phone_number: str) -> dict[str, Any] | None
     """
     Return the oldest answered escalation for this farmer and mark it closed.
 
-    The voice pipeline uses this on the farmer's next call so recorded expert
-    answers are delivered asynchronously, matching the DA/expert workflow.
+    Legacy on-call delivery uses this when explicitly enabled. The default
+    workflow now plays recorded expert answers through outbound callbacks.
     """
     if not _pg_enabled():
         return None
