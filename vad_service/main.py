@@ -26,11 +26,14 @@ app = FastAPI(title="Silero VAD Service")
 # ============================================================
 
 MAX_CONCURRENT_ASR = int(os.getenv("MAX_CONCURRENT_ASR", "2"))
-VAD_THRESHOLD = float(os.getenv("VAD_THRESHOLD", "0.55"))
+VAD_THRESHOLD = float(os.getenv("VAD_THRESHOLD", "0.58"))
+VAD_CANDIDATE_THRESHOLD = float(os.getenv("VAD_CANDIDATE_THRESHOLD", "0.38"))
+VAD_CONTINUE_THRESHOLD = float(os.getenv("VAD_CONTINUE_THRESHOLD", "0.28"))
 VAD_ENERGY_THRESHOLD = float(os.getenv("VAD_ENERGY_THRESHOLD", "0.012"))
 VAD_ENERGY_MIN_SPEECH_PROB = float(os.getenv("VAD_ENERGY_MIN_SPEECH_PROB", "0.20"))
-VAD_MIN_SPEECH_MS = int(os.getenv("VAD_MIN_SPEECH_MS", "400"))
-VAD_END_SILENCE_MS = int(os.getenv("VAD_END_SILENCE_MS", "900"))
+VAD_MIN_SPEECH_MS = int(os.getenv("VAD_MIN_SPEECH_MS", "128"))
+VAD_SPEECH_START_GAP_MS = int(os.getenv("VAD_SPEECH_START_GAP_MS", "96"))
+VAD_END_SILENCE_MS = int(os.getenv("VAD_END_SILENCE_MS", "520"))
 VAD_TTS_MAX_SENTENCES = int(os.getenv("VAD_TTS_MAX_SENTENCES", "0"))
 VAD_TTS_MAX_CHARS = int(os.getenv("VAD_TTS_MAX_CHARS", "0"))
 VAD_AUDIO_LOG_EVERY = int(os.getenv("VAD_AUDIO_LOG_EVERY", "0"))
@@ -49,8 +52,13 @@ def health_check():
         "service": "silero-vad-service",
         "max_concurrent_asr": MAX_CONCURRENT_ASR,
         "vad_threshold": VAD_THRESHOLD,
+        "vad_candidate_threshold": VAD_CANDIDATE_THRESHOLD,
+        "vad_continue_threshold": VAD_CONTINUE_THRESHOLD,
         "vad_energy_threshold": VAD_ENERGY_THRESHOLD,
         "vad_energy_min_speech_prob": VAD_ENERGY_MIN_SPEECH_PROB,
+        "vad_min_speech_ms": VAD_MIN_SPEECH_MS,
+        "vad_speech_start_gap_ms": VAD_SPEECH_START_GAP_MS,
+        "vad_end_silence_ms": VAD_END_SILENCE_MS,
     }
 
 
@@ -714,11 +722,14 @@ async def vad_websocket(
         session_id=session_id,
         sample_rate=sample_rate,
         threshold=VAD_THRESHOLD,
+        candidate_threshold=VAD_CANDIDATE_THRESHOLD,
+        continue_threshold=VAD_CONTINUE_THRESHOLD,
         energy_threshold=VAD_ENERGY_THRESHOLD,
         energy_min_speech_prob=VAD_ENERGY_MIN_SPEECH_PROB,
         min_speech_start_ms=VAD_MIN_SPEECH_MS,
+        speech_start_gap_ms=VAD_SPEECH_START_GAP_MS,
         speech_end_silence_ms=VAD_END_SILENCE_MS,
-        speech_pad_ms=200,
+        speech_pad_ms=160,
         output_dir=output_dir,
     )
 

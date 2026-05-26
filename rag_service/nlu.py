@@ -131,9 +131,14 @@ MARKET_KEYWORDS = [
     "cost",
     "ብር",
     "ሽያጭ",
+    "መሸጥ",
+    "ልሽጥ",
+    "ሽጥ",
     "ኪሎ ስንት",
     "quintal",
     "ኩንታል",
+    "sell",
+    "selling",
 ]
 
 # Dose / application questions often use amount/quantity words without asking market price.

@@ -37,3 +37,9 @@ def test_known_non_agriculture_amharic_can_still_escalate():
     nlu = SimpleNamespace(primary_intent="unknown", confidence=0.28)
 
     assert is_out_of_domain("ስለ መኪና ጥገና ንገረኝ", nlu) is True
+
+
+def test_phone_battery_question_is_out_of_domain():
+    nlu = SimpleNamespace(primary_intent="unknown", confidence=0.28)
+
+    assert is_out_of_domain("ስልኬ ባትሪ ቶሎ ይጠፋል። እንዴት ላስተካክለው?", nlu) is True

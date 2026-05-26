@@ -9,7 +9,7 @@ from escalation_policy import is_out_of_domain
 from nlu import analyze_intent, normalize_asr_farmer_query
 import scenario_router
 from farmer_rag_stack.nlu_farmer import parse_farmer_nlu
-from farmer_rag_stack.smart_advisory import classify_intent_and_entities
+from farmer_rag_stack.smart_advisory import classify_intent_and_entities, run_smart_advisory
 
 
 SUPPORTED_INTENT_SAMPLES = [
@@ -133,3 +133,93 @@ def test_voice_scenario_keeps_general_soil_acidity_in_kb_path():
     assert decision.needs_clarification is False
     assert decision.allow_low_conf_escalation is False
     assert decision.route_hint == "kb_tool"
+
+
+def test_follow_up_disease_uses_inherited_crop_context():
+    nlu = analyze_intent("እና በሽታ እንዳይመጣ ምን ልከታተል?")
+    nlu.entities["crop_en"] = "Wheat"
+    nlu.entities["crop_keyword"] = "ስንዴ"
+
+    decision = scenario_router.classify_voice_scenario(
+        text="እና በሽታ እንዳይመጣ ምን ልከታተል?",
+        nlu=nlu,
+        profile={"location": "Arsi"},
+        user_region=None,
+        history_pairs=[("user", "በአርሲ ስንዴ እዘራለሁ። ዝናብ ከቀነሰ ምን ላድርግ?")],
+        is_agrochemical=False,
+    )
+
+    assert decision.scenario == "pest_disease"
+    assert decision.needs_clarification is False
+
+
+def test_market_sell_hold_question_routes_to_market():
+    nlu = analyze_intent("ጤፍ አሁን ልሽጥ ወይስ ትንሽ ልጠብቅ?")
+
+    assert nlu.primary_intent == "market_price"
+    assert nlu.entities["crop_en"] == "Teff"
+
+
+def test_market_with_location_does_not_ask_for_location_again():
+    class EmptyMarketPrice:
+        def __call__(self, crop, region=None):
+            return None
+
+    text = "የጤፍ ዋጋ በአርሲ ስንት ነው?"
+    result = run_smart_advisory(
+        question=text,
+        phone_number="test",
+        nlu=analyze_intent(text),
+        profile=None,
+        history_pairs=[],
+        hits=[],
+        local_market_price_func=EmptyMarketPrice(),
+    )
+
+    assert "ከተማዎን" not in result.answer
+    assert "ለArsi" in result.answer
+    assert "አጠቃላይ ዋጋን" in result.answer
+
+
+def test_market_question_does_not_extract_fake_location_from_gebeja():
+    class EmptyMarketPrice:
+        def __call__(self, crop, region=None):
+            return None
+
+    text = "የጤፍ የገበያ ዋጋ አሁን ስንት ነው?"
+    routed = classify_intent_and_entities(text, nlu=analyze_intent(text), profile=None)
+    result = run_smart_advisory(
+        question=text,
+        phone_number="test",
+        nlu=analyze_intent(text),
+        profile=None,
+        history_pairs=[],
+        hits=[],
+        local_market_price_func=EmptyMarketPrice(),
+    )
+
+    assert "location" not in routed["entities"]
+    assert "ከተማዎን" in result.answer
+    assert "አልተገኘም" not in result.answer
+
+
+def test_soil_answer_is_farmer_facing_not_provider_metadata():
+    class EmptyMarketPrice:
+        def __call__(self, crop, region=None):
+            return None
+
+    text = "በአርሲ ለስንዴ አፈር እና እርጥበት ምን ምክር አለ?"
+    result = run_smart_advisory(
+        question=text,
+        phone_number="test",
+        nlu=analyze_intent(text),
+        profile=None,
+        history_pairs=[],
+        hits=[],
+        local_market_price_func=EmptyMarketPrice(),
+    )
+
+    assert result.answer.startswith("pH")
+    assert "EthioSIS" not in result.answer
+    assert "SoilGrids" not in result.answer
+    assert "Copernicus" not in result.answer

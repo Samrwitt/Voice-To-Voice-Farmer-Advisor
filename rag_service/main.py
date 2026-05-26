@@ -2,6 +2,8 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Header
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import os
 import re
@@ -9,6 +11,7 @@ import logging
 import requests
 import base64
 import time
+from pathlib import Path
 from database import (
     collection, add_to_escalation, log_conversation,
     get_conversation_history, get_market_price, register_farmer,
@@ -87,6 +90,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+if STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 # NOTE: This service is dedicated to RAG (static+dynamic) and KB ingestion.
 # Dashboard/admin APIs are provided by logic_service; do not mount the legacy
@@ -136,6 +142,63 @@ class RagDebugContextRequest(BaseModel):
     phone_number: str = "Unknown"
     session_id: str = "debug_session"
     retrieve: bool = True
+
+
+def _inherit_missing_entities_from_history(nlu, history_pairs: list[tuple[str, str]]) -> None:
+    """
+    Carry crop/location context across short voice follow-ups in the same session.
+    The NLU result is mutable, so downstream routing, retrieval, and smart tools
+    all see the inherited slots without changing the farmer's current wording.
+    """
+    entities = getattr(nlu, "entities", None)
+    if not isinstance(entities, dict):
+        return
+
+    wanted = (
+        "crop_en",
+        "crop_keyword",
+        "region_en",
+        "region_keyword",
+        "location_en",
+        "location_keyword",
+    )
+    if all(entities.get(key) for key in ("crop_en",)):
+        return
+
+    inherited_from_market = False
+    for role, message in reversed(history_pairs or []):
+        if role != "user" or not (message or "").strip():
+            continue
+        prior = analyze_intent(message)
+        prior_entities = getattr(prior, "entities", {}) or {}
+        prior_was_market = getattr(prior, "primary_intent", "") == "market_price"
+        copied = False
+        for key in wanted:
+            if not entities.get(key) and prior_entities.get(key):
+                entities[key] = prior_entities[key]
+                copied = True
+        if copied and prior_was_market:
+            inherited_from_market = True
+        if copied:
+            entities["context_source"] = "session_history"
+        if entities.get("crop_en"):
+            break
+
+    has_place_now = bool(
+        entities.get("location_en")
+        or entities.get("location_keyword")
+        or entities.get("region_en")
+        or entities.get("region_keyword")
+    )
+    if (
+        inherited_from_market
+        and has_place_now
+        and getattr(nlu, "primary_intent", "unknown") in {"unknown", "general_agronomy"}
+    ):
+        nlu.primary_intent = "market_price"
+        nlu.confidence = max(float(getattr(nlu, "confidence", 0.0) or 0.0), 0.78)
+        nlu.retrieval_query = "market price follow-up with location"
+        entities["intent_source"] = "session_history_market_followup"
 
 
 def _require_metrics_token(authorization: Optional[str] = Header(None)) -> None:
@@ -303,7 +366,16 @@ def rag_diagnostics():
         "dynamic_data": {
             "cache_table": "dynamic_knowledge_cache",
             "weather": {"provider": "Open-Meteo", "cache_ttl_sec": os.getenv("RAG_WEATHER_CACHE_TTL_SEC", "7200")},
-            "soil": {"provider": "SoilGrids/ISRIC", "cache_ttl_sec": os.getenv("RAG_SOIL_CACHE_TTL_SEC", str(180 * 24 * 3600))},
+            "soil": {
+                "providers": ["EthioSIS baseline", "ISRIC SoilGrids", "Copernicus Soil Water Index"],
+                "soilgrids_cache_ttl_sec": os.getenv("RAG_SOIL_CACHE_TTL_SEC", str(180 * 24 * 3600)),
+                "copernicus_swi_cache_ttl_sec": os.getenv("RAG_SOIL_WATER_CACHE_TTL_SEC", "21600"),
+                "copernicus_collection_id": os.getenv("COPERNICUS_SWI_COLLECTION_ID", "f2278442-eb7f-4926-93e9-7a382f567fb4"),
+                "copernicus_credentials_configured": bool(
+                    (os.getenv("COPERNICUS_CLIENT_ID") or os.getenv("SENTINELHUB_CLIENT_ID"))
+                    and (os.getenv("COPERNICUS_CLIENT_SECRET") or os.getenv("SENTINELHUB_CLIENT_SECRET"))
+                ),
+            },
             "market": {
                 "current_provider": "local market_prices table with mock demo fallback",
                 "nmis_live_adapter": False,
@@ -618,6 +690,8 @@ def _generate_core_rag_response(query_text: str, phone_number: str, session_id: 
             if price_data:
                 price, unit, updated_at = price_data
                 resp = f"የ{crop_name} ዋጋ {price} ብር በ {unit} ነው። (የዋጋ ቀን: {updated_at})"
+                if not farmer_location:
+                    resp += " ከተማዎን ወይም የሚጠቀሙበትን ገበያ ከነገሩኝ፣ በዳታቤዙ ካለ የዚያን ቦታ የተለየ ዋጋ እፈትሻለሁ።"
                 log_conversation(phone_number, session_id, "assistant", resp)
                 log_interaction_record(
                     phone_number=phone_number,
@@ -849,7 +923,11 @@ def _generate_core_rag_response(query_text: str, phone_number: str, session_id: 
 
     dyn_block = ""
     try:
-        dyn_block = build_dynamic_context(phone_number, crop_name=nlu.entities.get("crop_en")) or ""
+        dyn_block = build_dynamic_context(
+            phone_number,
+            crop_name=nlu.entities.get("crop_en") if nlu.primary_intent == "market_price" else None,
+            include_market=nlu.primary_intent == "market_price",
+        ) or ""
     except Exception:
         dyn_block = ""
 
@@ -927,6 +1005,16 @@ def _generate_core_rag_response(query_text: str, phone_number: str, session_id: 
 
 
 # ── API Endpoints ────────────────────────────────────────────────────────────
+
+
+@app.get("/smart-advisor")
+async def smart_advisor_console():
+    """Small manual test console for the smart advisory RAG path."""
+    page = STATIC_DIR / "smart_advisor.html"
+    if not page.exists():
+        raise HTTPException(status_code=404, detail="Smart advisor UI is not available.")
+    return FileResponse(page)
+
 
 @app.post("/ask")
 async def process_query(query: Query):
@@ -1169,13 +1257,14 @@ async def rag_answer(req: RagAnswerRequest):
     nlu = analyze_intent(query_text)
     expert_delivery_payload = _maybe_consume_answered_expert_response(req.phone_number)
     expert_delivery = _format_expert_delivery_text(expert_delivery_payload)
-    
+
+    hist = get_conversation_history(req.session_id, limit=6)
+    hist_pairs = list(hist)
+    _inherit_missing_entities_from_history(nlu, hist_pairs)
+
     crop_name = getattr(nlu, "entities", {}).get("crop_en") if nlu else None
     nlu_location = getattr(nlu, "entities", {}).get("location_en") if nlu else None
-    try:
-        dyn = build_dynamic_context(req.phone_number, crop_name=crop_name)
-    except Exception:
-        dyn = ""
+    dyn = ""
 
     # Identify region for filtering
     profile = get_farmer_profile(req.phone_number)
@@ -1190,8 +1279,6 @@ async def rag_answer(req: RagAnswerRequest):
         elif any(k in loc for k in ["lowland", "ቆላ"]): user_region = "lowland"
         elif any(k in loc for k in ["midland", "ወይና"]): user_region = "midland"
 
-    hist = get_conversation_history(req.session_id, limit=6)
-    hist_pairs = list(hist)
     log_conversation(req.phone_number, req.session_id, "user", raw_query_text)
 
     if asr_meta.get("needs_confirmation"):
@@ -1270,6 +1357,15 @@ async def rag_answer(req: RagAnswerRequest):
             expert_delivery_payload=expert_delivery_payload,
             asr_meta=asr_meta,
         )
+
+    try:
+        dyn = build_dynamic_context(
+            req.phone_number,
+            crop_name=crop_name if scenario_decision.route_hint == "market" else None,
+            include_market=scenario_decision.route_hint == "market",
+        )
+    except Exception:
+        dyn = ""
 
     cache_allowed = not expert_delivery and not (dyn or "").strip()
     cache_key = (

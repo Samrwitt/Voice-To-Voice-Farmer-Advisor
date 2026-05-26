@@ -113,6 +113,7 @@ def get_latest_market_price(crop_name: Optional[str], region: Optional[str]) -> 
 def build_dynamic_context(
     phone_number: str,
     crop_name: Optional[str] = None,
+    include_market: bool = True,
     max_chars: int = 1200,
 ) -> str:
     """
@@ -120,7 +121,7 @@ def build_dynamic_context(
     """
     region = get_farmer_region_for_phone(phone_number)
     alerts = get_latest_alerts(region, limit=2)
-    price = get_latest_market_price(crop_name, region)
+    price = get_latest_market_price(crop_name, region) if include_market else None
 
     parts: list[str] = []
     if region:

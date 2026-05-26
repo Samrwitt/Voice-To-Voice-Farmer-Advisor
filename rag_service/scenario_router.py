@@ -159,11 +159,17 @@ EXTENSION_SIGNALS = (
 )
 
 FOLLOW_UP_SIGNALS = (
+    "እና",
     "እሱ",
     "ይህ",
     "ያ",
     "በዚህ",
     "በላይ",
+    "ከዚያ",
+    "ሌላ",
+    "ቀጥሎ",
+    "also",
+    "what about",
     "more",
     "again",
     "then",

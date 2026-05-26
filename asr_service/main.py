@@ -580,9 +580,8 @@ async def transcribe_file(request: FileTranscribeRequest):
         )
 
     try:
-        # Files from VAD are already 16kHz Mono, so we skip the preparation step
-        # and transcribe them directly from the shared volume.
-        result = asr_engine.transcribe(audio_path)
+        prepared_path = prepare_audio_for_asr(audio_path)
+        result = asr_engine.transcribe(prepared_path)
         return result
 
 
