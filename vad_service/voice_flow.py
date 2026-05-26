@@ -3,6 +3,7 @@ import re
 
 
 VAD_TTS_SINGLE_CHUNK_MAX_CHARS = int(os.getenv("VAD_TTS_SINGLE_CHUNK_MAX_CHARS", "180"))
+VAD_TTS_CHUNK_MAX_CHARS = int(os.getenv("VAD_TTS_CHUNK_MAX_CHARS", "140"))
 
 
 def _normalize_confirmation_text(text: str) -> str:
@@ -33,6 +34,8 @@ def classify_confirmation_reply(text: str) -> str:
         "awo",
         "aw",
         "awe",
+        "eshi",
+        "ishi",
         "yes",
         "yeah",
         "yep",
@@ -103,4 +106,74 @@ def should_synthesize_as_single_chunk(text: str) -> bool:
         "እንደገና ይናገሩ",
         "አልተረዳሁም",
     )
-    return any(marker in normalized for marker in clarity_markers)
+    return (
+        len(normalized) <= max(80, VAD_TTS_SINGLE_CHUNK_MAX_CHARS)
+        and any(marker in normalized for marker in clarity_markers)
+    )
+
+
+def build_asr_confirmation_prompt(transcript: str, existing_prompt: str | None = None) -> str:
+    normalized_transcript = re.sub(r"\s+", " ", (transcript or "").strip())
+    prompt = re.sub(r"\s+", " ", (existing_prompt or "").strip())
+    if normalized_transcript and normalized_transcript in prompt:
+        return prompt
+    if normalized_transcript:
+        return (
+            f"የሰማሁት ይህ ነው፦ {normalized_transcript}። "
+            "ትክክል ነው? እባክዎ አዎ ወይም አይ ይበሉ።"
+        )
+    return prompt or "የሰማሁትን በትክክል አላረጋገጥኩም። እባክዎ ጥያቄዎን እንደገና ይናገሩ።"
+
+
+def _split_long_words(text: str, max_chars: int) -> list[str]:
+    words = text.split()
+    chunks: list[str] = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        if current and len(candidate) > max_chars:
+            chunks.append(current)
+            current = word
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def chunk_tts_text(text: str, max_chars: int | None = None) -> list[str]:
+    """Split long spoken text into natural TTS-sized chunks."""
+    normalized = re.sub(r"\s+", " ", (text or "").strip())
+    if not normalized:
+        return []
+    if max_chars is None and should_synthesize_as_single_chunk(normalized):
+        return [normalized]
+
+    if max_chars is None:
+        max_chars = VAD_TTS_CHUNK_MAX_CHARS
+    max_chars = max(60, int(max_chars or 140))
+
+    pieces = [
+        piece.strip()
+        for piece in re.findall(r".+?(?:[።!?፤፣,;]|$)", normalized)
+        if piece.strip()
+    ]
+    chunks: list[str] = []
+    current = ""
+
+    for piece in pieces:
+        subpieces = [piece]
+        if len(piece) > max_chars:
+            subpieces = _split_long_words(piece, max_chars)
+
+        for subpiece in subpieces:
+            candidate = f"{current} {subpiece}".strip()
+            if current and len(candidate) > max_chars:
+                chunks.append(current)
+                current = subpiece
+            else:
+                current = candidate
+
+    if current:
+        chunks.append(current)
+    return chunks

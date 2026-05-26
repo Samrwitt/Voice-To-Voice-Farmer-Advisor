@@ -101,6 +101,8 @@ def classify_intent_and_entities(question: str, nlu: Any | None = None, profile:
         detected = "general_agriculture"
 
     entities = dict(getattr(nlu, "entities", {}) or {})
+    if entities.get("location_en") and not entities.get("location"):
+        entities["location"] = entities["location_en"]
     if profile and profile.get("location") and not entities.get("location"):
         entities["location"] = profile.get("location")
 
@@ -542,7 +544,12 @@ def build_smart_context_only(
     routed = classify_intent_and_entities(question, nlu=nlu, profile=profile)
     entities = routed["entities"]
     crop = entities.get("crop_en") or entities.get("crop") or (profile or {}).get("crop_type")
-    location = entities.get("location") or entities.get("region_keyword") or (profile or {}).get("location")
+    location = (
+        entities.get("location")
+        or entities.get("location_en")
+        or entities.get("region_keyword")
+        or (profile or {}).get("location")
+    )
     kb = search_knowledge_base(question, hits, top_k=int(os.getenv("RAG_SMART_TOP_K", "5") or "5"))
     farmer_history = get_farmer_history(phone_number, profile, history_pairs)
 

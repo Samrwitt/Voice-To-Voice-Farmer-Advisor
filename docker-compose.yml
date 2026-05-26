@@ -41,7 +41,7 @@ services:
       postgres:
         condition: service_started
     ports:
-      - "8004:8000"
+      - "8004:8004"
     environment:
       POSTGRES_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       RAG_PG_MAX_L2_DISTANCE: "1.35"
@@ -133,6 +133,7 @@ services:
       SIP_PLAY_OPENING_GREETING: "true"
       SIP_DEFAULT_CALLER_PHONE_NUMBER: "sip:farmeruhamayohannes"
       SIP_DEFAULT_CALLER_NAME: "Ruhama SIP Farmer"
+      SIP_TTS_CHUNK_MAX_CHARS: "140"
       SIP_AUDIO_LOG_EVERY: "0"
       SIP_EVENT_LOGS: "1"
       S3_ENDPOINT_URL: http://minio:9000
@@ -147,7 +148,7 @@ services:
       DEFAULT_ADMIN_PASSWORD: ${DEFAULT_ADMIN_PASSWORD}
       RESET_DEFAULT_ADMIN_PASSWORD: "false"
     ports:
-      - "8000:8000"
+      - "8000:8004"
     expose:
       - "9092"
       - "9093"
@@ -202,13 +203,15 @@ services:
       RAG_SERVICE_URL: http://rag-service:8000
       TTS_SERVICE_URL: http://tts-service:8009
       VAD_UTTERANCES_DIR: /app/utterances
-      VAD_THRESHOLD: "0.55"
-      VAD_ENERGY_THRESHOLD: "0.012"
-      VAD_MIN_SPEECH_MS: "240"
+      VAD_THRESHOLD: "0.62"
+      VAD_ENERGY_THRESHOLD: "0.018"
+      VAD_ENERGY_MIN_SPEECH_PROB: "0.20"
+      VAD_MIN_SPEECH_MS: "160"
       VAD_END_SILENCE_MS: "900"
       VAD_TTS_MAX_SENTENCES: "0"
       VAD_TTS_MAX_CHARS: "0"
       VAD_TTS_SINGLE_CHUNK_MAX_CHARS: "180"
+      VAD_TTS_CHUNK_MAX_CHARS: "140"
       VAD_AUDIO_LOG_EVERY: "0"
       MAX_CONCURRENT_ASR: 2
     volumes:
@@ -298,7 +301,7 @@ services:
       - logic-service
     ports:
       # Host 3000 is often taken (other Next.js, Grafana, etc.). Override: ADMIN_DASHBOARD_PORT=3000
-      - "${ADMIN_DASHBOARD_PORT:-3001}:3000"
+      - "${ADMIN_DASHBOARD_PORT:-3000}:3000"
     environment:
       NODE_ENV: production
       NEXT_TELEMETRY_DISABLED: 1
@@ -352,9 +355,9 @@ services:
       VAD_HEALTH_URL: "http://vad-service:8010/health"
       ASR_HEALTH_URL: "http://asr-service:8001/docs"
       TTS_HEALTH_URL: "http://tts-service:8000/docs"
-      PHONE_GATEWAY_URL: "http://phone-gateway:8000/health"
-      PHONE_GATEWAY_ALERT_CALL_URL: "http://phone-gateway:8000"
-      PHONE_GATEWAY_EXPERT_CALLBACK_URL: "http://phone-gateway:8000"
+      PHONE_GATEWAY_URL: "http://phone-gateway:8004/health"
+      PHONE_GATEWAY_ALERT_CALL_URL: "http://phone-gateway:8004"
+      PHONE_GATEWAY_EXPERT_CALLBACK_URL: "http://phone-gateway:8004"
       EXPERT_RESPONSE_CALL_ENABLED: "1"
       EXPERT_RESPONSE_CALLBACK_WAIT_SECONDS: "300"
       EXPERT_RESPONSE_CALLBACK_POLL_SECONDS: "5"

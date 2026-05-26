@@ -31,6 +31,7 @@ class SileroStreamingVAD:
         sample_rate: int = 16000,
         threshold: float = 0.5,
         energy_threshold: float = 0.012,
+        energy_min_speech_prob: float = 0.2,
         min_speech_start_ms: int = 120,
         speech_end_silence_ms: int = 900,
         speech_pad_ms: int = 200,
@@ -43,6 +44,7 @@ class SileroStreamingVAD:
         self.sample_rate = sample_rate
         self.threshold = threshold
         self.energy_threshold = energy_threshold
+        self.energy_min_speech_prob = energy_min_speech_prob
 
         self.min_speech_start_ms = min_speech_start_ms
         self.speech_end_silence_ms = speech_end_silence_ms
@@ -116,7 +118,10 @@ class SileroStreamingVAD:
         now = time.time()
 
         rms_energy = float(np.sqrt(np.mean(np.square(audio_float32)))) if len(audio_float32) else 0.0
-        is_speech = speech_prob >= self.threshold or rms_energy >= self.energy_threshold
+        is_speech = speech_prob >= self.threshold or (
+            rms_energy >= self.energy_threshold
+            and speech_prob >= self.energy_min_speech_prob
+        )
 
         # Always keep a small pre-speech buffer so the beginning of speech is not cut.
         self._append_pre_speech(frame)

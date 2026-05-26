@@ -13,5 +13,5 @@ COPY phone_gateway/backend /app/backend
 COPY phone_gateway/frontend /app/frontend
 
 RUN mkdir -p /app/recordings/audio
-EXPOSE 8000
-CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]
+EXPOSE 8004
+CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8004"]

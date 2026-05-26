@@ -486,7 +486,7 @@ def _generate_core_rag_response(query_text: str, phone_number: str, session_id: 
 
     # ── Farmer Profile & Context ──────────────────────────────────────────────
     profile = get_farmer_profile(phone_number)
-    farmer_location = (profile or {}).get("location") or "Unknown"
+    farmer_location = nlu.entities.get("location_en") or (profile or {}).get("location") or "Unknown"
     
     # Identify the relevant region for RAG filtering
     # Priority: 1. NLU extracted region, 2. Profile region
@@ -1156,6 +1156,7 @@ async def rag_answer(req: RagAnswerRequest):
     expert_delivery = _format_expert_delivery_text(expert_delivery_payload)
     
     crop_name = getattr(nlu, "entities", {}).get("crop_en") if nlu else None
+    nlu_location = getattr(nlu, "entities", {}).get("location_en") if nlu else None
     try:
         dyn = build_dynamic_context(req.phone_number, crop_name=crop_name)
     except Exception:
@@ -1164,6 +1165,10 @@ async def rag_answer(req: RagAnswerRequest):
     # Identify region for filtering
     profile = get_farmer_profile(req.phone_number)
     user_region = nlu.entities.get("region_en")
+    if nlu_location and profile is None:
+        profile = {"location": nlu_location}
+    elif nlu_location and profile and not profile.get("location"):
+        profile = {**profile, "location": nlu_location}
     if not user_region and profile:
         loc = str(profile.get('location', '')).lower()
         if any(k in loc for k in ["highland", "ደጋ"]): user_region = "highland"
@@ -1561,6 +1566,11 @@ async def rag_debug_context(req: RagDebugContextRequest):
     nlu = analyze_intent(query_text)
     profile = get_farmer_profile(req.phone_number)
     user_region = nlu.entities.get("region_en")
+    nlu_location = nlu.entities.get("location_en")
+    if nlu_location and profile is None:
+        profile = {"location": nlu_location}
+    elif nlu_location and profile and not profile.get("location"):
+        profile = {**profile, "location": nlu_location}
     if not user_region and profile:
         loc = str(profile.get("location", "")).lower()
         if any(k in loc for k in ["highland", "ደጋ"]):

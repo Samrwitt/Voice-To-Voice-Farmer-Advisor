@@ -24,6 +24,7 @@ from backend.monitor_state import (
 )
 from backend.recorder import AudioRecorder
 from backend.sessions import create_session, end_session
+from backend.tts_chunking import chunk_tts_text
 
 
 AUDIOSOCKET_KIND_HANGUP = 0x00
@@ -366,9 +367,11 @@ def register_alert_call_payload(call_id: str, payload: dict) -> None:
 async def play_alert_message(sink: AudioSocketPlaybackSink, text: str) -> None:
     tts_url = os.getenv("TTS_SERVICE_URL", "http://tts-service:8009/synthesize").strip()
     async with httpx.AsyncClient(timeout=60.0) as client:
-        response = await client.post(tts_url, json={"text": text})
-        response.raise_for_status()
-    await stream_wav_to_audiosocket(sink, response.content)
+        for chunk in chunk_tts_text(text):
+            response = await client.post(tts_url, json={"text": chunk})
+            response.raise_for_status()
+            await stream_wav_to_audiosocket(sink, response.content)
+            await asyncio.sleep(0.12)
 
 
 async def play_recorded_audio_file(sink: AudioSocketPlaybackSink, audio_path: str) -> None:

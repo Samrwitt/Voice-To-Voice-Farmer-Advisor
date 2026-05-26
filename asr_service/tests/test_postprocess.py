@@ -21,6 +21,7 @@ def test_needs_confirmation_for_replacement_character():
 def test_confirmation_prompt_asks_yes_or_no():
     prompt = build_confirmation_prompt("በቆሎ ላይ ተባይ አለ")
 
+    assert "በቆሎ ላይ ተባይ አለ" in prompt
     assert "አዎ" in prompt
     assert "አይ" in prompt
 
@@ -34,6 +35,13 @@ def test_greeting_like_asr_variant_does_not_force_confirmation():
 
     assert looks_like_greeting(text) is True
     assert needs_confirmation(text, text, unusual_words=["እንደመነች"]) is False
+
+
+def test_latin_greeting_and_short_reply_do_not_force_confirmation():
+    assert looks_like_greeting("selam") is True
+    assert needs_confirmation("selam", "selam", confidence=0.2) is False
+    assert needs_confirmation("eshi", "eshi", confidence=0.2) is False
+    assert transcript_quality_confidence("eshi", acoustic_confidence=0.1) == 0.92
 
 
 def test_external_confidence_is_normalized_before_use():

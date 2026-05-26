@@ -6,8 +6,15 @@ _KNOWN_SHORT_REPLIES = {
     "አዎ",
     "አወ",
     "እሺ",
+    "እሽ",
     "አይ",
     "አይደለም",
+    "awo",
+    "aw",
+    "eshi",
+    "ishi",
+    "ok",
+    "okay",
     "yes",
     "no",
 }
@@ -77,6 +84,8 @@ def looks_like_greeting(text: str) -> bool:
         # Common ASR variants for "እንደምን/እንዴት" greetings.
         "እንደመ",
         "እንደመን",
+        "selam",
+        "salam",
         "hello",
         "hi",
     )
@@ -135,4 +144,7 @@ def needs_confirmation(
 
 
 def build_confirmation_prompt(corrected_text: str) -> str:
-    return f"የጠየቁት፦ {corrected_text} ነው? እባክዎ አዎ ወይም አይ ይበሉ።"
+    assumed = re.sub(r"\s+", " ", (corrected_text or "").strip())
+    if not assumed:
+        return "የሰማሁትን በትክክል አላረጋገጥኩም። እባክዎ ጥያቄዎን እንደገና ይናገሩ።"
+    return f"የሰማሁት ይህ ነው፦ {assumed}። ትክክል ነው? እባክዎ አዎ ወይም አይ ይበሉ።"

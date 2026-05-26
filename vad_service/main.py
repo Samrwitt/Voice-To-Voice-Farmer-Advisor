@@ -11,7 +11,11 @@ from vad_engine import SileroStreamingVAD
 from asr_client import transcribe_utterance_file
 from rag_client import get_rag_answer
 from tts_client import synthesize_speech
-from voice_flow import classify_confirmation_reply_from_asr, should_synthesize_as_single_chunk
+from voice_flow import (
+    build_asr_confirmation_prompt,
+    chunk_tts_text,
+    classify_confirmation_reply_from_asr,
+)
 
 
 app = FastAPI(title="Silero VAD Service")
@@ -24,6 +28,7 @@ app = FastAPI(title="Silero VAD Service")
 MAX_CONCURRENT_ASR = int(os.getenv("MAX_CONCURRENT_ASR", "2"))
 VAD_THRESHOLD = float(os.getenv("VAD_THRESHOLD", "0.55"))
 VAD_ENERGY_THRESHOLD = float(os.getenv("VAD_ENERGY_THRESHOLD", "0.012"))
+VAD_ENERGY_MIN_SPEECH_PROB = float(os.getenv("VAD_ENERGY_MIN_SPEECH_PROB", "0.20"))
 VAD_MIN_SPEECH_MS = int(os.getenv("VAD_MIN_SPEECH_MS", "400"))
 VAD_END_SILENCE_MS = int(os.getenv("VAD_END_SILENCE_MS", "900"))
 VAD_TTS_MAX_SENTENCES = int(os.getenv("VAD_TTS_MAX_SENTENCES", "0"))
@@ -45,6 +50,7 @@ def health_check():
         "max_concurrent_asr": MAX_CONCURRENT_ASR,
         "vad_threshold": VAD_THRESHOLD,
         "vad_energy_threshold": VAD_ENERGY_THRESHOLD,
+        "vad_energy_min_speech_prob": VAD_ENERGY_MIN_SPEECH_PROB,
     }
 
 
@@ -144,12 +150,7 @@ async def play_advisor_response(
                 f"spoken_text_len={len(spoken_answer)}, path={utterance_path}",
                 flush=True,
             )
-            # ── Sentence-level Streaming ──
-            # Split by Amharic and common sentence delimiters
-            if should_synthesize_as_single_chunk(spoken_answer):
-                sentences = [spoken_answer]
-            else:
-                sentences = split_tts_sentences(spoken_answer)
+            sentences = chunk_tts_text(spoken_answer)
             
             print(f"[STREAMING] Total sentences: {len(sentences)}", flush=True)
             
@@ -546,9 +547,9 @@ async def handle_completed_utterance(
                 "audio_id": asr_result.get("audio_id"),
             }
             session_state.pending_confirmation_utterance_path = utterance_path
-            rag_answer = (
-                asr_result.get("confirmation_prompt")
-                or f"የሰማሁት ይህ ነው፦ {transcript}። ትክክል ነው?"
+            rag_answer = build_asr_confirmation_prompt(
+                transcript,
+                asr_result.get("confirmation_prompt"),
             )
             print(
                 f"[ASR CONFIRMATION] session={session_id}, transcript={transcript!r}",
@@ -802,6 +803,7 @@ async def vad_websocket(
         sample_rate=sample_rate,
         threshold=VAD_THRESHOLD,
         energy_threshold=VAD_ENERGY_THRESHOLD,
+        energy_min_speech_prob=VAD_ENERGY_MIN_SPEECH_PROB,
         min_speech_start_ms=VAD_MIN_SPEECH_MS,
         speech_end_silence_ms=VAD_END_SILENCE_MS,
         speech_pad_ms=200,

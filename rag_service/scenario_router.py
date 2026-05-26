@@ -15,33 +15,147 @@ WEATHER_SIGNALS = (
     "weather",
     "forecast",
     "rain",
+    "rainfall",
     "raining",
+    "climate",
+    "temperature",
+    "humidity",
+    "drought",
     "ዝናብ",
+    "የዝናብ",
     "የአየር",
     "አየር",
     "ትንበያ",
+    "ድርቅ",
+    "ሙቀት",
 )
 
 FERTILIZER_SIGNALS = (
     "ማዳበሪያ",
     "ዩሪያ",
     "ኮምፖስት",
+    "አፈር",
+    "የአፈር",
+    "አሲዳማ",
+    "አሲዳማነት",
+    "ፒኤች",
+    "ኖራ",
     "fertilizer",
     "urea",
     "dap",
     "npk",
     "compost",
     "nutrient",
+    "soil acidity",
+    "soil acid",
+    "soil ph",
+    "acidic soil",
+    "acidity",
+    "acidic",
+    "ph",
+    "lime",
+    "liming",
 )
 
 PEST_DISEASE_SIGNALS = (
     "ተባይ",
     "በሽታ",
     "ቅጠል",
+    "አረም",
+    "ፈንገስ",
+    "ፈንጋይ",
+    "ዝገት",
     "pest",
+    "insect",
     "disease",
+    "fungus",
     "rust",
     "spot",
+    "blight",
+    "aphid",
+    "armyworm",
+    "weed",
+)
+
+POST_HARVEST_SIGNALS = (
+    "post-harvest",
+    "postharvest",
+    "post harvest",
+    "after harvest",
+    "storage",
+    "drying",
+    "threshing",
+    "grain loss",
+    "moisture",
+    "ከመከር",
+    "ድህረ ምርት",
+    "ድህረ-ምርት",
+    "ማከማቻ",
+    "ማከማቸት",
+    "ማጠራቀም",
+    "ጎተራ",
+    "ኪሳራ",
+)
+
+SOIL_WATER_SIGNALS = (
+    "soil and water",
+    "soil conservation",
+    "water conservation",
+    "soil erosion",
+    "erosion",
+    "terrace",
+    "terracing",
+    "watershed",
+    "water harvesting",
+    "runoff",
+    "bund",
+    "check dam",
+    "የአፈር ጥበቃ",
+    "የውሃ ጥበቃ",
+    "የመሬት ጥበቃ",
+    "መሸርሸር",
+    "እርከን",
+)
+
+LAND_CHARACTERIZATION_SIGNALS = (
+    "landpks",
+    "soil type",
+    "land type",
+    "land classification",
+    "land capability",
+    "land suitability",
+    "land potential",
+    "slope",
+    "texture",
+    "classification",
+    "የመሬት አይነት",
+    "የአፈር አይነት",
+    "የመሬት ምድብ",
+    "የመሬት ተስማሚነት",
+    "ተዳፋት",
+)
+
+EXTENSION_SIGNALS = (
+    "extension",
+    "development agent",
+    "da ",
+    "manual",
+    "guide",
+    "guideline",
+    "training",
+    "field visit",
+    "demonstration",
+    "ttl",
+    "ማራዘም",
+    "ማስፋፊያ",
+    "መመሪያ",
+    "መምሪያ",
+    "ማኑዋል",
+    "ስልጠና",
+    "የመስክ ጉብኝት",
+    "የመስክ ትምህርት",
+    "ፖስተር",
+    "ፍሊፕ",
 )
 
 FOLLOW_UP_SIGNALS = (
@@ -72,9 +186,15 @@ GENERAL_INFO_SIGNALS = (
     "ጥቅም",
     "ምንድን",
     "ምንድነው",
+    "ምንድን ነው",
+    "አሲዳማነት",
+    "ፒኤች",
     "benefit",
     "what is",
     "meaning",
+    "acidity",
+    "soil acidity",
+    "ph",
 )
 
 
@@ -105,7 +225,7 @@ def _has_any(text: str, lower: str, needles: tuple[str, ...]) -> bool:
 
 def _has_location(text: str, lower: str, nlu: Any, profile: dict | None, user_region: str | None) -> bool:
     entities = getattr(nlu, "entities", {}) or {}
-    if user_region or entities.get("location") or entities.get("region_en"):
+    if user_region or entities.get("location") or entities.get("location_en") or entities.get("region_en"):
         return True
     if profile and (profile.get("location") or profile.get("latitude")):
         return True
@@ -158,6 +278,12 @@ def classify_voice_scenario(
             )
         return ScenarioDecision("weather", allow_low_conf_escalation=False, route_hint="weather")
 
+    if primary == "soil_water_conservation" or _has_any(q, lower, SOIL_WATER_SIGNALS):
+        return ScenarioDecision("soil_water_conservation", allow_low_conf_escalation=False, route_hint="kb")
+
+    if primary == "land_characterization" or _has_any(q, lower, LAND_CHARACTERIZATION_SIGNALS):
+        return ScenarioDecision("land_characterization", allow_low_conf_escalation=False, route_hint="kb")
+
     if primary == "soil_fertility" or _has_any(q, lower, FERTILIZER_SIGNALS):
         if _has_any(q, lower, GENERAL_INFO_SIGNALS):
             return ScenarioDecision("fertilizer", allow_low_conf_escalation=False, route_hint="kb_tool")
@@ -195,6 +321,12 @@ def classify_voice_scenario(
                 route_hint="kb_tool",
             )
         return ScenarioDecision("pest_disease", allow_low_conf_escalation=False, route_hint="kb_tool")
+
+    if primary == "post_harvest" or _has_any(q, lower, POST_HARVEST_SIGNALS):
+        return ScenarioDecision("post_harvest", allow_low_conf_escalation=False, route_hint="kb")
+
+    if primary == "extension_advisory" or _has_any(q, lower, EXTENSION_SIGNALS):
+        return ScenarioDecision("extension_advisory", allow_low_conf_escalation=False, route_hint="kb")
 
     if primary in {"crop_production", "general_agronomy"} or (
         has_crop and _has_any(q, lower, CROP_PRODUCTION_SIGNALS)
