@@ -1180,7 +1180,7 @@ def run_smart_advisory(
         return SmartResult(answer, context, kb, False, tool_trace)
 
     backend = os.getenv("RAG_SMART_FINAL_BACKEND", "gemini").strip().lower()
-    if backend not in {"gemini", "groq", "ollama", "openai"}:
+    if backend not in {"gemini", "groq", "openai"}:
         backend = "gemini"
     if backend == "gemini" and not gemini_api_keys():
         backend = effective_llm_backend()

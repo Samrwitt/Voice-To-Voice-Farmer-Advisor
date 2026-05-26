@@ -1212,7 +1212,7 @@ async def rag_answer(req: RagAnswerRequest):
     RAG endpoint for other services:
     - static retrieval: Postgres+pgvector (rag_kb_*)
     - dynamic: alerts/market (``build_dynamic_context``)
-    - generation: RAG-folder-style assistant (Groq/Gemini/Ollama) when enabled, else chunk composition
+    - generation: RAG-folder-style assistant (Groq/Gemini) when enabled, else chunk composition
     """
     from farmer_rag_stack.assistant import try_llm_assistant_response
     from farmer_rag_stack.smart_advisory import run_smart_advisory

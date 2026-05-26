@@ -45,8 +45,8 @@ services:
     environment:
       POSTGRES_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       RAG_PG_MAX_L2_DISTANCE: "1.35"
-      OLLAMA_HOST: http://ollama:11434
-      OLLAMA_MODEL: qwen2.5:7b
+
+
       RAG_ASSISTANT_LLM: "1"
       RAG_PG_RETRIEVE_POOL: "40"
       RAG_PG_FINAL_TOP_K: "6"
@@ -250,9 +250,9 @@ services:
       # GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
       # ASR_USE_SHARED_GEMINI_KEYS: ${ASR_USE_SHARED_GEMINI_KEYS:-0}
       # ASR_LLM_FIX_MAX_KEYS_PER_REQUEST: ${ASR_LLM_FIX_MAX_KEYS_PER_REQUEST:-1}
-      ASR_USE_OLLAMA: ${ASR_USE_OLLAMA:-false}
-      OLLAMA_URL: http://ollama:11434
-      OLLAMA_MODEL: qwen2.5:7b
+
+
+
       ASR_DOMAIN_TERMS_PATHS: /app/RAG/KB,/app/kb_documents/amharic
       ASR_DOMAIN_TERMS_MAX_FILES: "160"
       ASR_DOMAIN_TERMS_MAX_TERMS: "1800"
@@ -261,28 +261,13 @@ services:
       ASR_CONFIRMATION_UNUSUAL_RATIO: "0.55"
       ASR_CONFIRMATION_MIN_UNUSUAL_WORDS: "2"
       ASR_CONFIRMATION_MIN_CONFIDENCE: "0.68"
-    depends_on:
-      - ollama
+
     volumes:
       - vad_utterances:/shared/utterances:ro
       - ./models/asr:/models/asr
       - ./RAG:/app/RAG:ro
       - ./kb_documents:/app/kb_documents:ro
 
-  ollama:
-    image: ollama/ollama:latest
-    container_name: ollama_service
-    ports:
-      - "11435:11434"
-    volumes:
-      - ollama_data:/root/.ollama
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: 1
-    #           capabilities: [gpu]
 
 
 
@@ -392,7 +377,7 @@ volumes:
   call_recordings:
   pgadmin_data:
   vad_utterances:
-  ollama_data:
+
 
   logic_data:
   minio_data:

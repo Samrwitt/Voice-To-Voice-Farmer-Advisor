@@ -1,12 +1,10 @@
-"""Hosted LLM backends (Groq, Gemini) + helpers. Ollama stays in query.py.
+"""Hosted LLM backends (Groq, Gemini) + helpers.
 
 **Multiple team keys:** set ``GROQ_API_KEYS`` and/or ``GEMINI_API_KEYS`` (comma-separated) so each
 teammate's free-tier key is rotated round-robin; on 429/503 the next key is tried automatically.
 
 Groq → Gemini: when ``RAG_LLM_BACKEND`` is groq and all Groq keys fail, ``groq_*_with_gemini_fallback``
 calls Gemini (also pooled via ``GEMINI_API_KEYS`` / ``GEMINI_API_KEY``). Disable with ``GROQ_GEMINI_FALLBACK=0``.
-
-When both hosted calls fail, ``query.py`` can fall back to local Ollama (``RAG_HOSTED_FALLBACK_OLLAMA``).
 """
 
 from __future__ import annotations
@@ -67,23 +65,17 @@ def _is_rate_limit_error(exc: BaseException) -> bool:
 
 
 def effective_llm_backend() -> str:
-    """groq | gemini | ollama | openai — see RAG_LLM_BACKEND, auto if unset."""
+    """groq | gemini | openai — see RAG_LLM_BACKEND, auto if unset."""
     b = os.environ.get("RAG_LLM_BACKEND", "").strip().lower()
-    if b in ("groq", "gemini", "ollama", "openai"):
+    if b in ("groq", "gemini", "openai"):
         return b
-    # Use local Ollama first when keys exist but you want zero API unless Ollama fails (no auto-up to API).
-    if os.environ.get("RAG_LOCAL_FIRST", "").strip().lower() in ("1", "true", "yes", "ollama"):
-        if os.environ.get("USE_OLLAMA", "1").strip().lower() in ("1", "true", "yes"):
-            return "ollama"
     if gemini_api_keys():
         return "gemini"
     if groq_api_keys():
         return "groq"
-    if os.environ.get("USE_OLLAMA", "1").strip() in ("1", "true", "yes"):
-        return "ollama"
     if os.environ.get("OPENAI_API_KEY", "").strip():
         return "openai"
-    return "ollama"
+    return "gemini"
 
 
 def groq_model(fast: bool) -> str:
@@ -113,7 +105,7 @@ def _groq_backoff_sec(attempt_index: int) -> float:
 def _groq_rate_limit_hint() -> str:
     return (
         "Groq የጥያቄ ወሰን (429) — ከአንድ ወደ ሁለት ደቂቃ በኋላ ይሞክሩ፣ ወይም "
-        "`.env` ውስጥ `RAG_LLM_BACKEND=gemini` ወይም `ollama` ያዘጋጁ።"
+        "`.env` ውስጥ `RAG_LLM_BACKEND=gemini` ያዘጋጁ።"
     )
 
 

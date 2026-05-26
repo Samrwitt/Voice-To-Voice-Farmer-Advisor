@@ -5,7 +5,7 @@ from rapidfuzz import process, fuzz
 
 from confirmation import build_confirmation_prompt, needs_confirmation
 from domain_terms import get_asr_vocabulary
-from config import USE_HOSTED_LLM_FIX, USE_OLLAMA, OLLAMA_URL, OLLAMA_MODEL
+# from config import USE_HOSTED_LLM_FIX
 # Hosted Groq/Gemini correction is disabled for now to avoid ASR token usage.
 # from hosted_llm_fix import hosted_fix_enabled, semantic_correction_hosted
 
@@ -249,46 +249,10 @@ def detect_unusual_words(text: str, min_len: int = 3) -> list[str]:
     return unusual
 
 
-def semantic_correction_ollama(text: str) -> str:
-    """
-    Use Ollama to semantically correct the Amharic transcript.
-    This helps with grammar, context, and regional dialects.
-    """
-    if not text.strip():
-        return text
-
-    prompt = (
-        "You are an Amharic linguistics expert and agricultural advisor. "
-        "The following text is a raw transcription from an Amharic farmer's voice query. "
-        "Correct any grammatical errors, spelling mistakes, or nonsense words while preserving the agricultural context. "
-        "Return ONLY the corrected Amharic text. No explanations.\n\n"
-        f"Raw Text: {text}\n"
-        "Corrected Text:"
-    )
-
-    try:
-        response = requests.post(
-            f"{OLLAMA_URL}/api/generate",
-            json={
-                "model": OLLAMA_MODEL,
-                "prompt": prompt,
-                "stream": False,
-            },
-            timeout=10.0,
-        )
-        response.raise_for_status()
-        corrected = response.json().get("response", "").strip()
-        return corrected if corrected else text
-    except Exception as e:
-        # Fallback to original text if Ollama fails
-        print(f"Ollama correction failed: {e}")
-        return text
-
-
 def _apply_semantic_correction(domain_corrected: str) -> tuple[str, str | None, str | None]:
     """
     Returns ``(final_text, semantic_corrected_or_none, fix_backend)``.
-    fix_backend: groq | gemini | ollama | none
+    fix_backend: groq | gemini | none
     """
     # Hosted Groq/Gemini correction is intentionally commented out for now.
     # use_hosted = USE_HOSTED_LLM_FIX in ("1", "true", "yes", "on") or (
@@ -301,10 +265,6 @@ def _apply_semantic_correction(domain_corrected: str) -> tuple[str, str | None, 
     #             return fixed, fixed, backend
     #     except Exception as exc:
     #         print(f"Hosted ASR fix failed, falling back: {exc}")
-
-    if USE_OLLAMA:
-        fixed = semantic_correction_ollama(domain_corrected)
-        return fixed, fixed, "ollama"
 
     return domain_corrected, None, None
 

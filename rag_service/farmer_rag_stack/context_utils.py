@@ -76,7 +76,7 @@ def sanitize_chat_answer(text: str | None) -> str:
     if not text or not str(text).strip():
         return (text or "").strip()
     t0 = text.strip()
-    if re.match(r"^\[(?:groq|gemini|ollama|openai)\]", t0, re.I) or t0.startswith("[Ollama]"):
+    if re.match(r"^\[(?:groq|gemini|openai)\]", t0, re.I):
         return t0
     t0 = _strip_answer_meta_openers(t0)
     out: list[str] = []
