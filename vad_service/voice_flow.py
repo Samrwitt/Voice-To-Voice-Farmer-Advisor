@@ -132,10 +132,10 @@ def build_asr_confirmation_prompt(transcript: str, existing_prompt: str | None =
     if normalized_transcript:
         return (
             f"የሰማሁት ይህ ነው፦ {normalized_transcript}። "
-            "ትክክል ነው? እባክዎ አዎ ወይም አይ ይበሉ።"
+            "ልክ ከሆነ አዎ ወይም።"
+            "ልክ ካልሆነ ደግሞ አይ ይበሉ።"
         )
-    return prompt or "የሰማሁትን በትክክል አላረጋገጥኩም። እባክዎ ጥያቄዎን እንደገና ይናገሩ።"
-
+    return prompt or "የሰማሁት ግልፅ አልሆነልኝም። እባክዎ ጥያቄዎን እንደገና ይናገሩ።"
 
 def _split_long_words(text: str, max_chars: int) -> list[str]:
     words = text.split()

@@ -55,5 +55,5 @@ def is_asr_gibberish(transcript: str | None, confidence: float | None = None) ->
 
 
 GIBBERISH_REPLY_AM = (
-    "ይቅርታ፣ ጥያቄዎን በትክክል አልተረዳኩም። እባክዎ በአማርኛ እንደገና ይናገሩልኝ።"
+    "ይቅርታ፣ ጥያቄዎን በትክክል አልተረዳኩም። እባክዎ በአማርኛ እንደገና ይናገሩ።"
 )
