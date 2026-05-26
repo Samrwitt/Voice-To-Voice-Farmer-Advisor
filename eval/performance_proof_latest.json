@@ -1,0 +1,145 @@
+{
+  "base_url": "http://127.0.0.1:8004",
+  "metrics": {
+    "cases_total": 12,
+    "cases_passed": 12,
+    "case_pass_rate_pct": 100.0,
+    "scenario_accuracy_pct": 100.0,
+    "scenario_cases": 7,
+    "expected_grounding_accuracy_pct": 100.0,
+    "expected_grounding_cases": 5,
+    "forbidden_grounding_pass_rate_pct": 100.0,
+    "forbidden_grounding_cases": 3,
+    "latency_ms_mean": 3893.0,
+    "latency_ms_p50": 386.8,
+    "latency_ms_p95": 12460.4,
+    "latency_ms_max": 12460.4,
+    "avg_references": 1.2
+  },
+  "cases": [
+    {
+      "id": "greeting_amharic",
+      "ok": true,
+      "latency_ms": 99.6,
+      "trust_latency_ms": null,
+      "grounding": "greeting",
+      "scenario": "greeting_only",
+      "references": 0,
+      "response_preview": "በምን የግብርና ጥያቄ ልርዳዎት?"
+    },
+    {
+      "id": "wheat_altitude",
+      "ok": true,
+      "latency_ms": 12460.4,
+      "trust_latency_ms": 12303.6,
+      "grounding": "kb_llm",
+      "scenario": "crop_production",
+      "references": 3,
+      "response_preview": "ስንዴ ለመዝራት የሚመከር ከፍታ እንደየአካባቢው የአየር ንብረት ሁኔታ ይለያያል። በደጋማ አካባቢዎች በአማካይ ከ 350-500 ሚ.ሜትር ከፍታ ላይ ሲሆን በቆላማ አካባቢዎች ደግሞ ከ 450-700 ሚ.ሜትር ከፍታ ላይ መዝራት ይመከራል።"
+    },
+    {
+      "id": "wheat_production_no_escalation",
+      "ok": true,
+      "latency_ms": 5528.9,
+      "trust_latency_ms": 5438.9,
+      "grounding": "kb_llm",
+      "scenario": "crop_production",
+      "references": 3,
+      "response_preview": "አዎ ስንዴ ይመረታል። ስለ ስንዴ ምርት የበለጠ መረጃ ከፈለጉ እባክዎን ይጠይቁ።"
+    },
+    {
+      "id": "fertilizer_general",
+      "ok": true,
+      "latency_ms": 176.3,
+      "trust_latency_ms": 172.8,
+      "grounding": "clarification",
+      "scenario": "fertilizer",
+      "references": 0,
+      "response_preview": "ለማዳበሪያ ምክር ሰብል እና አካባቢውን ይንገሩኝ። ለምሳሌ፦ ስንዴ በደጋ።"
+    },
+    {
+      "id": "wheat_fertilizer_region_clarification",
+      "ok": true,
+      "latency_ms": 206.1,
+      "trust_latency_ms": 201.9,
+      "grounding": "clarification",
+      "scenario": "fertilizer",
+      "references": 0,
+      "response_preview": "ለየትኛው አካባቢ ነው? (ደጋ፣ ቆላ ወይም ወይና ደጋ)"
+    },
+    {
+      "id": "teff_price_intent",
+      "ok": true,
+      "latency_ms": 562.7,
+      "trust_latency_ms": 484.1,
+      "grounding": "tools",
+      "scenario": "market_price",
+      "references": 0,
+      "response_preview": "የጤፍ ዋጋ በAsayta 14000.0 ብር/100 ኪሎ ግራም ነው። አዝማሚያው እየቀነሰ ነው። ዋጋው እየቀነሰ ከሆነ ብዙ ጊዜ ከመጠበቅ በፊት የአካባቢ ገበያን ያረጋግጡ። የመረጃው ቀን: 2026-03-15። የዋጋ አይነት: Retail። ይህ በመዝገቡ ያለ የመ"
+    },
+    {
+      "id": "weather_missing_location_clarifies",
+      "ok": true,
+      "latency_ms": 183.7,
+      "trust_latency_ms": 181.1,
+      "grounding": "clarification",
+      "scenario": "weather",
+      "references": 0,
+      "response_preview": "የአየር ሁኔታ ለየትኛው አካባቢ ነው የሚፈልጉት?"
+    },
+    {
+      "id": "coffee_pest",
+      "ok": true,
+      "latency_ms": 11368.3,
+      "trust_latency_ms": 11283.2,
+      "grounding": "kb_llm",
+      "scenario": "pest_disease",
+      "references": 3,
+      "response_preview": "ለቡና ተባይ ምን ማድረግ እንዳለብዎ ለመወሰን, የተባዩን አይነት ማወቅ ያስፈልጋል. ትክክለኛው የመስክ አቀማመጥ ቦታን፣ ውሃ እና ንጥረ ምግቦችን በብቃት ለመጠቀም ይረዳል፣ እንዲሁም በተባይ እና በበሽታ አያያዝ ላይ ይረዳል።"
+    },
+    {
+      "id": "compost_benefit",
+      "ok": true,
+      "latency_ms": 4378.8,
+      "trust_latency_ms": 4331.8,
+      "grounding": "kb_unknown",
+      "scenario": "fertilizer",
+      "references": 3,
+      "response_preview": "ኮምፖስት የአፈርን ኦርጋኒክ ንጥረ ነገር ይጨምራል፣ የውሃ መያዝ አቅምን ያሻሽላል፣ አፈርን ለሰብል ሥር ይለሰልሳል፣ እና ኬሚካል ማዳበሪያን ብቻ መመካትን ይቀንሳል።"
+    },
+    {
+      "id": "barley_region",
+      "ok": true,
+      "latency_ms": 11358.5,
+      "trust_latency_ms": 11272.2,
+      "grounding": "kb_llm",
+      "scenario": "crop_production",
+      "references": 3,
+      "response_preview": "በደጋማው አካባቢ ለአንድ ሄክታር መሬት ከ100-125 ኪሎ ግራም የገብስ ዘር ያስፈልጋል።"
+    },
+    {
+      "id": "urea_timing",
+      "ok": true,
+      "latency_ms": 182.3,
+      "trust_latency_ms": 179.7,
+      "grounding": "clarification",
+      "scenario": "fertilizer",
+      "references": 0,
+      "response_preview": "ለዩሪያ ምክር ሰብል እና አካባቢውን ይንገሩኝ። ለምሳሌ፦ ስንዴ በደጋ።"
+    },
+    {
+      "id": "agrochemical_safety_escalates",
+      "ok": true,
+      "latency_ms": 210.9,
+      "trust_latency_ms": 207.7,
+      "grounding": "escalation",
+      "scenario": "safety_agrochemical",
+      "references": 0,
+      "response_preview": "ለመድሐኒት መጠን፣ የመርጨት ጊዜ፣ መገናኛና የደህንነት ጥያቄዎች ከዚህ ስልክ አጠቃላይ መረጃ ብቻ ሙሉ መልስ ልንሰጥ አንችልም። እባክዎን የገበር ልማት ባለሙያ፣ ኮኦፕ ወይም የአካባቢ ተቋም ይጠይቁ። ጥያቄዎን ለባለሙያ አስተላልፈናል።"
+    }
+  ],
+  "failures": [],
+  "command": "python3 eval/run_rag_eval.py",
+  "exit_code": 0,
+  "generated_at": "2026-05-26T21:14:23.666959+00:00"
+}
