@@ -52,6 +52,8 @@ DEFAULT_GREETING_AM = (
 )
 
 _server: asyncio.AbstractServer | None = None
+_alert_server: asyncio.AbstractServer | None = None
+_alert_call_payloads: dict[str, dict] = {}
 
 
 def audiosocket_kind_for_sample_rate(sample_rate: int) -> int:
@@ -357,6 +359,94 @@ async def play_opening_greeting(sink: AudioSocketPlaybackSink) -> None:
         add_event("sip_greeting_failed", {"error": str(exc)})
 
 
+def register_alert_call_payload(call_id: str, payload: dict) -> None:
+    _alert_call_payloads[call_id] = payload
+
+
+async def play_alert_message(sink: AudioSocketPlaybackSink, text: str) -> None:
+    tts_url = os.getenv("TTS_SERVICE_URL", "http://tts-service:8009/synthesize").strip()
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.post(tts_url, json={"text": text})
+        response.raise_for_status()
+    await stream_wav_to_audiosocket(sink, response.content)
+
+
+async def play_recorded_audio_file(sink: AudioSocketPlaybackSink, audio_path: str) -> None:
+    path = Path(audio_path)
+    if not path.exists() or not path.is_file():
+        raise FileNotFoundError(f"Expert audio file not found: {audio_path}")
+    await stream_wav_to_audiosocket(sink, path.read_bytes())
+
+
+async def handle_alert_audiosocket_call(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+) -> None:
+    peer = writer.get_extra_info("peername")
+    try:
+        call_id = str(uuid.uuid4())
+        sample_rate = parse_int_env(
+            "SIP_AUDIOSOCKET_SAMPLE_RATE",
+            parse_int_env("SIP_ALERT_AUDIOSOCKET_SAMPLE_RATE", 8000),
+        )
+        packet_kind, payload = await asyncio.wait_for(read_audiosocket_packet(reader), timeout=10.0)
+        if packet_kind == AUDIOSOCKET_KIND_UUID:
+            call_id = decode_call_uuid(payload)
+        elif packet_kind in AUDIOSOCKET_MEDIA_RATES:
+            sample_rate = AUDIOSOCKET_MEDIA_RATES[packet_kind]
+        elif packet_kind == AUDIOSOCKET_KIND_ERROR:
+            raise RuntimeError(f"AudioSocket error before alert playback from {peer}: {payload.hex()}")
+        elif packet_kind == AUDIOSOCKET_KIND_HANGUP:
+            return
+
+        payload = _alert_call_payloads.pop(call_id, {})
+        message = (payload.get("alert_message") or "").strip()
+        expert_audio_path = (payload.get("expert_audio_path") or "").strip()
+        expert_response_text = (payload.get("expert_response_text") or "").strip()
+        severity = (payload.get("severity") or "warning").strip()
+        if severity == "critical":
+            prefix = "አስቸኳይ ማስጠንቀቂያ። "
+        elif severity == "expert_response":
+            prefix = ""
+        else:
+            prefix = "የግብርና ማሳሰቢያ። "
+        sink = AudioSocketPlaybackSink(writer, default_sample_rate=sample_rate)
+        if expert_audio_path:
+            intro = (
+                message
+                or os.getenv(
+                    "SIP_EXPERT_RESPONSE_INTRO_AM",
+                    "የባለሙያ መልስ ዝግጁ ነው። አሁን እናጫውታለን።",
+                )
+            )
+            if intro:
+                await play_alert_message(sink, intro)
+            await play_recorded_audio_file(sink, expert_audio_path)
+        elif expert_response_text:
+            await play_alert_message(sink, message or f"የባለሙያ መልስ። {expert_response_text}")
+        elif message:
+            await play_alert_message(sink, prefix + message)
+        add_event("alert_call_played", {
+            "call_id": call_id,
+            "phone_number": payload.get("phone_number"),
+            "target_region": payload.get("target_region"),
+            "kind": payload.get("kind") or "alert",
+        })
+    except Exception as exc:
+        print(f"[ALERT CALL ERROR] peer={peer}, error={exc}", flush=True)
+        add_event("alert_call_error", {"peer": str(peer), "error": str(exc)})
+    finally:
+        try:
+            await write_audiosocket_packet(writer, AUDIOSOCKET_KIND_HANGUP)
+        except Exception:
+            pass
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
 async def handle_sip_audiosocket_call(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
@@ -376,7 +466,13 @@ async def handle_sip_audiosocket_call(
         print(f"[SIP CALL START ERROR] peer={peer}, error={exc}", flush=True)
         return
 
-    session = create_session()
+    sip_caller_phone = (
+        os.getenv("SIP_DEFAULT_CALLER_PHONE_NUMBER", "sip:farmeruhamayohannes").strip()
+        or f"sip:{call_leg_id}"
+    )
+    sip_caller_name = os.getenv("SIP_DEFAULT_CALLER_NAME", "SIP Farmer").strip() or "SIP Farmer"
+
+    session = create_session(full_name=sip_caller_name, phone_number=sip_caller_phone)
     session_id = session["session_id"]
     recorder = AudioRecorder(session_id=session_id, sample_rate=sample_rate)
     sink = AudioSocketPlaybackSink(writer, default_sample_rate=sample_rate)
@@ -384,21 +480,22 @@ async def handle_sip_audiosocket_call(
     query_params = urlencode({
         "session_id": session_id,
         "sample_rate": sample_rate,
-        "phone_number": f"sip:{call_leg_id}",
+        "phone_number": sip_caller_phone,
     })
     vad_url = f"{os.getenv('VAD_WS_BASE_URL', 'ws://vad-service:8010/ws/vad')}?{query_params}"
 
     start_call_monitor(
         session_id=session_id,
-        caller_id=None,
-        caller_name="SIP caller",
-        caller_phone=f"sip:{call_leg_id}",
+        caller_id=session.get("caller_id"),
+        caller_name=sip_caller_name,
+        caller_phone=sip_caller_phone,
         sample_rate=sample_rate,
         audio_format="audiosocket/pcm16",
     )
     add_event("sip_call_started", {
         "session_id": session_id,
         "call_leg_id": call_leg_id,
+        "caller_phone": sip_caller_phone,
         "peer": str(peer),
         "sample_rate": sample_rate,
     })
@@ -553,3 +650,27 @@ async def stop_sip_audiosocket_server() -> None:
     _server.close()
     await _server.wait_closed()
     _server = None
+
+
+async def start_alert_audiosocket_server() -> asyncio.AbstractServer | None:
+    global _alert_server
+
+    if not parse_bool_env("SIP_ALERT_AUDIOSOCKET_ENABLED", "1"):
+        print("[SIP] Alert AudioSocket server disabled", flush=True)
+        return None
+
+    host = os.getenv("SIP_AUDIOSOCKET_HOST", "0.0.0.0")
+    port = int(os.getenv("SIP_ALERT_AUDIOSOCKET_PORT", "9093"))
+    _alert_server = await asyncio.start_server(handle_alert_audiosocket_call, host, port)
+    print(f"[SIP] Alert AudioSocket server listening on {host}:{port}", flush=True)
+    return _alert_server
+
+
+async def stop_alert_audiosocket_server() -> None:
+    global _alert_server
+
+    if not _alert_server:
+        return
+    _alert_server.close()
+    await _alert_server.wait_closed()
+    _alert_server = None

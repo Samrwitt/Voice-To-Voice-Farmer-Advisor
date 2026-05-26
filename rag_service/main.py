@@ -14,11 +14,24 @@ from database import (
     get_conversation_history, get_market_price, register_farmer,
     get_farmer_profile, get_alerts_for_region, set_session_state,
     get_session_state, insert_call_record, log_interaction_record,
-    get_dynamic_knowledge, set_dynamic_knowledge
+    get_dynamic_knowledge, set_dynamic_knowledge,
+    get_farmer_memory_context, consume_answered_expert_response
 )
 from nlu import analyze_intent, needs_slot_filling
 from dynamic_layer_runtime import build_dynamic_context
 from farmer_persona import build_personalization_block
+from escalation_policy import (
+    OUT_OF_DOMAIN_ESCALATION_AM,
+    USER_REQUESTED_ESCALATION_AM,
+    is_out_of_domain,
+    user_requested_escalation,
+)
+from greeting_utils import (
+    GREETING_ACK_AM,
+    GREETING_ONLY_FOLLOWUP_AM,
+    apply_greeting_ack,
+    split_greeting_from_query,
+)
 from quality_metrics import quality_snapshot
 from trust_meta import build_voice_trust_meta, maybe_append_trust_footer
 from rag_retrieval import ranked_hits_for_voice_query
@@ -368,28 +381,28 @@ def compose_grounded_answer_no_llm(query_text: str, hits: list[dict], max_chars:
     return (intro + "\n\n".join(parts))[:max_chars]
 
 
-def check_and_deliver_expert_responses(phone_number: str) -> str:
-    """Checks if there's an answered escalation for this phone number and returns the formatted response."""
-    import rag_pg
-    if not rag_pg.kb_pg_enabled():
+def _format_expert_delivery_text(delivery: dict | None) -> str:
+    """Text fallback for an answered escalation; audio is carried separately."""
+    if not delivery:
         return ""
-    try:
-        import psycopg
-        with psycopg.connect(rag_pg.POSTGRES_URL) as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT id, query, expert_response FROM escalations WHERE phone_number = %s AND status = 'answered' ORDER BY created_at ASC LIMIT 1",
-                    (phone_number,)
-                )
-                row = cur.fetchone()
-                if row:
-                    esc_id, orig_query, expert_resp = row
-                    cur.execute("UPDATE escalations SET status = 'closed', closed_at = NOW() WHERE id = %s", (esc_id,))
-                    conn.commit()
-                    return f"ቀደም ብለው ስለ '{orig_query}' ላቀረቡት ጥያቄ የባለሙያ ምላሽ አለኝ፡ {expert_resp}\n\nአሁን ደግሞ ስለ አዲሱ ጥያቄዎ ልርዳዎት።"
-    except Exception as exc:
-        logger.error(f"Failed to check for expert responses: {exc}")
+    query = (delivery.get("query") or "").strip()
+    text = (delivery.get("text") or "").strip()
+    if text:
+        return (
+            f"ቀደም ብለው ስለ '{query}' ላቀረቡት ጥያቄ የባለሙያ ምላሽ አለኝ፡ "
+            f"{text}\n\nአሁን ደግሞ ስለ አዲሱ ጥያቄዎ ልርዳዎት።"
+        )
+    if delivery.get("audio_path"):
+        return (
+            f"ቀደም ብለው ስለ '{query}' ላቀረቡት ጥያቄ የተቀረጸ የባለሙያ መልስ ዝግጁ ነው። "
+            "መልሱን አሁን እንጫወታለን።"
+        )
     return ""
+
+
+def check_and_deliver_expert_responses(phone_number: str) -> str:
+    """Compatibility wrapper for text-only clients."""
+    return _format_expert_delivery_text(consume_answered_expert_response(phone_number))
 
 
 # ── Core RAG Pipeline ────────────────────────────────────────────────────────
@@ -427,22 +440,7 @@ def _generate_core_rag_response(query_text: str, phone_number: str, session_id: 
     logger.info("NLU intent=%s conf=%.2f entities=%s", nlu.primary_intent, nlu.confidence, nlu.entities)
 
     # ── User-requested escalation (FR22) ──────────────────────────────────────
-    # A lightweight trigger: if the user explicitly asks for an expert/human.
-    # We do this early, before retrieval, so it's deterministic.
-    q = (query_text or "").lower()
-    user_escalation_phrases = (
-        "expert",
-        "human",
-        "agent",
-        "helpdesk",
-        "operator",
-        "ለባለሙያ",
-        "ባለሙያ",
-        "ሰው",
-        "ወደ ባለሙያ",
-        "እርዳታ",
-    )
-    if any(p in q for p in user_escalation_phrases):
+    if user_requested_escalation(query_text):
         add_to_escalation(
             query_text,
             "User explicitly requested expert handoff.",
@@ -452,7 +450,7 @@ def _generate_core_rag_response(query_text: str, phone_number: str, session_id: 
             confidence=nlu.confidence,
             entities=nlu.entities,
         )
-        resp = "እሺ፣ ጥያቄዎን ለግብርና ባለሙያ አስተላልፌዋለሁ። በቅርቡ መልስ ያገኛሉ።"
+        resp = USER_REQUESTED_ESCALATION_AM
         log_conversation(phone_number, session_id, "assistant", resp)
         log_interaction_record(
             phone_number=phone_number,
@@ -463,6 +461,28 @@ def _generate_core_rag_response(query_text: str, phone_number: str, session_id: 
             confidence=nlu.confidence,
         )
         return resp, "escalated_user_requested", [], nlu.to_dict()
+
+    if is_out_of_domain(query_text, nlu):
+        add_to_escalation(
+            query_text,
+            "Question appears outside the supported farmer advisory domain.",
+            phone_number=phone_number,
+            session_id=session_id,
+            reason_code="OUT_OF_DOMAIN",
+            confidence=nlu.confidence,
+            entities=nlu.entities,
+        )
+        resp = OUT_OF_DOMAIN_ESCALATION_AM
+        log_conversation(phone_number, session_id, "assistant", resp)
+        log_interaction_record(
+            phone_number=phone_number,
+            session_id=session_id,
+            intent=nlu.primary_intent,
+            response_type="escalated_out_of_domain",
+            entities=nlu.entities,
+            confidence=nlu.confidence,
+        )
+        return resp, "escalated_out_of_domain", [], nlu.to_dict()
 
     # ── Farmer Profile & Context ──────────────────────────────────────────────
     profile = get_farmer_profile(phone_number)
@@ -480,6 +500,7 @@ def _generate_core_rag_response(query_text: str, phone_number: str, session_id: 
 
     intent = nlu.primary_intent
     user_context = build_personalization_block(phone_number, profile)
+    user_context += get_farmer_memory_context(phone_number, exclude_session_id=session_id)
     if user_region:
         user_context = (user_context or "") + f"የክልል ማጣሪያ / ቦታ፦ {user_region}።\n"
 
@@ -913,10 +934,11 @@ def _voice_escalation_response(
     phone_number: str,
     session_id: str,
     expert_delivery: str,
+    expert_delivery_payload: dict | None = None,
     body: str,
     reason_code: str,
     escalation_context: str,
-    best_distance: float,
+    best_distance: float | None,
     hits: list,
     t0: float,
     safety: dict | None = None,
@@ -939,9 +961,12 @@ def _voice_escalation_response(
         phone_number=phone_number,
         session_id=session_id,
         intent=getattr(nlu, "primary_intent", None),
-        response_type="escalated_low_confidence"
-        if reason_code == "LOW_CONFIDENCE"
-        else "escalated_agrochemical",
+        response_type={
+            "LOW_CONFIDENCE": "escalated_low_confidence",
+            "AGROCHEM_NO_KB": "escalated_agrochemical",
+            "USER_REQUESTED": "escalated_user_requested",
+            "OUT_OF_DOMAIN": "escalated_out_of_domain",
+        }.get(reason_code, "escalated"),
         entities=getattr(nlu, "entities", None),
         confidence=getattr(nlu, "confidence", None),
     )
@@ -961,13 +986,19 @@ def _voice_escalation_response(
     final = maybe_append_trust_footer(final, sources=["escalation"])
     return {
         "response": final,
+        "current_response": body,
+        "expert_delivery": expert_delivery_payload,
         "references": [],
         "best_distance": best_distance,
         "trust": trust,
         "meta": {
             "response_cache": "bypass",
             "reason": meta_reason,
-            "scenario": "safety_agrochemical" if reason_code == "AGROCHEM_NO_KB" else "low_confidence",
+            "scenario": {
+                "AGROCHEM_NO_KB": "safety_agrochemical",
+                "USER_REQUESTED": "user_requested_escalation",
+                "OUT_OF_DOMAIN": "out_of_domain",
+            }.get(reason_code, "low_confidence"),
         },
     }
 
@@ -983,6 +1014,7 @@ def _voice_clarification_response(
     scenario: str,
     missing_slots: list[str] | None = None,
     expert_delivery: str = "",
+    expert_delivery_payload: dict | None = None,
     asr_meta: dict | None = None,
 ) -> dict:
     set_session_state(session_id, "awaiting_slot", query_text)
@@ -1015,6 +1047,8 @@ def _voice_clarification_response(
         }
     return {
         "response": final,
+        "current_response": prompt,
+        "expert_delivery": expert_delivery_payload,
         "references": [],
         "best_distance": None,
         "trust": trust,
@@ -1085,19 +1119,41 @@ async def rag_answer(req: RagAnswerRequest):
     from farmer_rag_stack.smart_advisory import run_smart_advisory
 
     t0 = time.perf_counter()
-    query_text = (req.text or "").strip()
-    if not query_text:
+    raw_query_text = (req.text or "").strip()
+    if not raw_query_text:
         raise HTTPException(status_code=400, detail="Empty query")
 
+    asr_meta = req.asr if isinstance(req.asr, dict) else {}
+    had_greeting, query_text = split_greeting_from_query(raw_query_text)
+    if not query_text:
+        final = f"{GREETING_ACK_AM} {GREETING_ONLY_FOLLOWUP_AM}"
+        set_session_state(req.session_id, "active", None)
+        log_conversation(req.phone_number, req.session_id, "user", raw_query_text)
+        log_conversation(req.phone_number, req.session_id, "assistant", final)
+        return {
+            "response": final,
+            "current_response": final,
+            "expert_delivery": None,
+            "references": [],
+            "best_distance": None,
+            "trust": {"grounding": "greeting"},
+            "meta": {"scenario": {"scenario": "greeting_only"}},
+        }
+
     state = get_session_state(req.session_id)
-    if state and state.get("current_state") == "awaiting_slot":
+    if (
+        state
+        and state.get("current_state") == "awaiting_slot"
+        and not asr_meta.get("needs_confirmation")
+    ):
         original_query = state.get("pending_action", "")
         if original_query:
             query_text = f"{original_query} {query_text}".strip()
         set_session_state(req.session_id, "active", None)
 
     nlu = analyze_intent(query_text)
-    expert_delivery = check_and_deliver_expert_responses(req.phone_number)
+    expert_delivery_payload = consume_answered_expert_response(req.phone_number)
+    expert_delivery = _format_expert_delivery_text(expert_delivery_payload)
     
     crop_name = getattr(nlu, "entities", {}).get("crop_en") if nlu else None
     try:
@@ -1116,9 +1172,8 @@ async def rag_answer(req: RagAnswerRequest):
 
     hist = get_conversation_history(req.session_id, limit=6)
     hist_pairs = list(hist)
-    log_conversation(req.phone_number, req.session_id, "user", query_text)
+    log_conversation(req.phone_number, req.session_id, "user", raw_query_text)
 
-    asr_meta = req.asr if isinstance(req.asr, dict) else {}
     if asr_meta.get("needs_confirmation"):
         prompt = (
             (asr_meta.get("confirmation_prompt") or "").strip()
@@ -1134,7 +1189,42 @@ async def rag_answer(req: RagAnswerRequest):
             scenario="asr_confirmation",
             missing_slots=["asr_confirmation"],
             expert_delivery=expert_delivery,
+            expert_delivery_payload=expert_delivery_payload,
             asr_meta=asr_meta,
+        )
+
+    if user_requested_escalation(query_text):
+        return _voice_escalation_response(
+            query_text=query_text,
+            phone_number=req.phone_number,
+            session_id=req.session_id,
+            expert_delivery=expert_delivery,
+            expert_delivery_payload=expert_delivery_payload,
+            body=apply_greeting_ack(USER_REQUESTED_ESCALATION_AM, had_greeting),
+            reason_code="USER_REQUESTED",
+            escalation_context="User explicitly requested expert handoff in the voice path.",
+            best_distance=None,
+            hits=[],
+            t0=t0,
+            meta_reason="user_requested_escalation",
+            nlu=nlu,
+        )
+
+    if is_out_of_domain(query_text, nlu):
+        return _voice_escalation_response(
+            query_text=query_text,
+            phone_number=req.phone_number,
+            session_id=req.session_id,
+            expert_delivery=expert_delivery,
+            expert_delivery_payload=expert_delivery_payload,
+            body=apply_greeting_ack(OUT_OF_DOMAIN_ESCALATION_AM, had_greeting),
+            reason_code="OUT_OF_DOMAIN",
+            escalation_context="Voice path: question appears outside the supported farmer advisory domain.",
+            best_distance=None,
+            hits=[],
+            t0=t0,
+            meta_reason="out_of_domain_escalation",
+            nlu=nlu,
         )
 
     is_agro = chemical_safety.is_high_risk_agrochemical_query(query_text)
@@ -1151,12 +1241,13 @@ async def rag_answer(req: RagAnswerRequest):
             query_text=query_text,
             phone_number=req.phone_number,
             session_id=req.session_id,
-            prompt=scenario_decision.clarification_prompt,
+            prompt=apply_greeting_ack(scenario_decision.clarification_prompt, had_greeting),
             nlu=nlu,
             t0=t0,
             scenario=scenario_decision.scenario,
             missing_slots=scenario_decision.missing_slots,
             expert_delivery=expert_delivery,
+            expert_delivery_payload=expert_delivery_payload,
             asr_meta=asr_meta,
         )
 
@@ -1217,6 +1308,7 @@ async def rag_answer(req: RagAnswerRequest):
             phone_number=req.phone_number,
             session_id=req.session_id,
             expert_delivery=expert_delivery,
+            expert_delivery_payload=expert_delivery_payload,
             body=chemical_safety.CANNED_AGROCHEM_ESCALATION_AM,
             reason_code="AGROCHEM_NO_KB",
             escalation_context=(
@@ -1241,6 +1333,7 @@ async def rag_answer(req: RagAnswerRequest):
             phone_number=req.phone_number,
             session_id=req.session_id,
             expert_delivery=expert_delivery,
+            expert_delivery_payload=expert_delivery_payload,
             body=voice_guards.GENERIC_LOW_CONFIDENCE_ESCALATION_AM,
             reason_code="LOW_CONFIDENCE",
             escalation_context=(
@@ -1268,6 +1361,7 @@ async def rag_answer(req: RagAnswerRequest):
         retrieval_diag["weak_kb_used"] = False
 
     profile_line = build_personalization_block(req.phone_number, profile)
+    profile_line += get_farmer_memory_context(req.phone_number, exclude_session_id=req.session_id)
     if user_region:
         profile_line = (profile_line or "") + f"የክልል ማጣሪያ፦ {user_region}።\n"
 
@@ -1324,6 +1418,7 @@ async def rag_answer(req: RagAnswerRequest):
     else:
         final = answer or ""
 
+    current_response = final
     if expert_delivery:
         final = f"{expert_delivery}\n\n{final}"
 
@@ -1349,6 +1444,8 @@ async def rag_answer(req: RagAnswerRequest):
         )
         final = "ይቅርታ፣ ለዚህ ጥያቄ በቂ መረጃ አልተገኘም። ጥያቄዎን ለግብርና ባለሙያ ልከናል፤ በቅርቡ መልስ ያገኛሉ።"
 
+    final = apply_greeting_ack(final, had_greeting)
+
     voice_cap_raw = os.environ.get("RAG_VOICE_RAG_ANSWER_MAX_CHARS", "600").strip()
     try:
         voice_cap = int(voice_cap_raw) if voice_cap_raw else 600
@@ -1358,6 +1455,7 @@ async def rag_answer(req: RagAnswerRequest):
         final = final[: max(0, voice_cap - 3)].rstrip() + "..."
 
     final = normalize_text(final)
+    current_response = normalize_text(current_response)
 
     latency_ms = (time.perf_counter() - t0) * 1000
     sla_h = int(os.getenv("ESCALATION_SLA_HOURS", "48") or "48")
@@ -1416,6 +1514,8 @@ async def rag_answer(req: RagAnswerRequest):
 
     out = {
         "response": final,
+        "current_response": current_response,
+        "expert_delivery": expert_delivery_payload,
         "references": refs,
         "best_distance": best,
         "trust": trust,

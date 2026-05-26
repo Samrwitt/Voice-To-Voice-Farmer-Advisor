@@ -14,7 +14,7 @@ const LOGIC_SERVICE_URL =
 
 type Props = { params: Promise<{ path: string[] }> };
 
-const COPY_REQUEST_HEADERS = ['authorization', 'content-type', 'accept'];
+const COPY_REQUEST_HEADERS = ['authorization', 'content-type', 'accept', 'range'];
 const STRIP_RESPONSE_HEADERS = new Set([
   'transfer-encoding',
   'content-encoding',
@@ -31,8 +31,12 @@ async function proxyHandler(req: NextRequest, props: Props) {
     const value = req.headers.get(name);
     if (value) headers[name] = value;
   }
+  const queryToken = req.nextUrl.searchParams.get('token');
+  if (queryToken && !headers.authorization) {
+    headers.authorization = `Bearer ${queryToken}`;
+  }
 
-  const init: RequestInit = { method: req.method, headers };
+  const init: RequestInit = { method: req.method, headers, redirect: 'manual' };
 
   if (req.method !== 'GET' && req.method !== 'HEAD') {
     const buffer = await req.arrayBuffer();

@@ -10,17 +10,21 @@ by `auth.py`. Roles enforced:
 import csv
 import io
 import os
+import subprocess
+import time
 import uuid
+import wave
 from datetime import datetime, timedelta
 from typing import List, Optional
 
 import requests
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Response, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import case, desc, func, text
 from sqlalchemy.orm import Session
 
+from alert_utils import normalize_region as _normalize_region
 from auth import (
     create_access_token,
     get_current_user,
@@ -29,12 +33,13 @@ from auth import (
     verify_password,
     ACCESS_TOKEN_EXPIRE_MINUTES,
 )
-from database import collection
-from db import get_db
+from database import collection, ensure_runtime_schema
+from db import SessionLocal, get_db
 from kb_indexing import index_document, remove_document_from_chroma
 from s3_client import is_enabled as s3_enabled, presign_get_url
 from models import (
     Alert,
+    AlertCallNotification,
     CallRecord,
     CallSessionPG,
     ConversationMessage,
@@ -91,6 +96,7 @@ class AlertRequest(BaseModel):
     severity: str = "warning"
     category: Optional[str] = None
     scheduled_at: Optional[datetime] = None
+    notify_by_call: bool = True
 
 
 class KBRequest(BaseModel):
@@ -133,6 +139,72 @@ def _user_dict(u: DashboardUser) -> dict:
 
 def _isoformat(dt: Optional[datetime]) -> Optional[str]:
     return dt.isoformat() if dt else None
+
+
+def _local_call_recording_candidates(session_id: str, stored_path: Optional[str] = None) -> list[str]:
+    candidates: list[str] = []
+    recordings_dir = os.getenv("CALL_RECORDINGS_DIR", "/app/recordings")
+    if stored_path and not stored_path.startswith("s3://"):
+        root, ext = os.path.splitext(stored_path)
+        if ext.lower() == ".wav":
+            candidates.append(stored_path)
+        elif ext.lower() == ".pcm":
+            candidates.append(f"{root}.wav")
+
+    candidates.extend(
+        [
+            os.path.join(recordings_dir, f"{session_id}.wav"),
+            os.path.join(recordings_dir, "audio", f"{session_id}.wav"),
+        ]
+    )
+    if stored_path and not stored_path.startswith("s3://"):
+        candidates.append(stored_path)
+    candidates.extend(
+        [
+            os.path.join(recordings_dir, f"{session_id}.pcm"),
+            os.path.join(recordings_dir, "audio", f"{session_id}.pcm"),
+            os.path.join(recordings_dir, session_id),
+        ]
+    )
+    return list(dict.fromkeys(candidates))
+
+
+def _ensure_playable_wav(candidate: str) -> str:
+    if not candidate.lower().endswith(".pcm"):
+        return candidate
+    wav_path = f"{os.path.splitext(candidate)[0]}.wav"
+    if os.path.exists(wav_path):
+        return wav_path
+    try:
+        with open(candidate, "rb") as f:
+            pcm_bytes = f.read()
+        with wave.open(wav_path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(int(os.getenv("SIP_AUDIOSOCKET_SAMPLE_RATE", "8000") or "8000"))
+            wf.writeframes(pcm_bytes)
+        return wav_path
+    except Exception as exc:
+        print(f"[CALL AUDIO] PCM to WAV fallback failed for {candidate}: {exc}")
+        return candidate
+
+
+def _first_existing_call_recording(session_id: str, stored_path: Optional[str] = None) -> Optional[str]:
+    for candidate in _local_call_recording_candidates(session_id, stored_path):
+        if candidate and os.path.exists(candidate):
+            return _ensure_playable_wav(candidate)
+    return None
+
+
+def _playable_call_recording_ref(session_id: str, stored_path: Optional[str] = None) -> Optional[str]:
+    # Prefer the shared local Docker volume when available. It keeps playback
+    # working even when MinIO is not reachable from the browser/proxy path.
+    local_path = _first_existing_call_recording(session_id, stored_path)
+    if local_path:
+        return local_path
+    if stored_path and stored_path.startswith("s3://") and s3_enabled():
+        return stored_path
+    return None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -476,7 +548,7 @@ def get_farmer_calls(
             "phone_number": phone_number,
             "duration": int(r.duration_seconds) if r.duration_seconds is not None else None,
             "timestamp": _isoformat(r.start_time),
-            "recording_path": r.audio_file_path,
+            "recording_path": _playable_call_recording_ref(r.session_id, r.audio_file_path),
         }
         for r in rows
     ]
@@ -512,7 +584,7 @@ def list_calls(
             "farmer_name": caller.full_name if caller else None,
             "duration": int(cs.duration_seconds) if cs.duration_seconds is not None else None,
             "timestamp": _isoformat(cs.start_time),
-            "recording_path": cs.audio_file_path,
+            "recording_path": _playable_call_recording_ref(cs.session_id, cs.audio_file_path),
         }
         for cs, caller in rows
     ]
@@ -562,7 +634,7 @@ def get_call_detail(
                 "phone_number": caller.phone_number if caller else None,
                 "duration": int(cs.duration_seconds) if cs and cs.duration_seconds is not None else None,
                 "timestamp": _isoformat(cs.start_time) if cs else None,
-                "recording_path": cs.audio_file_path if cs else None,
+                "recording_path": _playable_call_recording_ref(session_id, cs.audio_file_path if cs else None),
             }
             if cs or caller
             else None
@@ -604,28 +676,31 @@ def get_call_audio_url(
             raise HTTPException(status_code=403, detail="Access denied")
     elif user.role not in ("admin", "da"):
         raise HTTPException(status_code=403, detail="Access denied")
-    """
-    Returns a presigned URL for the call audio stored in S3/MinIO.
-    The CallSessionPG.audio_file_path is expected to be an s3://bucket/key reference.
-    """
+    """Streams local call audio when present, otherwise redirects to S3/MinIO."""
     cs = db.query(CallSessionPG).filter(CallSessionPG.session_id == session_id).first()
-    if not cs or not cs.audio_file_path:
+    stored_path = cs.audio_file_path if cs else None
+    if not cs:
         raise HTTPException(status_code=404, detail="Audio not found")
 
-    # 1. Try S3/MinIO presigned redirect
-    if cs.audio_file_path.startswith("s3://"):
-        if not s3_enabled():
-            raise HTTPException(status_code=503, detail="S3 is not configured")
-        url = presign_get_url(cs.audio_file_path, expires_seconds=900)
-        if url:
-            return Response(status_code=302, headers={"Location": url})
-        raise HTTPException(status_code=404, detail="Audio reference is not in S3")
+    # 1. Prefer local file serving from the shared recording volume.
+    local_path = _first_existing_call_recording(session_id, stored_path)
+    if local_path:
+        media_type = "audio/wav" if local_path.lower().endswith(".wav") else "application/octet-stream"
+        return FileResponse(local_path, media_type=media_type)
 
-    # 2. Try local file serving (if not in S3)
-    if os.path.exists(cs.audio_file_path):
-        return FileResponse(cs.audio_file_path, media_type="audio/wav")
+    # 2. Try S3/MinIO presigned redirect.
+    if stored_path and stored_path.startswith("s3://"):
+        if s3_enabled():
+            try:
+                url = presign_get_url(stored_path, expires_seconds=900)
+                if url:
+                    return Response(status_code=302, headers={"Location": url})
+            except Exception as exc:
+                print(f"[CALL AUDIO] S3 presign failed for {session_id}: {exc}")
 
-    raise HTTPException(status_code=404, detail=f"Audio not found at {cs.audio_file_path}")
+        raise HTTPException(status_code=404, detail="Audio is stored in S3, but no playable local fallback exists")
+
+    raise HTTPException(status_code=404, detail=f"Audio not found for session {session_id}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -637,6 +712,8 @@ def _escalation_dict(e: Escalation, db: Session) -> dict:
         u = db.query(DashboardUser).filter(DashboardUser.user_id == e.assigned_to_user_id).first()
         if u:
             assignee = {"user_id": u.user_id, "full_name": u.full_name, "email": u.email}
+    transcript_messages, transcript_text = _get_escalation_transcript(e, db)
+    session_record = _get_escalation_session_record(e, db)
     return {
         "id": e.id,
         "query": e.query,
@@ -655,7 +732,70 @@ def _escalation_dict(e: Escalation, db: Session) -> dict:
         "closed_at": _isoformat(e.closed_at),
         "timestamp": _isoformat(e.created_at),
         "expert_audio_url": _get_expert_audio_link(e, db),
+        "transcript": transcript_text,
+        "transcript_messages": transcript_messages,
+        "session_record": session_record,
+        "session_recording_url": session_record.get("audio_url") if session_record else None,
+        "session_recording_path": session_record.get("recording_path") if session_record else None,
     }
+
+
+def _get_escalation_transcript(e: Escalation, db: Session) -> tuple[list[dict], str]:
+    rows = []
+    if e.session_id:
+        rows = (
+            db.query(ConversationMessage)
+            .filter(ConversationMessage.session_id == e.session_id)
+            .order_by(ConversationMessage.timestamp.asc(), ConversationMessage.id.asc())
+            .all()
+        )
+    if rows:
+        messages = [
+            {
+                "role": r.role,
+                "message": r.message,
+                "timestamp": _isoformat(r.timestamp),
+            }
+            for r in rows
+        ]
+        text_value = "\n".join(
+            f"{m['role']}: {m['message']}"
+            for m in messages
+            if (m.get("message") or "").strip()
+        )
+        return messages, text_value
+
+    snapshot = (e.transcript_snapshot or "").strip()
+    if not snapshot:
+        snapshot = f"user: {e.query}".strip()
+    messages = []
+    for line in snapshot.splitlines():
+        role, _, message = line.partition(":")
+        messages.append(
+            {
+                "role": role.strip() or "user",
+                "message": message.strip() if message else line.strip(),
+                "timestamp": None,
+            }
+        )
+    return messages, snapshot
+
+
+def _get_escalation_session_record(e: Escalation, db: Session) -> Optional[dict]:
+    if not e.session_id:
+        return None
+    cs = db.query(CallSessionPG).filter(CallSessionPG.session_id == e.session_id).first()
+    stored_path = (cs.audio_file_path if cs and cs.audio_file_path else None) or e.session_recording_path
+    recording_path = _playable_call_recording_ref(e.session_id, stored_path)
+    return {
+        "session_id": e.session_id,
+        "status": cs.status if cs else None,
+        "duration_seconds": int(cs.duration_seconds) if cs and cs.duration_seconds is not None else None,
+        "timestamp": _isoformat(cs.start_time) if cs else None,
+        "recording_path": recording_path,
+        "audio_url": f"/api/admin/calls/{e.session_id}/audio" if recording_path else None,
+    }
+
 
 def _get_expert_audio_link(e: Escalation, db: Session) -> Optional[str]:
     if not e.expert_audio_path:
@@ -665,12 +805,142 @@ def _get_expert_audio_link(e: Escalation, db: Session) -> Optional[str]:
     return f"/api/admin/escalations/{e.id}/audio"
 
 
+def _phone_number_for_escalation(e: Escalation, db: Session) -> Optional[str]:
+    if e.phone_number:
+        return e.phone_number
+    if e.session_id:
+        row = (
+            db.query(CallSessionPG, Caller)
+            .outerjoin(Caller, Caller.caller_id == CallSessionPG.caller_id)
+            .filter(CallSessionPG.session_id == e.session_id)
+            .first()
+        )
+        if row and row[1] and row[1].phone_number:
+            return row[1].phone_number
+    return None
+
+
+def _phone_gateway_base_url() -> str:
+    base = (
+        os.getenv("PHONE_GATEWAY_EXPERT_CALLBACK_URL")
+        or os.getenv("PHONE_GATEWAY_ALERT_CALL_URL")
+        or os.getenv("PHONE_GATEWAY_URL", "http://phone-gateway:8000")
+    ).rstrip("/")
+    if base.endswith("/health"):
+        base = base[: -len("/health")]
+    return base
+
+
+def _escalation_session_is_active(e: Escalation, db: Session) -> bool:
+    if not e.session_id:
+        return False
+    cs = db.query(CallSessionPG).filter(CallSessionPG.session_id == e.session_id).first()
+    if not cs:
+        return False
+    return (cs.status or "").lower() == "active" or cs.end_time is None
+
+
+def _trigger_expert_response_call(
+    e: Escalation,
+    db: Session,
+    *,
+    audio_path: Optional[str] = None,
+    response_text: Optional[str] = None,
+) -> dict:
+    if os.getenv("EXPERT_RESPONSE_CALL_ENABLED", "1").strip().lower() not in ("1", "true", "yes", "on"):
+        return {"status": "disabled"}
+
+    phone = (_phone_number_for_escalation(e, db) or "").strip()
+    if not phone:
+        return {"status": "skipped", "reason": "missing_phone_number"}
+    if not (audio_path or response_text):
+        return {"status": "skipped", "reason": "missing_audio_or_text"}
+    if _escalation_session_is_active(e, db):
+        return {"status": "pending", "reason": "original_call_session_active"}
+
+    try:
+        response = requests.post(
+            f"{_phone_gateway_base_url()}/api/expert-responses/call",
+            json={
+                "escalation_id": e.id,
+                "phone_number": phone,
+                "expert_audio_path": audio_path,
+                "expert_response_text": response_text,
+                "message": "የባለሙያ መልስ ዝግጁ ነው።",
+            },
+            timeout=8,
+        )
+        if response.status_code >= 400:
+            return {"status": "failed", "error": response.text[:500]}
+        return response.json()
+    except Exception as exc:
+        return {"status": "failed", "error": str(exc)}
+
+
+def _trigger_expert_response_call_after_session_end(
+    escalation_id: int,
+    *,
+    audio_path: Optional[str] = None,
+    response_text: Optional[str] = None,
+) -> None:
+    max_wait = int(os.getenv("EXPERT_RESPONSE_CALLBACK_WAIT_SECONDS", "300") or "300")
+    poll = max(1, int(os.getenv("EXPERT_RESPONSE_CALLBACK_POLL_SECONDS", "5") or "5"))
+    deadline = time.monotonic() + max_wait
+
+    while True:
+        db = SessionLocal()
+        try:
+            esc = db.query(Escalation).filter(Escalation.id == escalation_id).first()
+            if not esc:
+                print(f"[EXPERT CALLBACK] escalation {escalation_id} disappeared")
+                return
+            if not _escalation_session_is_active(esc, db):
+                report = _trigger_expert_response_call(
+                    esc,
+                    db,
+                    audio_path=audio_path,
+                    response_text=response_text,
+                )
+                print(f"[EXPERT CALLBACK] delayed callback report: {report}")
+                return
+        finally:
+            db.close()
+
+        if time.monotonic() >= deadline:
+            print(
+                f"[EXPERT CALLBACK] delayed callback timed out for escalation {escalation_id}; "
+                "expert response remains saved for next farmer call"
+            )
+            return
+        time.sleep(poll)
+
+
+def _queue_or_trigger_expert_response_call(
+    e: Escalation,
+    db: Session,
+    background_tasks: BackgroundTasks,
+    *,
+    audio_path: Optional[str] = None,
+    response_text: Optional[str] = None,
+) -> dict:
+    if _escalation_session_is_active(e, db):
+        background_tasks.add_task(
+            _trigger_expert_response_call_after_session_end,
+            e.id,
+            audio_path=audio_path,
+            response_text=response_text,
+        )
+        return {"status": "pending", "reason": "will_call_after_original_session_ends"}
+    return _trigger_expert_response_call(e, db, audio_path=audio_path, response_text=response_text)
+
+
 @router.get("/escalations")
 def list_escalations(
     status: Optional[str] = None,
     user: DashboardUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    ensure_runtime_schema()
     q = db.query(Escalation)
     if status:
         q = q.filter(Escalation.status == status)
@@ -687,6 +957,7 @@ def list_my_escalations(
     user: DashboardUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    ensure_runtime_schema()
     rows = (
         db.query(Escalation)
         .filter(Escalation.assigned_to_user_id == user.user_id)
@@ -724,6 +995,7 @@ def assign_escalation(
 def respond_escalation(
     ticket_id: int,
     req: EscalationResponseRequest,
+    background_tasks: BackgroundTasks,
     user: DashboardUser = Depends(require_roles("expert", "admin")),
     db: Session = Depends(get_db),
 ):
@@ -740,12 +1012,25 @@ def respond_escalation(
     esc.status = "answered"
     esc.updated_at = datetime.utcnow()
     db.commit()
-    return _escalation_dict(esc, db)
+    callback_report = {"status": "skipped", "reason": "audio_response_not_present"}
+    if not esc.expert_audio_path:
+        callback_report = _queue_or_trigger_expert_response_call(
+            esc,
+            db,
+            background_tasks,
+            response_text=req.answer,
+        )
+        if callback_report.get("status") == "failed":
+            print(f"[EXPERT CALLBACK] text response call failed: {callback_report}")
+    out = _escalation_dict(esc, db)
+    out["expert_callback"] = callback_report
+    return out
 
 
 @router.post("/escalations/{ticket_id}/audio-response")
 async def upload_expert_audio(
     ticket_id: int,
+    background_tasks: BackgroundTasks,
     audio_file: UploadFile = File(...),
     user: DashboardUser = Depends(require_roles("expert", "admin")),
     db: Session = Depends(get_db),
@@ -762,18 +1047,47 @@ async def upload_expert_audio(
     filename = f"esc_{ticket_id}_{uuid.uuid4().hex[:8]}.wav"
     file_path = os.path.join(recordings_dir, filename)
 
+    raw_path = f"{file_path}.upload"
     content = await audio_file.read()
-    with open(file_path, "wb") as f:
+    with open(raw_path, "wb") as f:
         f.write(content)
 
-    # Optional: Upload to S3 if enabled
+    try:
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                raw_path,
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-sample_fmt",
+                "s16",
+                file_path,
+            ],
+            check=True,
+        )
+    except Exception as exc:
+        print(f"[EXPERT AUDIO] ffmpeg normalization failed, keeping raw upload: {exc}")
+        os.replace(raw_path, file_path)
+    else:
+        try:
+            os.remove(raw_path)
+        except OSError:
+            pass
+
+    # Optional: Upload to S3 as a backup, but keep the shared local WAV path in
+    # the DB so the VAD service can play it during the farmer's next call.
     final_path = file_path
     if s3_enabled():
         from s3_client import upload_file as s3_upload
         try:
-            s3_ref = s3_upload(file_path, f"expert_responses/{filename}", content_type="audio/wav")
-            if s3_ref:
-                final_path = s3_ref
+            s3_upload(file_path, f"expert_responses/{filename}", content_type="audio/wav")
         except Exception as exc:
             print(f"[EXPERT AUDIO] S3 upload failed, keeping local: {exc}")
 
@@ -782,7 +1096,17 @@ async def upload_expert_audio(
     esc.status = "answered"
     esc.updated_at = datetime.utcnow()
     db.commit()
-    return _escalation_dict(esc, db)
+    callback_report = _queue_or_trigger_expert_response_call(
+        esc,
+        db,
+        background_tasks,
+        audio_path=final_path,
+    )
+    if callback_report.get("status") == "failed":
+        print(f"[EXPERT CALLBACK] audio response call failed: {callback_report}")
+    out = _escalation_dict(esc, db)
+    out["expert_callback"] = callback_report
+    return out
 
 
 @router.get("/escalations/{ticket_id}/audio")
@@ -904,12 +1228,117 @@ def delete_market_price(
 # ──────────────────────────────────────────────────────────────────────────────
 # Alerts
 # ──────────────────────────────────────────────────────────────────────────────
+def _farmers_for_alert_region(db: Session, target_region: str) -> list[dict]:
+    target = _normalize_region(target_region)
+    rows = (
+        db.query(Caller, FarmerProfilePG, FarmerKB)
+        .outerjoin(FarmerProfilePG, FarmerProfilePG.caller_id == Caller.caller_id)
+        .outerjoin(FarmerKB, FarmerKB.phone_number == Caller.phone_number)
+        .all()
+    )
+    out: list[dict] = []
+    seen: set[str] = set()
+    for caller, pg_profile, kb_profile in rows:
+        phone = (caller.phone_number or "").strip()
+        if not phone or phone in seen:
+            continue
+        locations = [
+            getattr(pg_profile, "location", None),
+            getattr(kb_profile, "location", None),
+        ]
+        if target not in {"", "all"} and not any(
+            target in _normalize_region(loc) for loc in locations if loc
+        ):
+            continue
+        seen.add(phone)
+        out.append(
+            {
+                "phone_number": phone,
+                "name": caller.full_name,
+                "location": next((loc for loc in locations if loc), None),
+            }
+        )
+    return out
+
+
+def _request_alert_call(
+    *,
+    alert_id: int,
+    phone_number: str,
+    target_region: str,
+    alert_message: str,
+    severity: str,
+) -> tuple[str, Optional[str], Optional[str]]:
+    phone_gateway_url = (
+        os.getenv("PHONE_GATEWAY_ALERT_CALL_URL")
+        or os.getenv("PHONE_GATEWAY_URL", "http://phone-gateway:8000")
+    ).rstrip("/")
+    if phone_gateway_url.endswith("/health"):
+        phone_gateway_url = phone_gateway_url[: -len("/health")]
+    try:
+        response = requests.post(
+            f"{phone_gateway_url}/api/alerts/call",
+            json={
+                "alert_id": alert_id,
+                "phone_number": phone_number,
+                "target_region": target_region,
+                "alert_message": alert_message,
+                "severity": severity,
+            },
+            timeout=8,
+        )
+        if response.status_code >= 400:
+            return "failed", None, response.text[:500]
+        payload = response.json()
+        return str(payload.get("status") or "queued"), payload.get("call_id"), None
+    except Exception as exc:
+        return "failed", None, str(exc)
+
+
+def _enqueue_alert_calls(db: Session, alert: Alert) -> dict:
+    recipients = _farmers_for_alert_region(db, alert.target_region)
+    max_recipients = int(os.getenv("ALERT_CALL_MAX_RECIPIENTS", "50") or "50")
+    recipients = recipients[: max(0, max_recipients)]
+    queued = 0
+    failed = 0
+    for recipient in recipients:
+        status, provider_ref, error = _request_alert_call(
+            alert_id=alert.id,
+            phone_number=recipient["phone_number"],
+            target_region=alert.target_region,
+            alert_message=alert.alert_message,
+            severity=alert.severity,
+        )
+        row = AlertCallNotification(
+            alert_id=alert.id,
+            phone_number=recipient["phone_number"],
+            target_region=recipient.get("location") or alert.target_region,
+            status=status,
+            provider_ref=provider_ref,
+            error=error,
+        )
+        db.add(row)
+        if status in {"queued", "calling", "sent", "scheduled"}:
+            queued += 1
+        else:
+            failed += 1
+    return {"recipients": len(recipients), "queued": queued, "failed": failed}
+
+
 @router.get("/alerts")
 def list_alerts(
     _: DashboardUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     rows = db.query(Alert).order_by(desc(Alert.created_at)).limit(200).all()
+    counts = dict(
+        db.query(
+            AlertCallNotification.alert_id,
+            func.count(AlertCallNotification.id),
+        )
+        .group_by(AlertCallNotification.alert_id)
+        .all()
+    )
     return [
         {
             "id": r.id,
@@ -920,6 +1349,7 @@ def list_alerts(
             "scheduled_at": _isoformat(r.scheduled_at),
             "published_at": _isoformat(r.published_at),
             "created_at": _isoformat(r.created_at),
+            "call_notification_count": int(counts.get(r.id, 0)),
         }
         for r in rows
     ]
@@ -931,19 +1361,22 @@ def create_alert_endpoint(
     user: DashboardUser = Depends(require_roles("admin", "da")),
     db: Session = Depends(get_db),
 ):
-    db.add(
-        Alert(
-            target_region=req.target_region,
-            alert_message=req.alert_message,
-            severity=req.severity,
-            category=req.category,
-            scheduled_at=req.scheduled_at,
-            published_at=datetime.utcnow() if not req.scheduled_at else None,
-            created_by=user.user_id,
-        )
+    alert = Alert(
+        target_region=req.target_region,
+        alert_message=req.alert_message,
+        severity=req.severity,
+        category=req.category,
+        scheduled_at=req.scheduled_at,
+        published_at=datetime.utcnow() if not req.scheduled_at else None,
+        created_by=user.user_id,
     )
+    db.add(alert)
+    db.flush()
+    call_report = {"recipients": 0, "queued": 0, "failed": 0}
+    if req.notify_by_call and not req.scheduled_at:
+        call_report = _enqueue_alert_calls(db, alert)
     db.commit()
-    return {"status": "ok"}
+    return {"status": "ok", "id": alert.id, "call_notifications": call_report}
 
 
 @router.delete("/alerts/{alert_id}")
@@ -961,19 +1394,77 @@ def delete_alert(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Knowledge Base — raw Chroma intents (legacy)
+# Knowledge Base — legacy Chroma entries + active RAG pgvector documents
 # ──────────────────────────────────────────────────────────────────────────────
 @router.get("/kb")
-def list_kb(_: DashboardUser = Depends(get_current_user)):
-    if collection.count() == 0:
-        return []
-    result = collection.get(include=["documents", "metadatas"])
-    return [
-        {"id": doc_id, "intent": meta.get("intent", ""), "response": doc}
-        for doc_id, doc, meta in zip(
-            result["ids"], result["documents"], result["metadatas"]
+def list_kb(
+    _: DashboardUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    entries: list[dict] = []
+
+    # Active RAG store: this is what /rag/answer retrieves from.
+    try:
+        rows = db.execute(
+            text(
+                """
+                SELECT
+                  d.id::text,
+                  COALESCE(d.title, d.original_filename, d.external_document_id, d.id::text) AS title,
+                  d.original_filename,
+                  d.source_org,
+                  d.status,
+                  d.updated_at,
+                  COUNT(c.chunk_index) AS chunk_count,
+                  LEFT(MIN(c.content), 500) AS sample_content
+                FROM rag_kb_documents d
+                LEFT JOIN rag_kb_chunks c ON c.document_id = d.id
+                GROUP BY d.id, d.title, d.original_filename, d.external_document_id,
+                         d.source_org, d.status, d.updated_at
+                ORDER BY d.updated_at DESC NULLS LAST, title
+                LIMIT 1000;
+                """
+            )
+        ).mappings().all()
+        entries.extend(
+            {
+                "id": f"rag:{row['id']}",
+                "intent": row["title"],
+                "title": row["title"],
+                "category": row["source_org"] or "rag_pgvector",
+                "response": row["sample_content"] or "",
+                "content": row["sample_content"] or "",
+                "source": "rag_pgvector",
+                "filename": row["original_filename"],
+                "status": row["status"],
+                "chunk_count": int(row["chunk_count"] or 0),
+                "updated_at": _isoformat(row["updated_at"]),
+            }
+            for row in rows
         )
-    ]
+    except Exception as exc:
+        print(f"[KB] active RAG pgvector list skipped: {exc}")
+
+    # Legacy/manual Chroma entries: small hand-authored intent responses.
+    try:
+        if collection.count() > 0:
+            result = collection.get(include=["documents", "metadatas"])
+            entries.extend(
+                {
+                    "id": f"chroma:{doc_id}",
+                    "intent": meta.get("intent", ""),
+                    "response": doc,
+                    "content": doc,
+                    "source": "legacy_chroma",
+                }
+                for doc_id, doc, meta in zip(
+                    result["ids"], result["documents"], result["metadatas"]
+                )
+            )
+    except Exception as exc:
+        print(f"[KB] legacy Chroma list skipped: {exc}")
+
+    return entries
 
 
 @router.post("/kb")
@@ -995,6 +1486,13 @@ def delete_kb(
     entry_id: str,
     _: DashboardUser = Depends(require_roles("admin")),
 ):
+    if entry_id.startswith("rag:"):
+        raise HTTPException(
+            status_code=400,
+            detail="RAG pgvector documents are managed from Knowledge Documents, not this legacy delete action.",
+        )
+    if entry_id.startswith("chroma:"):
+        entry_id = entry_id[len("chroma:"):]
     try:
         collection.delete(ids=[entry_id])
         return {"status": "ok"}

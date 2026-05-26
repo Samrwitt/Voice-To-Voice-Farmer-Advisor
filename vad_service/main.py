@@ -11,6 +11,7 @@ from vad_engine import SileroStreamingVAD
 from asr_client import transcribe_utterance_file
 from rag_client import get_rag_answer
 from tts_client import synthesize_speech
+from voice_flow import classify_confirmation_reply_from_asr, should_synthesize_as_single_chunk
 
 
 app = FastAPI(title="Silero VAD Service")
@@ -21,10 +22,12 @@ app = FastAPI(title="Silero VAD Service")
 # ============================================================
 
 MAX_CONCURRENT_ASR = int(os.getenv("MAX_CONCURRENT_ASR", "2"))
-VAD_THRESHOLD = float(os.getenv("VAD_THRESHOLD", "0.85"))
+VAD_THRESHOLD = float(os.getenv("VAD_THRESHOLD", "0.55"))
+VAD_ENERGY_THRESHOLD = float(os.getenv("VAD_ENERGY_THRESHOLD", "0.012"))
 VAD_MIN_SPEECH_MS = int(os.getenv("VAD_MIN_SPEECH_MS", "400"))
-VAD_TTS_MAX_SENTENCES = int(os.getenv("VAD_TTS_MAX_SENTENCES", "1"))
-VAD_TTS_MAX_CHARS = int(os.getenv("VAD_TTS_MAX_CHARS", "220"))
+VAD_END_SILENCE_MS = int(os.getenv("VAD_END_SILENCE_MS", "900"))
+VAD_TTS_MAX_SENTENCES = int(os.getenv("VAD_TTS_MAX_SENTENCES", "0"))
+VAD_TTS_MAX_CHARS = int(os.getenv("VAD_TTS_MAX_CHARS", "0"))
 VAD_AUDIO_LOG_EVERY = int(os.getenv("VAD_AUDIO_LOG_EVERY", "0"))
 ASR_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_ASR)
 PLAYBACK_LOCK = asyncio.Lock()
@@ -40,6 +43,8 @@ def health_check():
         "status": "ok",
         "service": "silero-vad-service",
         "max_concurrent_asr": MAX_CONCURRENT_ASR,
+        "vad_threshold": VAD_THRESHOLD,
+        "vad_energy_threshold": VAD_ENERGY_THRESHOLD,
     }
 
 
@@ -70,6 +75,9 @@ async def safe_send(
 class SessionState:
     def __init__(self):
         self.playback_task = None
+        self.pending_confirmation_transcript = None
+        self.pending_confirmation_asr_meta = None
+        self.pending_confirmation_utterance_path = None
 
 
 def split_tts_sentences(text: str) -> list[str]:
@@ -81,7 +89,7 @@ def split_tts_sentences(text: str) -> list[str]:
 
 
 def compact_voice_tts_text(text: str) -> str:
-    """Keep spoken answers short so phone calls do not wait on many TTS calls."""
+    """Normalize RAG text for speech without changing the answer by default."""
     normalized = re.sub(r"\s+", " ", (text or "")).strip()
     if not normalized:
         return ""
@@ -138,7 +146,10 @@ async def play_advisor_response(
             )
             # ── Sentence-level Streaming ──
             # Split by Amharic and common sentence delimiters
-            sentences = split_tts_sentences(spoken_answer)
+            if should_synthesize_as_single_chunk(spoken_answer):
+                sentences = [spoken_answer]
+            else:
+                sentences = split_tts_sentences(spoken_answer)
             
             print(f"[STREAMING] Total sentences: {len(sentences)}", flush=True)
             
@@ -211,6 +222,63 @@ async def play_advisor_response(
         except Exception as e:
             print(f"[PLAYBACK ERROR] session={session_id}, error={e}", flush=True)
 
+
+async def play_recorded_expert_response(
+    websocket: WebSocket,
+    send_lock: asyncio.Lock,
+    session_id: str,
+    audio_path: str,
+    playback_sample_rate: int = 16000,
+) -> bool:
+    """Stream a DA/expert recorded WAV answer back into the active call."""
+    path = (audio_path or "").strip()
+    if not path or path.startswith("s3://") or not os.path.exists(path):
+        print(f"[EXPERT AUDIO SKIPPED] session={session_id}, path={path}", flush=True)
+        return False
+
+    async with PLAYBACK_LOCK:
+        try:
+            import wave
+
+            print(f"[EXPERT AUDIO START] session={session_id}, path={path}", flush=True)
+            with wave.open(path, "rb") as wf:
+                source_sample_rate = wf.getframerate()
+                channels = wf.getnchannels()
+                sample_width = wf.getsampwidth()
+                frames_per_chunk = max(1, source_sample_rate // 50)
+                rate_state = None
+                data = wf.readframes(frames_per_chunk)
+                while data:
+                    if sample_width != 2:
+                        data = audioop.lin2lin(data, sample_width, 2)
+
+                    if channels == 2:
+                        data = audioop.tomono(data, 2, 0.5, 0.5)
+                    elif channels != 1:
+                        raise ValueError(f"Unsupported expert audio channel count: {channels}")
+
+                    if source_sample_rate != playback_sample_rate:
+                        data, rate_state = audioop.ratecv(
+                            data,
+                            2,
+                            1,
+                            source_sample_rate,
+                            playback_sample_rate,
+                            rate_state,
+                        )
+
+                    sent = await safe_send(websocket, send_lock, data)
+                    if not sent:
+                        return False
+
+                    await asyncio.sleep(len(data) / (2 * playback_sample_rate))
+                    data = wf.readframes(frames_per_chunk)
+            print(f"[EXPERT AUDIO DONE] session={session_id}", flush=True)
+            return True
+        except Exception as e:
+            print(f"[EXPERT AUDIO ERROR] session={session_id}, error={e}", flush=True)
+            return False
+
 # ============================================================
 # ASR / RAG Handling
 # ============================================================
@@ -271,8 +339,11 @@ async def handle_completed_utterance(
                 "utterance_path": utterance_path,
                 "transcript": asr_result.get("transcript"),
                 "transcript_raw": asr_result.get("raw_transcript"),
+                "structured_transcript": asr_result.get("structured_transcript"),
                 "transcript_fix_backend": asr_result.get("transcript_fix_backend"),
                 "confidence": asr_result.get("confidence"),
+                "acoustic_confidence": asr_result.get("acoustic_confidence"),
+                "fuzzy": asr_result.get("fuzzy"),
                 "engine": asr_result.get("engine"),
                 "audio_id": asr_result.get("audio_id"),
                 "needs_confirmation": asr_result.get("needs_confirmation"),
@@ -296,6 +367,116 @@ async def handle_completed_utterance(
         if not transcript:
             return
 
+        confirmed_pending_transcript = False
+        pending_transcript = session_state.pending_confirmation_transcript
+        if pending_transcript:
+            confirmation_reply = classify_confirmation_reply_from_asr(asr_result)
+            if confirmation_reply == "yes":
+                transcript = pending_transcript
+                confirmed_pending_transcript = True
+                pending_meta = session_state.pending_confirmation_asr_meta or {}
+                print(
+                    f"[ASR CONFIRMED] session={session_id}, transcript={transcript!r}",
+                    flush=True,
+                )
+                session_state.pending_confirmation_transcript = None
+                session_state.pending_confirmation_asr_meta = None
+                session_state.pending_confirmation_utterance_path = None
+                asr_result = {
+                    **pending_meta,
+                    "transcript": pending_transcript,
+                    "text": pending_transcript,
+                    "final_transcript": pending_transcript,
+                    "structured_transcript": pending_transcript,
+                    "needs_confirmation": False,
+                    "confirmation_reply": "yes",
+                }
+            elif confirmation_reply == "no":
+                session_state.pending_confirmation_transcript = None
+                session_state.pending_confirmation_asr_meta = None
+                session_state.pending_confirmation_utterance_path = None
+                rag_answer = "እሺ፣ እባክዎን ጥያቄዎን በግልጽ እንደገና ይናገሩ።"
+                print(
+                    f"[ASR CONFIRMATION REJECTED] session={session_id}, reply={transcript!r}",
+                    flush=True,
+                )
+                await safe_send(
+                    websocket,
+                    send_lock,
+                    {
+                        "event": "rag_answer",
+                        "session_id": session_id,
+                        "utterance_path": utterance_path,
+                        "response": rag_answer,
+                        "references": [],
+                        "trust": {"grounding": "asr_confirmation"},
+                        "meta": {"reason": "asr_confirmation_rejected"},
+                        "message": "ASR confirmation rejected; asking user to repeat",
+                    },
+                )
+                await safe_send(
+                    websocket,
+                    send_lock,
+                    {
+                        "event": "tts_started",
+                        "session_id": session_id,
+                        "utterance_path": utterance_path,
+                        "message": "Synthesizing voice response...",
+                    },
+                )
+                session_state.playback_task = asyncio.create_task(
+                    play_advisor_response(
+                        websocket=websocket,
+                        send_lock=send_lock,
+                        session_id=session_id,
+                        utterance_path=utterance_path,
+                        rag_answer=rag_answer,
+                        playback_sample_rate=playback_sample_rate,
+                    )
+                )
+                return
+            else:
+                rag_answer = "ይቅርታ፣ ማረጋገጫዎን አልተረዳሁም። እባክዎ አዎ ወይም አይ ብቻ ይበሉ።"
+                print(
+                    f"[ASR CONFIRMATION UNCLEAR] session={session_id}, reply={transcript!r}",
+                    flush=True,
+                )
+                await safe_send(
+                    websocket,
+                    send_lock,
+                    {
+                        "event": "rag_answer",
+                        "session_id": session_id,
+                        "utterance_path": utterance_path,
+                        "response": rag_answer,
+                        "references": [],
+                        "trust": {"grounding": "asr_confirmation"},
+                        "meta": {"reason": "asr_confirmation_unclear"},
+                        "message": "ASR confirmation reply was unclear",
+                    },
+                )
+                await safe_send(
+                    websocket,
+                    send_lock,
+                    {
+                        "event": "tts_started",
+                        "session_id": session_id,
+                        "utterance_path": utterance_path,
+                        "message": "Synthesizing voice response...",
+                    },
+                )
+                session_state.playback_task = asyncio.create_task(
+                    play_advisor_response(
+                        websocket=websocket,
+                        send_lock=send_lock,
+                        session_id=session_id,
+                        utterance_path=utterance_path,
+                        rag_answer=rag_answer,
+                        playback_sample_rate=playback_sample_rate,
+                    )
+                )
+                return
+
         from transcript_quality import GIBBERISH_REPLY_AM, is_asr_gibberish
 
         conf = asr_result.get("confidence")
@@ -303,7 +484,7 @@ async def handle_completed_utterance(
             conf_f = float(conf) if conf is not None else None
         except (TypeError, ValueError):
             conf_f = None
-        if is_asr_gibberish(transcript, conf_f):
+        if not confirmed_pending_transcript and is_asr_gibberish(transcript, conf_f):
             rag_answer = GIBBERISH_REPLY_AM
             print(
                 f"[ASR GIBBERISH] session={session_id}, transcript={transcript!r}, conf={conf_f}",
@@ -347,7 +528,24 @@ async def handle_completed_utterance(
             os.getenv("VAD_ASR_CONFIRMATION_GATE", "1").strip().lower()
             in ("1", "true", "yes", "on")
             and asr_result.get("needs_confirmation")
+            and not confirmed_pending_transcript
         ):
+            session_state.pending_confirmation_transcript = transcript
+            session_state.pending_confirmation_asr_meta = {
+                "raw_transcript": asr_result.get("raw_transcript"),
+                "final_transcript": asr_result.get("final_transcript"),
+                "structured_transcript": asr_result.get("structured_transcript"),
+                "confidence": asr_result.get("confidence"),
+                "acoustic_confidence": asr_result.get("acoustic_confidence"),
+                "fuzzy": asr_result.get("fuzzy"),
+                "transcript_fix_backend": asr_result.get("transcript_fix_backend"),
+                "needs_confirmation": asr_result.get("needs_confirmation"),
+                "confirmation_prompt": asr_result.get("confirmation_prompt"),
+                "unusual_words": asr_result.get("unusual_words"),
+                "engine": asr_result.get("engine"),
+                "audio_id": asr_result.get("audio_id"),
+            }
+            session_state.pending_confirmation_utterance_path = utterance_path
             rag_answer = (
                 asr_result.get("confirmation_prompt")
                 or f"የሰማሁት ይህ ነው፦ {transcript}። ትክክል ነው?"
@@ -410,7 +608,10 @@ async def handle_completed_utterance(
             asr_meta={
                 "raw_transcript": asr_result.get("raw_transcript"),
                 "final_transcript": asr_result.get("final_transcript"),
+                "structured_transcript": asr_result.get("structured_transcript"),
                 "confidence": asr_result.get("confidence"),
+                "acoustic_confidence": asr_result.get("acoustic_confidence"),
+                "fuzzy": asr_result.get("fuzzy"),
                 "transcript_fix_backend": asr_result.get("transcript_fix_backend"),
                 "needs_confirmation": asr_result.get("needs_confirmation"),
                 "confirmation_prompt": asr_result.get("confirmation_prompt"),
@@ -421,6 +622,10 @@ async def handle_completed_utterance(
         )
 
         rag_answer = rag_result.get("response")
+        expert_delivery = rag_result.get("expert_delivery") if isinstance(rag_result, dict) else None
+        expert_audio_path = ""
+        if isinstance(expert_delivery, dict):
+            expert_audio_path = str(expert_delivery.get("audio_path") or "").strip()
 
         await safe_send(
             websocket,
@@ -445,9 +650,36 @@ async def handle_completed_utterance(
             flush=True,
         )
 
+        # ── Expert Recorded Audio Step ───────────────────────────────────────
+        # If an asynchronously answered escalation has a voice recording, play
+        # the expert's real audio first, then continue with the current answer.
+        played_expert_audio = False
+        if expert_audio_path:
+            await safe_send(
+                websocket,
+                send_lock,
+                {
+                    "event": "expert_audio_started",
+                    "session_id": session_id,
+                    "utterance_path": utterance_path,
+                    "message": "Playing recorded expert response...",
+                },
+            )
+            played_expert_audio = await play_recorded_expert_response(
+                websocket=websocket,
+                send_lock=send_lock,
+                session_id=session_id,
+                audio_path=expert_audio_path,
+                playback_sample_rate=playback_sample_rate,
+            )
+
         # ── TTS Step ─────────────────────────────────────────────────────────
         if not rag_answer:
             return
+        if played_expert_audio:
+            rag_answer = (rag_result.get("current_response") or "").strip()
+            if not rag_answer:
+                return
 
         await safe_send(
             websocket,
@@ -569,8 +801,9 @@ async def vad_websocket(
         session_id=session_id,
         sample_rate=sample_rate,
         threshold=VAD_THRESHOLD,
+        energy_threshold=VAD_ENERGY_THRESHOLD,
         min_speech_start_ms=VAD_MIN_SPEECH_MS,
-        speech_end_silence_ms=900,
+        speech_end_silence_ms=VAD_END_SILENCE_MS,
         speech_pad_ms=200,
         output_dir=output_dir,
     )
@@ -635,6 +868,7 @@ async def vad_websocket(
                             "utterance_path": utterance_path,
                             "duration_seconds": event.get("duration_seconds"),
                             "speech_probability": event.get("speech_probability"),
+                            "rms_energy": event.get("rms_energy"),
                         },
                     )
 

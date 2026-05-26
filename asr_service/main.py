@@ -397,15 +397,16 @@ from engine import create_asr_engine
 from audio_utils import save_upload_file, prepare_audio_for_asr
 from config import SHARED_UTTERANCES_DIR, ASR_ENGINE
 from postprocess import postprocess_asr_transcript
-from hosted_llm_fix import (
-    hosted_fix_enabled,
-    groq_keys,
-    gemini_keys,
-    free_gemini_keys,
-    shared_gemini_keys,
-    use_shared_gemini_keys_for_asr,
-    _backend_mode,
-)
+# Hosted Groq/Gemini ASR correction is disabled for now to avoid token usage.
+# from hosted_llm_fix import (
+#     hosted_fix_enabled,
+#     groq_keys,
+#     gemini_keys,
+#     free_gemini_keys,
+#     shared_gemini_keys,
+#     use_shared_gemini_keys_for_asr,
+#     _backend_mode,
+# )
 
 
 app = FastAPI(
@@ -495,13 +496,14 @@ def health():
 def fix_status():
     """Whether hosted Groq/Gemini post-ASR correction is active (keys + env)."""
     return {
-        "hosted_fix_enabled": hosted_fix_enabled(),
-        "backend_mode": _backend_mode(),
-        "groq_key_count": len(groq_keys()),
-        "gemini_key_count": len(gemini_keys()),
-        "free_gemini_key_count": len(free_gemini_keys()),
-        "shared_gemini_key_count": len(shared_gemini_keys()),
-        "using_shared_gemini_keys": use_shared_gemini_keys_for_asr(),
+        "hosted_fix_enabled": False,
+        "backend_mode": "disabled",
+        "groq_key_count": 0,
+        "gemini_key_count": 0,
+        "free_gemini_key_count": 0,
+        "shared_gemini_key_count": 0,
+        "using_shared_gemini_keys": False,
+        "note": "Hosted ASR token usage is commented out for now.",
     }
 
 
@@ -522,7 +524,12 @@ def postprocess_text(request: PostprocessTextRequest):
         "semantic_corrected_transcript": p.get("semantic_corrected"),
         "transcript_fix_backend": p.get("transcript_fix_backend"),
         "final_transcript": p["final"],
+        "structured_transcript": p["structured_transcript"],
         "transcript": p["final"],
+        "confidence": p["confidence"],
+        "fuzzy": p.get("fuzzy") or {},
+        "needs_confirmation": p["needs_confirmation"],
+        "confirmation_prompt": p["confirmation_prompt"],
     }
 
 

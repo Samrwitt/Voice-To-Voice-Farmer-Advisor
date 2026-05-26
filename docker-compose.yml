@@ -80,6 +80,8 @@ services:
       CALL_RECORDING_RETENTION_DAYS: "30"
       RAG_AGROCHEM_EXPERT_ONLY: "1"
       RAG_VOICE_LOW_CONF_ESCALATE: "1"
+      RAG_ESCALATE_OUT_OF_DOMAIN: "1"
+      RAG_OUT_OF_DOMAIN_NLU_CONFIDENCE: "0.35"
       RAG_RESPONSE_CACHE_TTL_SEC: "120"
       RAG_RESPONSE_CACHE_MAX: "512"
       RAG_SMART_PIPELINE: ${RAG_SMART_PIPELINE:-1}
@@ -120,7 +122,17 @@ services:
       SIP_AUDIOSOCKET_HOST: 0.0.0.0
       SIP_AUDIOSOCKET_PORT: "9092"
       SIP_AUDIOSOCKET_SAMPLE_RATE: "8000"
+      SIP_ALERT_AUDIOSOCKET_ENABLED: "true"
+      SIP_ALERT_AUDIOSOCKET_PORT: "9093"
+      SIP_ALERT_AUDIOSOCKET_CONNECT_HOST: phone-gateway
+      ASTERISK_AMI_HOST: sip-gateway
+      ASTERISK_AMI_PORT: "5038"
+      ASTERISK_AMI_USERNAME: ${ASTERISK_AMI_USERNAME:-farmer_admin}
+      ASTERISK_AMI_PASSWORD: ${ASTERISK_AMI_PASSWORD:-farmer_admin_dev}
+      SIP_ALERT_DEFAULT_ENDPOINT: ${SIP_ALERT_DEFAULT_ENDPOINT:-farmeruhamayohannes}
       SIP_PLAY_OPENING_GREETING: "true"
+      SIP_DEFAULT_CALLER_PHONE_NUMBER: "sip:farmeruhamayohannes"
+      SIP_DEFAULT_CALLER_NAME: "Ruhama SIP Farmer"
       SIP_AUDIO_LOG_EVERY: "0"
       SIP_EVENT_LOGS: "1"
       S3_ENDPOINT_URL: http://minio:9000
@@ -138,9 +150,11 @@ services:
       - "8000:8000"
     expose:
       - "9092"
+      - "9093"
     volumes:
       - call_recordings:/app/recordings
       - vad_utterances:/app/utterances:ro
+      - logic_data:/app/data:ro
 
   sip-gateway:
     build:
@@ -154,6 +168,8 @@ services:
       - "5062:5060/udp"
       - "5062:5060/tcp"
       - "10000-10050:10000-10050/udp"
+    expose:
+      - "5038"
 
   pgadmin:
     image: dpage/pgadmin4
@@ -186,12 +202,18 @@ services:
       RAG_SERVICE_URL: http://rag-service:8000
       TTS_SERVICE_URL: http://tts-service:8009
       VAD_UTTERANCES_DIR: /app/utterances
-      VAD_TTS_MAX_SENTENCES: "1"
-      VAD_TTS_MAX_CHARS: "220"
+      VAD_THRESHOLD: "0.55"
+      VAD_ENERGY_THRESHOLD: "0.012"
+      VAD_MIN_SPEECH_MS: "240"
+      VAD_END_SILENCE_MS: "900"
+      VAD_TTS_MAX_SENTENCES: "0"
+      VAD_TTS_MAX_CHARS: "0"
+      VAD_TTS_SINGLE_CHUNK_MAX_CHARS: "180"
       VAD_AUDIO_LOG_EVERY: "0"
       MAX_CONCURRENT_ASR: 2
     volumes:
       - vad_utterances:/app/utterances
+      - logic_data:/app/data:ro
 
   asr-service:
     build:
@@ -204,25 +226,36 @@ services:
       ASR_ENGINE: ${ASR_ENGINE:-whisper_local}
       ASR_MODEL_PATH: ${ASR_MODEL_PATH:-/models/asr/whisper-small-amharic-bdu-8khz-aug-ct2-fp16}
       SHARED_UTTERANCES_DIR: /shared/utterances
-      ASR_HOSTED_LLM_FIX: ${ASR_HOSTED_LLM_FIX:-auto}
-      ASR_LLM_FIX_BACKEND: ${ASR_LLM_FIX_BACKEND:-gemini}
-      GROQ_API_KEYS: ${GROQ_API_KEYS:-}
-      GROQ_API_KEY: ${GROQ_API_KEY:-}
-      FREE_GEMINI_API_KEYS: ${FREE_GEMINI_API_KEYS:-}
-      FREE_GEMINI_API_KEY: ${FREE_GEMINI_API_KEY:-}
-      GEMINI_API_KEYS: ${GEMINI_API_KEYS:-}
-      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
-      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
-      ASR_USE_SHARED_GEMINI_KEYS: ${ASR_USE_SHARED_GEMINI_KEYS:-0}
-      ASR_LLM_FIX_MAX_KEYS_PER_REQUEST: ${ASR_LLM_FIX_MAX_KEYS_PER_REQUEST:-1}
+      ASR_HOSTED_LLM_FIX: "0"
+      # ASR hosted-token correction is commented out for now.
+      # ASR_LLM_FIX_BACKEND: ${ASR_LLM_FIX_BACKEND:-gemini}
+      # GROQ_API_KEYS: ${GROQ_API_KEYS:-}
+      # GROQ_API_KEY: ${GROQ_API_KEY:-}
+      # FREE_GEMINI_API_KEYS: ${FREE_GEMINI_API_KEYS:-}
+      # FREE_GEMINI_API_KEY: ${FREE_GEMINI_API_KEY:-}
+      # GEMINI_API_KEYS: ${GEMINI_API_KEYS:-}
+      # GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      # GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      # ASR_USE_SHARED_GEMINI_KEYS: ${ASR_USE_SHARED_GEMINI_KEYS:-0}
+      # ASR_LLM_FIX_MAX_KEYS_PER_REQUEST: ${ASR_LLM_FIX_MAX_KEYS_PER_REQUEST:-1}
       ASR_USE_OLLAMA: ${ASR_USE_OLLAMA:-false}
       OLLAMA_URL: http://ollama:11434
       OLLAMA_MODEL: qwen2.5:7b
+      ASR_DOMAIN_TERMS_PATHS: /app/RAG/KB,/app/kb_documents/amharic
+      ASR_DOMAIN_TERMS_MAX_FILES: "160"
+      ASR_DOMAIN_TERMS_MAX_TERMS: "1800"
+      ASR_DOMAIN_TERM_FUZZY_THRESHOLD: "84"
+      ASR_CONFIRMATION_MIN_WORDS: "3"
+      ASR_CONFIRMATION_UNUSUAL_RATIO: "0.55"
+      ASR_CONFIRMATION_MIN_UNUSUAL_WORDS: "2"
+      ASR_CONFIRMATION_MIN_CONFIDENCE: "0.68"
     depends_on:
       - ollama
     volumes:
       - vad_utterances:/shared/utterances:ro
       - ./models/asr:/models/asr
+      - ./RAG:/app/RAG:ro
+      - ./kb_documents:/app/kb_documents:ro
 
   ollama:
     image: ollama/ollama:latest
@@ -320,6 +353,12 @@ services:
       ASR_HEALTH_URL: "http://asr-service:8001/docs"
       TTS_HEALTH_URL: "http://tts-service:8000/docs"
       PHONE_GATEWAY_URL: "http://phone-gateway:8000/health"
+      PHONE_GATEWAY_ALERT_CALL_URL: "http://phone-gateway:8000"
+      PHONE_GATEWAY_EXPERT_CALLBACK_URL: "http://phone-gateway:8000"
+      EXPERT_RESPONSE_CALL_ENABLED: "1"
+      EXPERT_RESPONSE_CALLBACK_WAIT_SECONDS: "300"
+      EXPERT_RESPONSE_CALLBACK_POLL_SECONDS: "5"
+      ALERT_CALL_MAX_RECIPIENTS: ${ALERT_CALL_MAX_RECIPIENTS:-50}
       RAG_SERVICE_URL: "http://rag-service:8000"
       ESCALATION_SLA_HOURS: "48"
       S3_ENDPOINT_URL: http://minio:9000
@@ -327,10 +366,12 @@ services:
       S3_REGION: us-east-1
       S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID}
       S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY}
+      S3_BUCKET: farmer-advisor-media
 
       DATA_DIR: "/app/data"
     volumes:
       - logic_data:/app/data
+      - call_recordings:/app/recordings:ro
       - ./models:/models
 
 volumes:

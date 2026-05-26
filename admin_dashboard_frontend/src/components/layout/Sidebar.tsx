@@ -13,7 +13,6 @@ import {
   ShieldCheck,
   Activity,
   BarChart2,
-  FileText,
 } from 'lucide-react';
 
 import type { UserRole } from '@/types';
@@ -29,9 +28,8 @@ const allNavItems: NavItem[] = [
   { label: 'Dashboard',       path: '/',               icon: <LayoutDashboard size={16} />, roles: ['admin', 'da', 'expert'] },
   { label: 'Users',           path: '/users',          icon: <ShieldCheck size={16} />,     roles: ['admin'] },
   { label: 'Farmer Profiles', path: '/farmers',        icon: <Users size={16} />,           roles: ['admin', 'da'] },
-  { label: 'Call Logs',       path: '/calls',          icon: <PhoneCall size={16} />,       roles: ['admin', 'da'] },
+  { label: 'Call Logs',       path: '/calls',          icon: <PhoneCall size={16} />,       roles: ['admin', 'da', 'expert'] },
   { label: 'Helpdesk',        path: '/helpdesk',       icon: <HeadphonesIcon size={16} />,  roles: ['admin', 'da', 'expert'] },
-  { label: 'KB Documents',    path: '/kb-documents',   icon: <FileText size={16} />,        roles: ['admin'] },
   { label: 'Knowledge Base',  path: '/knowledge-base', icon: <BookOpen size={16} />,        roles: ['admin'] },
   { label: 'Market Prices',   path: '/market-prices',  icon: <TrendingUp size={16} />,      roles: ['admin', 'da'] },
   { label: 'Alerts',          path: '/alerts',         icon: <Bell size={16} />,            roles: ['admin', 'da'] },

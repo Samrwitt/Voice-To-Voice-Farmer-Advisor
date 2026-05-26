@@ -26,6 +26,7 @@ export default function AlertsPage() {
   const [targetRegion, setTargetRegion]   = useState('all');
   const [alertMessage, setAlertMessage]   = useState('');
   const [severity, setSeverity]           = useState<'info' | 'warning' | 'critical'>('warning');
+  const [notifyByCall, setNotifyByCall]   = useState(true);
 
   const showToast = (msg: string) => { setToast(msg); setTimeout(() => setToast(''), 3000); };
 
@@ -44,9 +45,14 @@ export default function AlertsPage() {
     if (!alertMessage.trim()) return;
     setBroadcasting(true);
     try {
-      await createAlert({ target_region: targetRegion, alert_message: alertMessage.trim(), severity });
+      await createAlert({
+        target_region: targetRegion,
+        alert_message: alertMessage.trim(),
+        severity,
+        notify_by_call: notifyByCall,
+      });
       setAlertMessage('');
-      showToast(`Alert broadcast to ${targetRegion === 'all' ? 'all regions' : targetRegion} ✓`);
+      showToast(`Alert broadcast to ${targetRegion === 'all' ? 'all regions' : targetRegion}${notifyByCall ? ' and call notifications queued' : ''} ✓`);
       load();
     } catch (err) {
       showToast(err instanceof Error ? err.message : 'Broadcast failed');
@@ -120,6 +126,21 @@ export default function AlertsPage() {
                   className="w-full p-3 rounded-md border border-slate-300 text-sm focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-green-500 resize-none"
                 />
               </div>
+
+              <label className="flex items-start gap-3 rounded-md border border-slate-200 bg-slate-50 p-3">
+                <input
+                  type="checkbox"
+                  checked={notifyByCall}
+                  onChange={(e) => setNotifyByCall(e.target.checked)}
+                  className="mt-1 h-4 w-4 rounded border-slate-300 text-green-600 focus:ring-green-500"
+                />
+                <span>
+                  <span className="block text-sm font-medium text-slate-700">Call farmers in this region</span>
+                  <span className="block text-xs text-slate-500">
+                    The SIP gateway will place alert calls to matching farmer phone records.
+                  </span>
+                </span>
+              </label>
 
               <button
                 type="submit"
@@ -195,6 +216,7 @@ export default function AlertsPage() {
                   <th className="py-4 px-8 text-xs font-semibold text-slate-500 uppercase tracking-wide">Region</th>
                   <th className="py-4 px-8 text-xs font-semibold text-slate-500 uppercase tracking-wide">Severity</th>
                   <th className="py-4 px-8 text-xs font-semibold text-slate-500 uppercase tracking-wide">Message</th>
+                  <th className="py-4 px-8 text-xs font-semibold text-slate-500 uppercase tracking-wide">Calls</th>
                   <th className="py-4 px-8 text-xs font-semibold text-slate-500 uppercase tracking-wide">Sent At</th>
                 </tr>
               </thead>
@@ -208,13 +230,16 @@ export default function AlertsPage() {
                       </span>
                     </td>
                     <td className="py-4 px-8 text-sm text-slate-600 max-w-sm truncate">{a.alert_message}</td>
+                    <td className="py-4 px-8 text-sm text-slate-600">
+                      {a.call_notification_count ?? 0}
+                    </td>
                     <td className="py-4 px-8 text-sm text-slate-400">
                       {a.created_at ? new Date(a.created_at).toLocaleString() : '—'}
                     </td>
                   </tr>
                 )) : (
                   <tr>
-                    <td colSpan={4} className="py-16 text-center text-sm text-slate-400">
+                    <td colSpan={5} className="py-16 text-center text-sm text-slate-400">
                       No alerts broadcast yet.
                     </td>
                   </tr>

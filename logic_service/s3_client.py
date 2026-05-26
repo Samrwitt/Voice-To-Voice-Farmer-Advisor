@@ -27,7 +27,35 @@ def _client(endpoint=None):
 
 
 def is_enabled() -> bool:
-    return bool(os.getenv("S3_ENDPOINT_URL") and os.getenv("S3_ACCESS_KEY_ID") and os.getenv("S3_SECRET_ACCESS_KEY"))
+    return bool(
+        os.getenv("S3_ENDPOINT_URL")
+        and os.getenv("S3_ACCESS_KEY_ID")
+        and os.getenv("S3_SECRET_ACCESS_KEY")
+        and os.getenv("S3_BUCKET")
+    )
+
+
+def ensure_bucket(bucket: str) -> None:
+    c = _client()
+    try:
+        c.head_bucket(Bucket=bucket)
+    except Exception:
+        c.create_bucket(Bucket=bucket)
+
+
+def upload_file(local_path: str, key: str, content_type: Optional[str] = None) -> str:
+    """Upload local_path to configured S3/MinIO bucket and return s3:// ref."""
+    bucket = os.getenv("S3_BUCKET")
+    if not bucket:
+        raise RuntimeError("S3_BUCKET is not set")
+
+    c = _client()
+    ensure_bucket(bucket)
+    extra = {}
+    if content_type:
+        extra["ContentType"] = content_type
+    c.upload_file(local_path, bucket, key, ExtraArgs=extra or None)
+    return f"s3://{bucket}/{key}"
 
 
 def parse_s3_ref(ref: str) -> Optional[Tuple[str, str]]:

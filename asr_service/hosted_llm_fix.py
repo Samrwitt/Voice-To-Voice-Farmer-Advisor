@@ -182,6 +182,16 @@ def _gemini_model() -> str:
 
 
 def _fix_prompt(raw: str) -> list[dict]:
+    domain_hint = ""
+    try:
+        from domain_terms import get_asr_vocabulary
+
+        terms = get_asr_vocabulary()[:120]
+        if terms:
+            domain_hint = "Likely farmer/KG terms: " + ", ".join(terms) + "\n"
+    except Exception:
+        domain_hint = ""
+
     return [
         {
             "role": "system",
@@ -193,7 +203,7 @@ def _fix_prompt(raw: str) -> list[dict]:
                 "Return ONLY the corrected Amharic text, nothing else."
             ),
         },
-        {"role": "user", "content": f"Raw ASR transcript:\n{raw}\n\nCorrected:"},
+        {"role": "user", "content": f"{domain_hint}Raw ASR transcript:\n{raw}\n\nCorrected:"},
     ]
 
 

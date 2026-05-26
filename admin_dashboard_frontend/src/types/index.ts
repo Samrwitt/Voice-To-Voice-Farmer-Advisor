@@ -106,6 +106,10 @@ export interface KBEntry {
   title?: string;
   category?: string;
   content?: string;
+  source?: 'rag_pgvector' | 'legacy_chroma' | string;
+  filename?: string | null;
+  status?: string | null;
+  chunk_count?: number;
   created_at?: string;
   updated_at?: string;
 }
@@ -154,6 +158,17 @@ export interface EscalationCase {
   assigned_at?: string | null;
   expert_response?: string | null;
   expert_audio_url?: string | null;
+  transcript_messages?: TranscriptMessage[];
+  session_record?: {
+    session_id?: string;
+    status?: string | null;
+    duration_seconds?: number | null;
+    timestamp?: string | null;
+    recording_path?: string | null;
+    audio_url?: string | null;
+  } | null;
+  session_recording_url?: string | null;
+  session_recording_path?: string | null;
   answered_at?: string | null;
   closed_at?: string | null;
   // legacy / mock
@@ -186,6 +201,7 @@ export interface Alert {
   category?: string | null;
   scheduled_at?: string | null;
   published_at?: string | null;
+  call_notification_count?: number;
   created_at: string;
 }
 

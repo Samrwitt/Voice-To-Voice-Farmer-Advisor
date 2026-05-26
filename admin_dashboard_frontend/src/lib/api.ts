@@ -210,6 +210,7 @@ export async function createAlert(
     severity: string;
     category?: string;
     scheduled_at?: string | null;
+    notify_by_call?: boolean;
   },
 ): Promise<void> {
   await request('/alerts', { method: 'POST', body: JSON.stringify(data) });

@@ -452,6 +452,56 @@ def _simple_market_answer(market: dict[str, Any], language: str) -> str:
     )
 
 
+def _dynamic_source_intro(context: dict[str, Any], language: str) -> str:
+    """Build a short voice-friendly source phrase for live tool data."""
+    sources: list[str] = []
+    weather = context.get("weather") or {}
+    soil = context.get("soil") or {}
+    market = context.get("market") or {}
+    web_results = context.get("web_results") or []
+
+    if weather.get("available") and weather.get("source"):
+        sources.append(str(weather["source"]))
+    if soil.get("available") and soil.get("source"):
+        sources.append(str(soil["source"]))
+    if market.get("available"):
+        source = str(market.get("source") or "").strip()
+        if source == "local_database":
+            sources.append("የአካባቢ ገበያ ዳታቤዝ")
+        elif source and source != "mock_demo_data":
+            sources.append(source)
+    if web_results:
+        title = str((web_results[0] or {}).get("title") or "").strip()
+        href = str((web_results[0] or {}).get("href") or "").strip()
+        if title:
+            sources.append(title)
+        elif href:
+            sources.append(href)
+
+    deduped = [s for i, s in enumerate(sources) if s and s not in sources[:i]][:2]
+    if not deduped:
+        return ""
+    joined = " እና ".join(deduped)
+    if language == "am":
+        return f"እንደ {joined} የተገኘው መረጃ፣ "
+    return f"According to {joined}, "
+
+
+def _ensure_spoken_source_reference(answer: str, context: dict[str, Any], language: str) -> str:
+    if os.getenv("RAG_SPOKEN_DYNAMIC_SOURCES", "0").strip().lower() not in ("1", "true", "yes", "on"):
+        return (answer or "").strip()
+
+    text = (answer or "").strip()
+    if not text:
+        return ""
+    intro = _dynamic_source_intro(context, language)
+    if not intro:
+        return text
+    if any(src in text for src in ("Open-Meteo", "SoilGrids", "According to", "እንደ", "ምንጭ")):
+        return text
+    return intro + text[0].lower() + text[1:] if text and language != "am" else intro + text
+
+
 def build_structured_context(
     *,
     question: str,
@@ -561,7 +611,14 @@ def run_smart_advisory(
     # Cheap deterministic path for pure market questions.
     lang = (profile or {}).get("preferred_language") or (profile or {}).get("primary_language") or "am"
     if routed_intent == "market_price" and market.get("available") and not kb and not context.get("web_results"):
-        return SmartResult(_simple_market_answer(market, lang), context, kb, False, tool_trace)
+        answer = _simple_market_answer(market, lang)
+        return SmartResult(
+            _ensure_spoken_source_reference(answer, context, lang),
+            context,
+            kb,
+            False,
+            tool_trace,
+        )
 
     backend = os.getenv("RAG_SMART_FINAL_BACKEND", "gemini").strip().lower()
     if backend not in {"gemini", "groq", "ollama", "openai"}:
@@ -577,5 +634,6 @@ def run_smart_advisory(
     messages = prepare_rag_llm_messages(system, [], user_block, backend)
     answer, used_backend = run_sync_llm(backend, messages, fast=True)
     answer = sanitize_voice_advice(answer, question)
+    answer = _ensure_spoken_source_reference(answer, context, lang)
     tool_trace.append({"tool": "final_llm", "backend": used_backend})
     return SmartResult(answer.strip(), context, kb, True, tool_trace)

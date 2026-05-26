@@ -12,12 +12,13 @@ from typing import Optional
 
 import chromadb
 from chromadb.utils import embedding_functions
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, func, select, text
 
 from db import Base, SessionLocal, engine
 from models import (
     Alert,
     CallRecord,
+    CallSessionPG,
     ConversationMessage,
     DashboardUser,
     Escalation,
@@ -125,7 +126,58 @@ def init_kb():
 # ── Postgres schema bootstrap ────────────────────────────────────────────────
 def init_db():
     """Create all tables defined on the SQLAlchemy Base."""
-    Base.metadata.create_all(bind=engine)
+    ensure_runtime_schema()
+
+
+def ensure_runtime_schema():
+    """Keep existing databases in sync with additive columns used by live services."""
+    try:
+        Base.metadata.create_all(bind=engine)
+        with engine.begin() as conn:
+            # Existing dev databases may have an older, smaller escalations table.
+            # SQLAlchemy create_all() does not add missing columns, so keep this
+            # additive sync aligned with logic_service.models.Escalation.
+            for ddl in (
+                "ALTER TABLE escalations ADD COLUMN IF NOT EXISTS phone_number TEXT;",
+                "ALTER TABLE escalations ADD COLUMN IF NOT EXISTS session_id TEXT;",
+                "ALTER TABLE escalations ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending';",
+                "ALTER TABLE escalations ADD COLUMN IF NOT EXISTS reason_code TEXT;",
+                "ALTER TABLE escalations ADD COLUMN IF NOT EXISTS confidence DOUBLE PRECISION;",
+                "ALTER TABLE escalations ADD COLUMN IF NOT EXISTS entities JSON;",
+                "ALTER TABLE escalations ADD COLUMN IF NOT EXISTS assigned_to_user_id TEXT;",
+                "ALTER TABLE escalations ADD COLUMN IF NOT EXISTS assigned_at TIMESTAMP;",
+                "ALTER TABLE escalations ADD COLUMN IF NOT EXISTS expert_response TEXT;",
+                "ALTER TABLE escalations ADD COLUMN IF NOT EXISTS expert_audio_path VARCHAR;",
+                "ALTER TABLE escalations ADD COLUMN IF NOT EXISTS expert_notes TEXT;",
+                "ALTER TABLE escalations ADD COLUMN IF NOT EXISTS transcript_snapshot TEXT;",
+                "ALTER TABLE escalations ADD COLUMN IF NOT EXISTS session_recording_path VARCHAR;",
+                "ALTER TABLE escalations ADD COLUMN IF NOT EXISTS answered_at TIMESTAMP;",
+                "ALTER TABLE escalations ADD COLUMN IF NOT EXISTS closed_at TIMESTAMP;",
+                "ALTER TABLE escalations ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();",
+                "ALTER TABLE escalations ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();",
+                "CREATE INDEX IF NOT EXISTS idx_escalations_phone_number ON escalations(phone_number);",
+                "CREATE INDEX IF NOT EXISTS idx_escalations_session_id ON escalations(session_id);",
+                "CREATE INDEX IF NOT EXISTS idx_escalations_status ON escalations(status);",
+                """
+                CREATE TABLE IF NOT EXISTS alert_call_notifications (
+                    id SERIAL PRIMARY KEY,
+                    alert_id INTEGER NOT NULL REFERENCES alerts(id) ON DELETE CASCADE,
+                    phone_number TEXT NOT NULL,
+                    target_region TEXT,
+                    status TEXT DEFAULT 'queued',
+                    provider_ref TEXT,
+                    error TEXT,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                );
+                """,
+                "CREATE INDEX IF NOT EXISTS idx_alert_call_notifications_alert ON alert_call_notifications(alert_id);",
+                "CREATE INDEX IF NOT EXISTS idx_alert_call_notifications_phone ON alert_call_notifications(phone_number);",
+                "CREATE INDEX IF NOT EXISTS idx_alert_call_notifications_status ON alert_call_notifications(status);",
+            ):
+                conn.execute(text(ddl))
+    except Exception as exc:
+        print(f"[DB] runtime schema sync failed: {exc}")
 
 
 def seed_default_admin():
@@ -195,6 +247,8 @@ def add_to_escalation(
             reason_code=reason_code,
             confidence=confidence,
             entities=entities,
+            transcript_snapshot=_build_transcript_snapshot(db, session_id, query),
+            session_recording_path=_get_session_recording_path(db, session_id),
             status="pending",
         )
         db.add(esc)
@@ -204,6 +258,33 @@ def add_to_escalation(
         print(f"[DB] add_to_escalation failed: {exc}")
     finally:
         db.close()
+
+
+def _build_transcript_snapshot(db, session_id: Optional[str], current_query: str) -> str:
+    if not session_id:
+        return f"user: {current_query}".strip()
+    rows = (
+        db.query(ConversationMessage)
+        .filter(ConversationMessage.session_id == session_id)
+        .order_by(ConversationMessage.timestamp.asc(), ConversationMessage.id.asc())
+        .all()
+    )
+    lines = [
+        f"{row.role}: {row.message.strip()}"
+        for row in rows
+        if row.message and row.message.strip()
+    ]
+    current_line = f"user: {current_query}".strip()
+    if current_query and current_line not in lines:
+        lines.append(current_line)
+    return "\n".join(lines)[-12000:]
+
+
+def _get_session_recording_path(db, session_id: Optional[str]) -> Optional[str]:
+    if not session_id:
+        return None
+    row = db.query(CallSessionPG).filter(CallSessionPG.session_id == session_id).first()
+    return row.audio_file_path if row and row.audio_file_path else None
 
 
 # ── Conversation history ─────────────────────────────────────────────────────

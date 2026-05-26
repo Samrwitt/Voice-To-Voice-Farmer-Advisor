@@ -201,6 +201,74 @@ def init_pg_app_tables():
                 cur.execute(
                     "CREATE INDEX IF NOT EXISTS idx_interaction_records_phone ON interaction_records(phone_number);"
                 )
+
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS farmers_kb (
+                      id SERIAL PRIMARY KEY,
+                      phone_number TEXT UNIQUE NOT NULL,
+                      name TEXT,
+                      location TEXT,
+                      preferred_language TEXT DEFAULT 'am',
+                      crops JSONB,
+                      farm_size DOUBLE PRECISION,
+                      notes TEXT,
+                      registered_at TIMESTAMPTZ DEFAULT NOW(),
+                      updated_at TIMESTAMPTZ DEFAULT NOW()
+                    );
+                    """
+                )
+                for ddl in (
+                    "ALTER TABLE farmers_kb ADD COLUMN IF NOT EXISTS crops JSONB;",
+                    "ALTER TABLE farmers_kb ADD COLUMN IF NOT EXISTS farm_size DOUBLE PRECISION;",
+                    "ALTER TABLE farmers_kb ADD COLUMN IF NOT EXISTS notes TEXT;",
+                    "ALTER TABLE farmers_kb ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();",
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_farmers_kb_phone ON farmers_kb(phone_number);",
+                ):
+                    cur.execute(ddl)
+
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS escalations (
+                      id SERIAL PRIMARY KEY,
+                      query TEXT NOT NULL,
+                      context TEXT,
+                      phone_number TEXT,
+                      session_id TEXT,
+                      status TEXT NOT NULL DEFAULT 'pending',
+                      reason_code TEXT,
+                      confidence DOUBLE PRECISION,
+                      entities JSONB,
+                      assigned_to_user_id TEXT,
+                      assigned_at TIMESTAMPTZ,
+                      expert_response TEXT,
+                      expert_audio_path TEXT,
+                      expert_notes TEXT,
+                      transcript_snapshot TEXT,
+                      session_recording_path TEXT,
+                      answered_at TIMESTAMPTZ,
+                      closed_at TIMESTAMPTZ,
+                      created_at TIMESTAMPTZ DEFAULT NOW(),
+                      updated_at TIMESTAMPTZ DEFAULT NOW()
+                    );
+                    """
+                )
+                for ddl in (
+                    "ALTER TABLE escalations ADD COLUMN IF NOT EXISTS expert_audio_path TEXT;",
+                    "ALTER TABLE escalations ADD COLUMN IF NOT EXISTS expert_response TEXT;",
+                    "ALTER TABLE escalations ADD COLUMN IF NOT EXISTS expert_notes TEXT;",
+                    "ALTER TABLE escalations ADD COLUMN IF NOT EXISTS transcript_snapshot TEXT;",
+                    "ALTER TABLE escalations ADD COLUMN IF NOT EXISTS session_recording_path TEXT;",
+                    "ALTER TABLE escalations ADD COLUMN IF NOT EXISTS assigned_to_user_id TEXT;",
+                    "ALTER TABLE escalations ADD COLUMN IF NOT EXISTS assigned_at TIMESTAMPTZ;",
+                    "ALTER TABLE escalations ADD COLUMN IF NOT EXISTS answered_at TIMESTAMPTZ;",
+                    "ALTER TABLE escalations ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ;",
+                    "ALTER TABLE escalations ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();",
+                ):
+                    cur.execute(ddl)
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_escalations_phone ON escalations(phone_number);")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_escalations_status ON escalations(status);")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_escalations_session ON escalations(session_id);")
             conn.commit()
     except Exception as exc:
         print(f"[DB] init_pg_app_tables failed: {exc}")
@@ -228,11 +296,17 @@ def add_to_escalation(
         import psycopg
         with psycopg.connect(POSTGRES_URL) as conn:
             with conn.cursor() as cur:
+                transcript_snapshot = _build_transcript_snapshot(cur, session_id, query)
+                session_recording_path = _get_session_recording_path(cur, session_id)
                 cur.execute(
                     """
                     INSERT INTO escalations 
-                    (query, context, phone_number, session_id, reason_code, confidence, entities, status, created_at, updated_at) 
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                    (
+                      query, context, phone_number, session_id, reason_code,
+                      confidence, entities, transcript_snapshot, session_recording_path,
+                      status, created_at, updated_at
+                    ) 
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
                     """,
                     (
                         query,
@@ -242,6 +316,8 @@ def add_to_escalation(
                         reason_code,
                         confidence,
                         json.dumps(entities) if entities else None,
+                        transcript_snapshot,
+                        session_recording_path,
                         "pending"
                     ),
                 )
@@ -257,6 +333,48 @@ def add_to_escalation(
             conn.close()
         except Exception:
             pass
+
+
+def _build_transcript_snapshot(cur, session_id: str | None, current_query: str) -> str:
+    if not session_id:
+        return f"user: {current_query}".strip()
+    try:
+        cur.execute(
+            """
+            SELECT role, message
+            FROM conversation_history
+            WHERE session_id = %s
+            ORDER BY timestamp ASC, id ASC;
+            """,
+            (session_id,),
+        )
+        rows = cur.fetchall() or []
+    except Exception:
+        rows = []
+
+    lines = [
+        f"{role}: {str(message).strip()}"
+        for role, message in rows
+        if str(message or "").strip()
+    ]
+    current_line = f"user: {current_query}".strip()
+    if current_query and current_line not in lines:
+        lines.append(current_line)
+    return "\n".join(lines)[-12000:]
+
+
+def _get_session_recording_path(cur, session_id: str | None) -> str | None:
+    if not session_id:
+        return None
+    try:
+        cur.execute(
+            "SELECT audio_file_path FROM call_sessions WHERE session_id = %s LIMIT 1;",
+            (session_id,),
+        )
+        row = cur.fetchone()
+        return row[0] if row and row[0] else None
+    except Exception:
+        return None
 
 def log_conversation(phone_number: str, session_id: str, role: str, message: str):
     # Prefer Postgres so dashboard can read unified history.
@@ -318,6 +436,113 @@ def get_conversation_history(session_id: str, limit: int = 5):
     return list(reversed(history))
 
 
+def get_farmer_memory_context(
+    phone_number: str,
+    *,
+    exclude_session_id: str | None = None,
+    limit: int = 6,
+) -> str:
+    """
+    Cross-call personalization memory for FR16/FR17.
+
+    This intentionally summarizes only recent non-sensitive interaction signals:
+    intents, response types, extracted entities, and recent user questions.
+    """
+    if not _pg_enabled():
+        return ""
+    keys = _phone_lookup_keys(phone_number)
+    if not keys:
+        return ""
+    try:
+        import psycopg
+
+        lim = max(1, min(int(limit or 6), 12))
+        interactions: list[str] = []
+        questions: list[str] = []
+        with psycopg.connect(POSTGRES_URL) as conn:
+            with conn.cursor() as cur:
+                if exclude_session_id:
+                    cur.execute(
+                        """
+                        SELECT intent, response_type, entities, confidence
+                        FROM interaction_records
+                        WHERE phone_number = ANY(%s)
+                          AND session_id <> %s
+                        ORDER BY created_at DESC
+                        LIMIT %s;
+                        """,
+                        (keys, exclude_session_id, lim),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT intent, response_type, entities, confidence
+                        FROM interaction_records
+                        WHERE phone_number = ANY(%s)
+                        ORDER BY created_at DESC
+                        LIMIT %s;
+                        """,
+                        (keys, lim),
+                    )
+                for intent, response_type, entities, confidence in (cur.fetchall() or []):
+                    parts = []
+                    if intent:
+                        parts.append(f"intent={intent}")
+                    if response_type:
+                        parts.append(f"response={response_type}")
+                    if entities:
+                        parts.append(f"entities={entities}")
+                    if confidence is not None:
+                        try:
+                            parts.append(f"conf={float(confidence):.2f}")
+                        except (TypeError, ValueError):
+                            pass
+                    if parts:
+                        interactions.append("; ".join(parts))
+
+                if exclude_session_id:
+                    cur.execute(
+                        """
+                        SELECT message
+                        FROM conversation_history
+                        WHERE phone_number = ANY(%s)
+                          AND role = 'user'
+                          AND session_id <> %s
+                        ORDER BY timestamp DESC
+                        LIMIT %s;
+                        """,
+                        (keys, exclude_session_id, min(lim, 4)),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT message
+                        FROM conversation_history
+                        WHERE phone_number = ANY(%s)
+                          AND role = 'user'
+                        ORDER BY timestamp DESC
+                        LIMIT %s;
+                        """,
+                        (keys, min(lim, 4)),
+                    )
+                questions = [
+                    str(row[0]).strip()
+                    for row in (cur.fetchall() or [])
+                    if row and str(row[0]).strip()
+                ]
+        lines: list[str] = []
+        if interactions:
+            lines.append("የቀድሞ ጥያቄ/ምላሽ ማጠቃለያ፦ " + " | ".join(interactions[:lim]))
+        if questions:
+            lines.append("ቀደም ሲል የጠየቁት፦ " + " | ".join(q[:160] for q in questions))
+        if not lines:
+            return ""
+        return "የተጠቃሚ ታሪክ (ለቀጣይ ጥያቄዎች አውድ ብቻ)\n" + "\n".join(lines) + "\n\n"
+    except Exception as exc:
+        print(f"[DB] get_farmer_memory_context failed: {exc}")
+        return ""
+
+
 def log_interaction_record(
     phone_number: str,
     session_id: str,
@@ -355,6 +580,100 @@ def log_interaction_record(
             conn.commit()
     except Exception as exc:
         print(f"[DB] log_interaction_record failed: {exc}")
+
+    _learn_farmer_memory_from_interaction(phone_number, intent, entities)
+
+
+def _learn_farmer_memory_from_interaction(
+    phone_number: str,
+    intent: Optional[str],
+    entities: Optional[dict[str, Any]],
+) -> None:
+    """Best-effort personalization memory learned from each farmer interaction."""
+    if not _pg_enabled():
+        return
+    p = (phone_number or "").strip()
+    if not p or p == "Unknown":
+        return
+    data = entities or {}
+    crop = (
+        data.get("crop_en")
+        or data.get("crop")
+        or data.get("crop_type")
+        or data.get("commodity")
+    )
+    location = data.get("location") or data.get("region") or data.get("region_keyword")
+    language = data.get("language") or data.get("preferred_language")
+    learned: list[str] = []
+    if intent:
+        learned.append(f"last_intent={intent}")
+    if crop:
+        learned.append(f"crop={crop}")
+    if location:
+        learned.append(f"location={location}")
+    if not any([crop, location, language, intent]):
+        return
+
+    try:
+        import psycopg
+
+        with psycopg.connect(POSTGRES_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT crops, notes
+                    FROM farmers_kb
+                    WHERE phone_number = %s
+                    LIMIT 1;
+                    """,
+                    (p,),
+                )
+                row = cur.fetchone()
+                existing_crops: list[str] = []
+                existing_notes = ""
+                if row:
+                    raw_crops, existing_notes = row
+                    if isinstance(raw_crops, list):
+                        existing_crops = [str(x) for x in raw_crops if x]
+                    elif raw_crops:
+                        try:
+                            parsed = json.loads(raw_crops) if isinstance(raw_crops, str) else raw_crops
+                            if isinstance(parsed, list):
+                                existing_crops = [str(x) for x in parsed if x]
+                        except Exception:
+                            existing_crops = [str(raw_crops)]
+
+                if crop and str(crop) not in existing_crops:
+                    existing_crops.append(str(crop))
+                note_line = "; ".join(learned)
+                notes = (existing_notes or "").strip()
+                if note_line and note_line not in notes:
+                    notes = (notes + "\n" + note_line).strip()
+                    notes = notes[-2000:]
+
+                cur.execute(
+                    """
+                    INSERT INTO farmers_kb
+                      (phone_number, location, preferred_language, crops, notes, registered_at, updated_at)
+                    VALUES (%s, %s, COALESCE(%s, 'am'), %s::jsonb, %s, NOW(), NOW())
+                    ON CONFLICT (phone_number) DO UPDATE SET
+                      location = COALESCE(EXCLUDED.location, farmers_kb.location),
+                      preferred_language = COALESCE(EXCLUDED.preferred_language, farmers_kb.preferred_language),
+                      crops = COALESCE(EXCLUDED.crops, farmers_kb.crops),
+                      notes = COALESCE(EXCLUDED.notes, farmers_kb.notes),
+                      updated_at = NOW();
+                    """,
+                    (
+                        p,
+                        str(location) if location else None,
+                        str(language) if language else None,
+                        json.dumps(existing_crops, ensure_ascii=False) if existing_crops else None,
+                        notes or None,
+                    ),
+                )
+            conn.commit()
+    except Exception as exc:
+        print(f"[DB] farmer memory update failed: {exc}")
 
 def get_market_price(crop_name: str, region: str = None):
     conn = sqlite3.connect(DB_PATH)
@@ -515,6 +834,62 @@ def get_farmer_profile(phone_number: str):
             "registered_at": row[3],
         }
     return None
+
+
+def consume_answered_expert_response(phone_number: str) -> dict[str, Any] | None:
+    """
+    Return the oldest answered escalation for this farmer and mark it closed.
+
+    The voice pipeline uses this on the farmer's next call so recorded expert
+    answers are delivered asynchronously, matching the DA/expert workflow.
+    """
+    if not _pg_enabled():
+        return None
+    keys = _phone_lookup_keys(phone_number)
+    if not keys:
+        return None
+    try:
+        import psycopg
+
+        with psycopg.connect(POSTGRES_URL, autocommit=False) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, query, expert_response, expert_audio_path, expert_notes
+                    FROM escalations
+                    WHERE phone_number = ANY(%s)
+                      AND status = 'answered'
+                      AND (expert_response IS NOT NULL OR expert_audio_path IS NOT NULL)
+                    ORDER BY answered_at NULLS LAST, created_at ASC
+                    LIMIT 1
+                    FOR UPDATE;
+                    """,
+                    (keys,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    conn.commit()
+                    return None
+                ticket_id, query, expert_response, expert_audio_path, expert_notes = row
+                cur.execute(
+                    """
+                    UPDATE escalations
+                    SET status = 'closed', closed_at = NOW(), updated_at = NOW()
+                    WHERE id = %s;
+                    """,
+                    (ticket_id,),
+                )
+            conn.commit()
+        return {
+            "ticket_id": ticket_id,
+            "query": query,
+            "text": expert_response or "",
+            "audio_path": expert_audio_path or "",
+            "expert_notes": expert_notes or "",
+        }
+    except Exception as exc:
+        print(f"[DB] consume_answered_expert_response failed: {exc}")
+        return None
 
 def create_alert(target_region: str, alert_message: str, severity: str = "warning"):
     conn = sqlite3.connect(DB_PATH)

@@ -7,6 +7,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from gtts import gTTS
 from pydantic import BaseModel
+from config_utils import get_target_sample_rate, get_tts_atempo, get_tts_volume
 
 logging.basicConfig(
     level=logging.INFO,
@@ -16,9 +17,9 @@ logger = logging.getLogger("tts_service")
 
 app = FastAPI()
 
-TARGET_SAMPLE_RATE = int(os.getenv("TTS_SAMPLE_RATE", "16000"))
-TTS_ATEMPO = min(2.0, max(0.5, float(os.getenv("TTS_ATEMPO", "1.35"))))
-TTS_VOLUME = min(3.0, max(0.1, float(os.getenv("TTS_VOLUME", "1.5"))))
+TARGET_SAMPLE_RATE = get_target_sample_rate()
+TTS_ATEMPO = get_tts_atempo()
+TTS_VOLUME = get_tts_volume()
 
 
 class TTSRequest(BaseModel):

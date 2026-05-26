@@ -101,7 +101,6 @@ function getPageTitle(pathname: string) {
     "/farmers": "Farmer Profiles",
     "/calls": "Call Logs",
     "/knowledge-base": "Knowledge Base",
-    "/kb-documents": "Knowledge Documents",
     "/helpdesk": "Helpdesk",
     "/market-prices": "Market Prices",
     "/alerts": "Alerts & Forecasts",
