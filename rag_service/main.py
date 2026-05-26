@@ -31,9 +31,7 @@ from escalation_policy import (
 )
 from expert_delivery_policy import maybe_consume_answered_expert_response
 from greeting_utils import (
-    GREETING_ACK_AM,
     GREETING_ONLY_FOLLOWUP_AM,
-    apply_greeting_ack,
     split_greeting_from_query,
 )
 from quality_metrics import quality_snapshot
@@ -84,6 +82,18 @@ async def lifespan(app: FastAPI):
                 logger.warning("merged.json QA sync failed: %s", exc)
 
         threading.Thread(target=_merged_qa, daemon=True).start()
+
+        def _warm_market():
+            try:
+                from farmer_rag_stack.smart_advisory import warm_wfp_hdx_market_cache
+
+                mrep = warm_wfp_hdx_market_cache()
+                if mrep.get("enabled"):
+                    logger.info("WFP/HDX market cache warmup: %s", mrep)
+            except Exception as exc:
+                logger.warning("WFP/HDX market cache warmup failed: %s", exc)
+
+        threading.Thread(target=_warm_market, daemon=True).start()
     except Exception as exc:
         logger.warning("KB auto-ingest setup skipped: %s", exc)
     yield
@@ -377,10 +387,22 @@ def rag_diagnostics():
                 ),
             },
             "market": {
-                "current_provider": "local market_prices table with mock demo fallback",
-                "nmis_live_adapter": False,
-                "planned_sources": ["NMIS", "ECX", "ESS", "FAO", "manual CSV/Excel"],
+                "current_provider": "WFP/HDX Ethiopia food prices CSV, then optional custom API, local table, demo fallback",
+                "wfp_hdx_enabled": os.getenv("WFP_HDX_MARKET_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off"),
+                "wfp_hdx_csv_path": os.getenv("WFP_HDX_MARKET_CSV_PATH", "/app/data/wfp_food_prices_eth.csv"),
+                "wfp_hdx_csv_path_exists": Path(os.getenv("WFP_HDX_MARKET_CSV_PATH", "/app/data/wfp_food_prices_eth.csv")).exists(),
+                "wfp_hdx_package_id": os.getenv("WFP_HDX_PACKAGE_ID", "2e4f1922-e446-4b57-a98a-d0e2d5e34afa"),
+                "custom_market_api_configured": bool(os.getenv("NMIS_MARKET_API_URL")),
+                "fallback_sources": ["local market_prices table", "demo values"],
             },
+            "supplemental_source_catalog": [
+                "Ethiopian National Agri Data Hub / EIAR Open Research Data",
+                "NSIS / EthioSIS GeoNode layers",
+                "Ethiopia Land Soil Crop Hub",
+                "EIAR Land, Soil and Crop Hub",
+                "Coalition of the Willing / LSC catalog datasets",
+                "Ethiopian Statistical Service Agriculture",
+            ],
         },
         "voice_pipeline": {
             "asr_to_rag": "vad_service calls POST /rag/answer with ASR transcript",
@@ -764,32 +786,16 @@ def _generate_core_rag_response(query_text: str, phone_number: str, session_id: 
     closest_distance = 999.0
     use_pg = rag_pg.kb_pg_enabled() and rag_pg.count_approved_chunks() > 0
     history_pairs = get_conversation_history(session_id, limit=6)
-    conv_msgs = [{"role": r, "content": (m or "").strip()} for r, m in history_pairs if (m or "").strip()]
-    from farmer_rag_stack.context_utils import retrieval_query_for
     from farmer_rag_stack.assistant import try_llm_assistant_response
-    from farmer_rag_stack.nlu_farmer import augment_retrieval_query_with_nlu, parse_farmer_nlu
-    from farmer_rag_stack.retrieval_ranking import rank_pg_hits
-    from chroma_retrieve import merge_pg_chroma_hits, retrieve_chroma_mirror_hits
-
-    farmer_nlu = parse_farmer_nlu(query_text)
-    retrieval_query = augment_retrieval_query_with_nlu(
-        retrieval_query_for(nlu.retrieval_query or query_text, conv_msgs),
-        farmer_nlu,
-    )
 
     if use_pg:
-        pool = max(12, int(os.environ.get("RAG_PG_RETRIEVE_POOL", "40")))
-        hits, closest_distance = rag_pg.retrieve_for_query(
-            retrieval_query,
-            top_k=pool,
+        hits, retrieval_query, farmer_nlu, closest_distance, retrieval_diag = ranked_hits_for_voice_query(
+            query_text=query_text,
+            nlu=nlu,
+            user_region=user_region,
+            hist_pairs=history_pairs,
             max_l2_distance=RAG_PG_MAX_L2_DISTANCE,
-            region=user_region,
         )
-
-        pg_hits = [h for h in hits if float(h.get("distance", 999)) <= RAG_PG_MAX_L2_DISTANCE]
-        chroma_k = max(8, int(os.getenv("RAG_CHROMA_TOP_K", "18").strip() or "18"))
-        chroma_hits = retrieve_chroma_mirror_hits(retrieval_query, top_k=chroma_k)
-        hits = merge_pg_chroma_hits(pg_hits, chroma_hits)
 
         if not hits:
             dyn_key = f"soil_kb_{query_text}"
@@ -799,28 +805,10 @@ def _generate_core_rag_response(query_text: str, phone_number: str, session_id: 
                 log_interaction_record(phone_number, session_id, intent, "dynamic_kb_answer", nlu.entities, nlu.confidence)
                 return cached, "dynamic_kb_answer", [], nlu.to_dict()
 
-            from farmer_rag_stack.rag_tools import web_search
-            from farmer_rag_stack.query_llm import run_sync_llm
-            from farmer_rag_stack.llm_providers import effective_llm_backend
-            snippets = web_search.fetch_web_snippets(f"Ethiopia agriculture {query_text}", max_results=4)
-            if snippets:
-                web_text = web_search.format_web_block(snippets)
-                prompt = f"መመሪያ: ከታች ካለው የድር መረጃ በመነሳት ለጥያቄው አጭር እና ትክክለኛ ምላሽ በአማርኛ ስጥ። መረጃው የማይጠቅም ከሆነ 'መረጃ የለም' በል።\n\nጥያቄ: {query_text}\n\nመረጃ:\n{web_text}"
-                msgs = [{"role": "user", "content": prompt}]
-                try:
-                    ans, _ = run_sync_llm(effective_llm_backend(), msgs, fast=True)
-                    if "መረጃ የለም" not in ans and len(ans) > 10:
-                        set_dynamic_knowledge(dyn_key, ans)
-                        log_conversation(phone_number, session_id, "assistant", ans)
-                        log_interaction_record(phone_number, session_id, intent, "dynamic_kb_answer", nlu.entities, nlu.confidence)
-                        return ans, "dynamic_kb_answer", [], nlu.to_dict()
-                except Exception:
-                    pass
-
             logger.info(f"No results found for query: {query_text}. Escalating.")
             add_to_escalation(
                 query_text,
-                "No relevant KB documents found and web fallback yielded no useful info.",
+                f"No relevant KB documents found after query analysis/rewrite/hybrid retrieval: {retrieval_diag}",
                 phone_number=phone_number,
                 session_id=session_id,
                 reason_code="NO_KB_HITS"
@@ -836,26 +824,6 @@ def _generate_core_rag_response(query_text: str, phone_number: str, session_id: 
                 confidence=nlu.confidence,
             )
             return resp, "escalated", [], nlu.to_dict()
-
-        def _retrieve_more_boosted(q: str) -> list:
-            hh, _ = rag_pg.retrieve_for_query(
-                q,
-                top_k=pool,
-                max_l2_distance=RAG_PG_MAX_L2_DISTANCE,
-                region=user_region,
-            )
-            return [h for h in hh if float(h.get("distance", 999)) <= RAG_PG_MAX_L2_DISTANCE]
-
-        keep = max(4, int(os.environ.get("RAG_PG_FINAL_TOP_K", "6")))
-        hits = rank_pg_hits(
-            query_text,
-            retrieval_query,
-            hits,
-            farmer_nlu,
-            retrieve_more=_retrieve_more_boosted,
-            max_hits=max(keep, 8),
-        )
-        hits = hits[:keep]
 
         references = [
             {
@@ -1229,7 +1197,7 @@ async def rag_answer(req: RagAnswerRequest):
         logger.info("Normalized voice ASR query before RAG: %r -> %r", query_text, normalized_query_text)
         query_text = normalized_query_text
     if not query_text:
-        final = f"{GREETING_ACK_AM} {GREETING_ONLY_FOLLOWUP_AM}"
+        final = GREETING_ONLY_FOLLOWUP_AM
         set_session_state(req.session_id, "active", None)
         log_conversation(req.phone_number, req.session_id, "user", raw_query_text)
         log_conversation(req.phone_number, req.session_id, "assistant", final)
@@ -1307,7 +1275,7 @@ async def rag_answer(req: RagAnswerRequest):
             session_id=req.session_id,
             expert_delivery=expert_delivery,
             expert_delivery_payload=expert_delivery_payload,
-            body=apply_greeting_ack(USER_REQUESTED_ESCALATION_AM, had_greeting),
+            body=USER_REQUESTED_ESCALATION_AM,
             reason_code="USER_REQUESTED",
             escalation_context="User explicitly requested expert handoff in the voice path.",
             best_distance=None,
@@ -1324,7 +1292,7 @@ async def rag_answer(req: RagAnswerRequest):
             session_id=req.session_id,
             expert_delivery=expert_delivery,
             expert_delivery_payload=expert_delivery_payload,
-            body=apply_greeting_ack(OUT_OF_DOMAIN_ESCALATION_AM, had_greeting),
+            body=OUT_OF_DOMAIN_ESCALATION_AM,
             reason_code="OUT_OF_DOMAIN",
             escalation_context="Voice path: question appears outside the supported farmer advisory domain.",
             best_distance=None,
@@ -1348,7 +1316,7 @@ async def rag_answer(req: RagAnswerRequest):
             query_text=query_text,
             phone_number=req.phone_number,
             session_id=req.session_id,
-            prompt=apply_greeting_ack(scenario_decision.clarification_prompt, had_greeting),
+            prompt=scenario_decision.clarification_prompt,
             nlu=nlu,
             t0=t0,
             scenario=scenario_decision.scenario,
@@ -1357,6 +1325,113 @@ async def rag_answer(req: RagAnswerRequest):
             expert_delivery_payload=expert_delivery_payload,
             asr_meta=asr_meta,
         )
+
+    agrochemical_dose_terms = (
+        "መጠን",
+        "መርጨት",
+        "መርጨ",
+        "ርጭት",
+        "dose",
+        "dosage",
+        "rate",
+        "mixing ratio",
+        "spray",
+        "spraying",
+    )
+    if is_agro and any(term in query_text.lower() or term in query_text for term in agrochemical_dose_terms):
+        return _voice_escalation_response(
+            query_text=query_text,
+            phone_number=req.phone_number,
+            session_id=req.session_id,
+            expert_delivery=expert_delivery,
+            expert_delivery_payload=expert_delivery_payload,
+            body=chemical_safety.CANNED_AGROCHEM_ESCALATION_AM,
+            reason_code="AGROCHEM_NO_KB",
+            escalation_context="Agrochemical dose/spray question requires human review before advice.",
+            best_distance=None,
+            hits=[],
+            t0=t0,
+            safety={"agrochemical_expert_only": True, "reason": "dose_or_spray_question"},
+            meta_reason="agrochemical_escalation",
+            nlu=nlu,
+        )
+
+    if (
+        scenario_decision.route_hint in {"market", "weather"}
+        and os.environ.get("RAG_SMART_PIPELINE", "1").strip().lower() not in ("0", "false", "no", "off")
+    ):
+        try:
+            smart = run_smart_advisory(
+                question=query_text,
+                phone_number=req.phone_number,
+                nlu=nlu,
+                profile=profile,
+                history_pairs=hist_pairs,
+                hits=[],
+                local_market_price_func=get_market_price,
+            )
+        except Exception as exc:
+            logger.warning("Fast tool route failed; falling back to normal RAG path: %s", exc)
+        else:
+            if (smart.answer or "").strip():
+                final = normalize_text(smart.answer)
+                current_response = final
+                if expert_delivery:
+                    final = normalize_text(f"{expert_delivery}\n\n{final}")
+                latency_ms = (time.perf_counter() - t0) * 1000
+                sla_h = int(os.getenv("ESCALATION_SLA_HOURS", "48") or "48")
+                trust = build_voice_trust_meta(
+                    hits=[],
+                    used_llm_assistant=smart.used_llm,
+                    used_chunk_compose=False,
+                    sources=["tools"],
+                    escalated_empty=False,
+                    latency_ms=latency_ms,
+                    sla_target_hours=sla_h,
+                )
+                trust["scenario"] = scenario_decision.scenario
+                trust["retrieval"] = {
+                    "best_distance": None,
+                    "kb_grounded": False,
+                    "weak_kb_used": False,
+                    "pg_raw_count": 0,
+                    "pg_filtered_count": 0,
+                    "keyword_count": 0,
+                    "chroma_count": 0,
+                    "final_count": 0,
+                }
+                final = maybe_append_trust_footer(final, sources=["tools"])
+                out = {
+                    "response": final,
+                    "current_response": current_response,
+                    "expert_delivery": expert_delivery_payload,
+                    "references": [],
+                    "best_distance": None,
+                    "trust": trust,
+                    "meta": {
+                        "response_cache": "bypass",
+                        "scenario": scenario_decision.to_dict(),
+                        "retrieval": trust["retrieval"],
+                    },
+                    "tool_trace": smart.tool_trace,
+                }
+                if smart.context and os.environ.get("RAG_RETURN_SMART_CONTEXT", "0").strip().lower() in ("1", "true", "yes", "on"):
+                    out["smart_context"] = smart.context
+                log_conversation(req.phone_number, req.session_id, "assistant", final)
+                entities_for_log = dict(getattr(nlu, "entities", {}) or {})
+                if isinstance(smart.context, dict):
+                    routed_entities = smart.context.get("entities")
+                    if isinstance(routed_entities, dict):
+                        entities_for_log.update({k: v for k, v in routed_entities.items() if v is not None})
+                log_interaction_record(
+                    phone_number=req.phone_number,
+                    session_id=req.session_id,
+                    intent=getattr(nlu, "primary_intent", None),
+                    response_type="tool_answer",
+                    entities=entities_for_log,
+                    confidence=getattr(nlu, "confidence", None),
+                )
+                return out
 
     try:
         dyn = build_dynamic_context(
@@ -1560,7 +1635,10 @@ async def rag_answer(req: RagAnswerRequest):
         )
         final = "ይቅርታ፣ ለዚህ ጥያቄ በቂ መረጃ አልተገኘም። ጥያቄዎን ለግብርና ባለሙያ ልከናል፤ በቅርቡ መልስ ያገኛሉ።"
 
-    final = apply_greeting_ack(final, had_greeting)
+    # The SIP/voice layer plays the opening greeting once at call start. Keep
+    # follow-up RAG turns focused on the answer even if the transcript contains
+    # a greeting phrase.
+    del had_greeting
 
     voice_cap_raw = os.environ.get("RAG_VOICE_RAG_ANSWER_MAX_CHARS", "600").strip()
     try:
@@ -1603,6 +1681,7 @@ async def rag_answer(req: RagAnswerRequest):
         "weak_kb_used": retrieval_diag.get("weak_kb_used", False),
         "pg_raw_count": retrieval_diag.get("pg_raw_count", 0),
         "pg_filtered_count": retrieval_diag.get("pg_filtered_count", 0),
+        "keyword_count": retrieval_diag.get("keyword_count", 0),
         "chroma_count": retrieval_diag.get("chroma_count", 0),
         "final_count": retrieval_diag.get("final_count", len(hits)),
     }
@@ -1650,13 +1729,18 @@ async def rag_answer(req: RagAnswerRequest):
         if hits and g in ("kb_llm", "kb_compose"):
             response_cache.set(cache_key, out)
     if final:
+        entities_for_log = dict(getattr(nlu, "entities", {}) or {})
+        if isinstance(smart_context, dict):
+            routed_entities = smart_context.get("entities")
+            if isinstance(routed_entities, dict):
+                entities_for_log.update({k: v for k, v in routed_entities.items() if v is not None})
         log_conversation(req.phone_number, req.session_id, "assistant", final)
         log_interaction_record(
             phone_number=req.phone_number,
             session_id=req.session_id,
             intent=getattr(nlu, "primary_intent", None),
             response_type="escalated_empty" if escalated_empty else "rag_answer",
-            entities=getattr(nlu, "entities", None),
+            entities=entities_for_log,
             confidence=getattr(nlu, "confidence", None),
         )
     return out

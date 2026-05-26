@@ -7,6 +7,9 @@ calling Gemini or another final LLM.
 
 from __future__ import annotations
 
+import csv
+import difflib
+import io
 import json
 import os
 import re
@@ -20,6 +23,7 @@ import httpx
 from .llm_providers import effective_llm_backend, gemini_api_keys
 from .query_llm import prepare_rag_llm_messages, run_sync_llm
 from .rag_tools import web_search
+from .source_catalog import supplemental_context_block
 
 
 WEATHER_TTL_SEC = int(os.getenv("RAG_WEATHER_CACHE_TTL_SEC", "7200") or "7200")
@@ -28,6 +32,10 @@ SOIL_WATER_TTL_SEC = int(os.getenv("RAG_SOIL_WATER_CACHE_TTL_SEC", "21600") or "
 _weather_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 _soil_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 _soil_water_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+_wfp_hdx_market_cache: tuple[float, list[dict[str, Any]], str] | None = None
+_wfp_hdx_market_error_cache: tuple[float, str] | None = None
+_wfp_hdx_clean_cache: tuple[int, int, list[dict[str, Any]], str] | None = None
+_wfp_hdx_records_cache: tuple[str, str, int, int, list[dict[str, Any]]] | None = None
 
 
 INTENT_MAP = {
@@ -576,6 +584,12 @@ def get_market_price(
     crop_key = _norm_key(crop)
     if not crop_key:
         return {"available": False, "reason": "crop_missing"}
+    wfp_hdx = _fetch_wfp_hdx_market_price(crop, location_or_market)
+    if wfp_hdx.get("available"):
+        return wfp_hdx
+    nmis = _fetch_configured_nmis_market_price(crop, location_or_market)
+    if nmis.get("available"):
+        return nmis
     row = None
     location_matched = False
     if local_price_func is not None:
@@ -621,6 +635,534 @@ def get_market_price(
         "needs_location_for_personal_price": not bool(location_or_market),
         "location_price_unavailable": bool(location_or_market),
         "selling_recommendation": "sell_gradually" if trend == "up" else "avoid_rushed_sale",
+    }
+
+
+def _first_present(row: dict[str, Any], names: tuple[str, ...]) -> Any:
+    lower_map = {str(k).lower(): v for k, v in row.items()}
+    for name in names:
+        if name in row and row[name] not in (None, ""):
+            return row[name]
+        low = name.lower()
+        if low in lower_map and lower_map[low] not in (None, ""):
+            return lower_map[low]
+    return None
+
+
+_WFP_HDX_PACKAGE_ID = "2e4f1922-e446-4b57-a98a-d0e2d5e34afa"
+_WFP_HDX_DEFAULT_LOCAL_CSV = os.path.normpath(
+    os.path.join(os.path.dirname(__file__), "..", "data", "wfp_food_prices_eth.csv")
+)
+_WFP_CROP_ALIASES: dict[str, tuple[str, ...]] = {
+    "teff": ("teff", "teff white", "teff mixed", "teff red", "ጤፍ"),
+    "wheat": ("wheat", "wheat grain", "ስንዴ"),
+    "maize": ("maize", "maize white", "maize grain", "corn", "በቆሎ"),
+    "barley": ("barley", "ገብስ"),
+    "sorghum": ("sorghum", "ማሽላ"),
+    "sesame": ("sesame", "ሰሊጥ"),
+    "coffee": ("coffee", "ቡና"),
+}
+
+
+def _market_source_enabled() -> bool:
+    return os.getenv("WFP_HDX_MARKET_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _normalize_match_text(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    text = re.sub(r"\([^)]*\)", " ", text)
+    text = re.sub(r"[^a-z0-9\u1200-\u137f]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _row_text(row: dict[str, Any], names: tuple[str, ...]) -> str:
+    value = _first_present(row, names)
+    return str(value or "").strip()
+
+
+def _parse_market_date(value: Any) -> tuple[int, int, int]:
+    text = str(value or "").strip()
+    if not text:
+        return (0, 0, 0)
+    for fmt in ("%Y-%m-%d", "%Y-%m", "%d/%m/%Y", "%m/%d/%Y", "%Y/%m/%d"):
+        try:
+            dt = datetime.strptime(text[:10] if "%d" in fmt else text[:7] if fmt == "%Y-%m" else text, fmt)
+            return (dt.year, dt.month, dt.day)
+        except ValueError:
+            continue
+    nums = [int(x) for x in re.findall(r"\d+", text)[:3]]
+    if len(nums) >= 3 and nums[0] > 1900:
+        return (nums[0], nums[1], nums[2])
+    if len(nums) >= 2 and nums[0] > 1900:
+        return (nums[0], nums[1], 1)
+    return (0, 0, 0)
+
+
+def _parse_market_datetime(value: Any) -> datetime | None:
+    y, m, d = _parse_market_date(value)
+    if y <= 0 or m <= 0:
+        return None
+    try:
+        return datetime(y, m, max(1, d or 1), tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _parse_price_value(value: Any) -> float | None:
+    text = str(value or "").strip().replace(",", "")
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _discover_wfp_hdx_csv_url() -> str:
+    direct = os.getenv("WFP_HDX_MARKET_CSV_URL", "").strip()
+    if direct:
+        return direct
+    package_id = os.getenv("WFP_HDX_PACKAGE_ID", _WFP_HDX_PACKAGE_ID).strip() or _WFP_HDX_PACKAGE_ID
+    api_url = os.getenv(
+        "WFP_HDX_PACKAGE_API_URL",
+        f"https://data.humdata.org/api/3/action/package_show?id={package_id}",
+    )
+    with httpx.Client(timeout=float(os.getenv("WFP_HDX_TIMEOUT_SEC", "20") or "20")) as client:
+        resp = client.get(api_url)
+        resp.raise_for_status()
+        payload = resp.json()
+    resources = ((payload or {}).get("result") or {}).get("resources") or []
+    for res in resources:
+        name = str(res.get("name") or "").lower()
+        fmt = str(res.get("format") or "").lower()
+        url = str(res.get("url") or "").strip()
+        if url and fmt == "csv" and "food prices" in name:
+            return url
+    for res in resources:
+        url = str(res.get("url") or "").strip()
+        fmt = str(res.get("format") or "").lower()
+        if url and fmt == "csv":
+            return url
+    raise RuntimeError("wfp_hdx_csv_resource_not_found")
+
+
+def _local_wfp_hdx_csv_path() -> str:
+    return os.getenv("WFP_HDX_MARKET_CSV_PATH", _WFP_HDX_DEFAULT_LOCAL_CSV).strip()
+
+
+def _load_wfp_hdx_market_rows() -> tuple[list[dict[str, Any]], str]:
+    global _wfp_hdx_market_cache, _wfp_hdx_market_error_cache
+    ttl = int(os.getenv("WFP_HDX_MARKET_CACHE_TTL_SEC", "21600") or "21600")
+    if _wfp_hdx_market_cache and time.time() - _wfp_hdx_market_cache[0] <= ttl:
+        return _wfp_hdx_market_cache[1], _wfp_hdx_market_cache[2]
+
+    local_path = _local_wfp_hdx_csv_path()
+    if local_path and os.path.exists(local_path):
+        csv_url = local_path
+        with open(local_path, "r", encoding="utf-8-sig", newline="") as fh:
+            text = fh.read()
+    else:
+        csv_url = _discover_wfp_hdx_csv_url()
+        with httpx.Client(timeout=float(os.getenv("WFP_HDX_TIMEOUT_SEC", "40") or "40"), follow_redirects=True) as client:
+            resp = client.get(csv_url)
+            resp.raise_for_status()
+            text = resp.text
+    reader = csv.DictReader(io.StringIO(text))
+    rows: list[dict[str, Any]] = []
+    for row in reader:
+        # HDX/WFP CSVs may include a second HXL tag row beginning with "#".
+        if any(str(v or "").startswith("#") for v in row.values()):
+            continue
+        rows.append(row)
+    _wfp_hdx_market_cache = (time.time(), rows, csv_url)
+    _wfp_hdx_market_error_cache = None
+    return rows, csv_url
+
+
+def _clean_wfp_hdx_market_rows(rows: list[dict[str, Any]], csv_source: str) -> list[dict[str, Any]]:
+    global _wfp_hdx_clean_cache
+    cache_key = (id(rows), len(rows))
+    if (
+        _wfp_hdx_clean_cache
+        and _wfp_hdx_clean_cache[0] == cache_key[0]
+        and _wfp_hdx_clean_cache[1] == cache_key[1]
+        and _wfp_hdx_clean_cache[3] == csv_source
+    ):
+        return list(_wfp_hdx_clean_cache[2])
+
+    cleaned: list[dict[str, Any]] = []
+    for row in rows:
+        if any(str(v or "").startswith("#") for v in row.values()):
+            continue
+        date_text = _row_text(row, ("date", "mp_year_month", "month", "updated_at"))
+        dt = _parse_market_datetime(date_text)
+        price = _parse_price_value(_first_present(row, ("price", "mp_price", "value", "amount")))
+        if not dt or price is None:
+            continue
+        market = _row_text(row, ("market", "mkt_name", "market_name"))
+        commodity = _row_text(row, ("commodity", "cm_name", "product", "item", "crop", "crop_name"))
+        if not market or not commodity:
+            continue
+        admin1 = _row_text(row, ("admin1", "adm1_name", "region"))
+        admin2 = _row_text(row, ("admin2", "adm2_name", "zone", "district"))
+        cleaned.append(
+            {
+                "date": dt.date().isoformat(),
+                "date_ts": dt.timestamp(),
+                "market": market,
+                "admin1": admin1,
+                "admin2": admin2,
+                "market_context": " ".join(p for p in (market, admin2, admin1) if p),
+                "commodity": commodity,
+                "unit": _row_text(row, ("unit", "um_name", "price_unit", "uom")) or "unit",
+                "price_type": _row_text(row, ("pricetype", "price_type", "pt_name")) or "unknown",
+                "price_flag": _row_text(row, ("priceflag", "price_flag")) or "unknown",
+                "currency": _row_text(row, ("currency", "cur_name")) or "ETB",
+                "price": price,
+                "usd_price": _parse_price_value(_first_present(row, ("usdprice", "usd_price"))),
+                "latitude": _parse_price_value(_first_present(row, ("latitude", "lat"))),
+                "longitude": _parse_price_value(_first_present(row, ("longitude", "lon", "lng"))),
+            }
+        )
+    cleaned.sort(key=lambda r: float(r.get("date_ts") or 0), reverse=True)
+    _wfp_hdx_clean_cache = (cache_key[0], cache_key[1], cleaned, csv_source)
+    return list(cleaned)
+
+
+def _crop_matches_wfp(row_commodity: str, crop: str) -> bool:
+    commodity = _normalize_match_text(row_commodity)
+    crop_key = _norm_key(crop)
+    aliases = _WFP_CROP_ALIASES.get(crop_key, (crop_key,))
+    return any(
+        alias and (_normalize_match_text(alias) in commodity or commodity in _normalize_match_text(alias))
+        for alias in aliases
+    )
+
+
+def _location_matches_wfp(row: dict[str, Any], location_or_market: str | None) -> bool:
+    if not location_or_market:
+        return True
+    needle = str(location_or_market).strip().lower()
+    if not needle:
+        return True
+    fields = (
+        "market",
+        "market_name",
+        "admin1",
+        "admin2",
+        "adm1_name",
+        "adm2_name",
+        "region",
+        "location",
+    )
+    haystack = " ".join(_row_text(row, (f,)) for f in fields).lower()
+    location_aliases = {
+        "arsi": ("arsi", "asella"),
+        "አርሲ": ("arsi", "asella", "አርሲ"),
+        "oromia": ("oromia", "ኦሮሚያ"),
+        "sidama": ("sidama", "hawassa", "ሲዳማ", "ሀዋሳ"),
+        "amhara": ("amhara", "bahir dar", "አማራ"),
+    }.get(needle, (needle,))
+    return any(alias in haystack for alias in location_aliases)
+
+
+def _similarity(needle: str, haystack: str) -> float:
+    n = _normalize_match_text(needle)
+    h = _normalize_match_text(haystack)
+    if not n or not h:
+        return 0.0
+    if n == h:
+        return 1.0
+    if n in h or h in n:
+        return 0.92
+    n_tokens = set(n.split())
+    h_tokens = set(h.split())
+    token_score = (len(n_tokens & h_tokens) / max(len(n_tokens), 1)) if n_tokens else 0.0
+    seq_score = difflib.SequenceMatcher(None, n, h).ratio()
+    return max(token_score, seq_score)
+
+
+def _commodity_match_score(record: dict[str, Any], crop: str) -> float:
+    commodity = str(record.get("commodity") or "")
+    crop_key = _norm_key(crop)
+    aliases = _WFP_CROP_ALIASES.get(crop_key, (crop_key,))
+    return max((_similarity(alias, commodity) for alias in aliases if alias), default=0.0)
+
+
+def _location_match_score(record: dict[str, Any], location_or_market: str | None) -> float:
+    if not location_or_market:
+        return 1.0
+    location = str(location_or_market)
+    candidates = (
+        str(record.get("market") or ""),
+        str(record.get("admin2") or ""),
+        str(record.get("admin1") or ""),
+        str(record.get("market_context") or ""),
+    )
+    aliases = {
+        "arsi": ("arsi", "asella"),
+        "አርሲ": ("arsi", "asella", "አርሲ"),
+        "oromia": ("oromia", "ኦሮሚያ"),
+        "sidama": ("sidama", "hawassa", "ሲዳማ", "ሀዋሳ"),
+        "amhara": ("amhara", "bahir dar", "አማራ"),
+    }.get(_normalize_match_text(location), (location,))
+    return max((_similarity(alias, candidate) for alias in aliases for candidate in candidates), default=0.0)
+
+
+def _find_wfp_hdx_market_match(
+    records: list[dict[str, Any]],
+    crop: str,
+    location_or_market: str | None,
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]], dict[str, Any]]:
+    if not records:
+        return None, [], {"quality": "none", "approximate": False, "reason": "wfp_hdx_empty"}
+
+    scored: list[tuple[float, float, float, dict[str, Any]]] = []
+    for record in records:
+        commodity_score = _commodity_match_score(record, crop)
+        if commodity_score < 0.35:
+            continue
+        location_score = _location_match_score(record, location_or_market)
+        if location_or_market and location_score < 0.25:
+            # Keep weak location matches only if the commodity is very strong; this
+            # allows an approximate national fallback when a local market is absent.
+            location_score = 0.0
+        recency = float(record.get("date_ts") or 0.0)
+        total = (commodity_score * 0.64) + (location_score * 0.31) + (min(recency / time.time(), 1.0) * 0.05)
+        scored.append((total, commodity_score, location_score, record))
+    if not scored:
+        return None, [], {"quality": "none", "approximate": False, "reason": "wfp_hdx_no_close_commodity"}
+
+    scored.sort(key=lambda item: (item[0], item[1], item[2], float(item[3].get("date_ts") or 0.0)), reverse=True)
+    _total, commodity_score, location_score, best = scored[0]
+    exact_commodity = commodity_score >= 0.88
+    exact_location = bool(not location_or_market or location_score >= 0.88)
+    same_pair_history = [
+        r
+        for _score, cscore, lscore, r in scored
+        if cscore >= max(0.78, commodity_score - 0.05)
+        and (not location_or_market or lscore >= max(0.55, location_score - 0.05))
+        and _normalize_match_text(r.get("commodity")) == _normalize_match_text(best.get("commodity"))
+        and _normalize_match_text(r.get("market")) == _normalize_match_text(best.get("market"))
+        and str(r.get("price_type") or "").lower() == str(best.get("price_type") or "").lower()
+    ]
+    same_pair_history.sort(key=lambda r: float(r.get("date_ts") or 0.0), reverse=True)
+    quality = "exact" if exact_commodity and exact_location else "approximate"
+    if location_or_market and location_score == 0.0 and exact_commodity:
+        quality = "commodity_only"
+    return best, same_pair_history, {
+        "quality": quality,
+        "approximate": quality != "exact",
+        "commodity_score": round(commodity_score, 3),
+        "location_score": round(location_score, 3),
+    }
+
+
+def _trend_from_wfp_history(history: list[dict[str, Any]]) -> tuple[str, float | None, str | None]:
+    if len(history) < 2:
+        return "unknown", None, None
+    latest = _parse_price_value(history[0].get("price"))
+    latest_date = str(history[0].get("date") or "")
+    previous_row = next(
+        (
+            r
+            for r in history[1:]
+            if _parse_price_value(r.get("price")) is not None
+            and str(r.get("date") or "") != latest_date
+        ),
+        None,
+    )
+    if latest is None or not previous_row:
+        return "unknown", None, None
+    previous = _parse_price_value(previous_row.get("price"))
+    if previous is None or previous == 0:
+        return "unknown", previous, previous_row.get("date")
+    pct = ((latest - previous) / previous) * 100.0
+    if pct > 2.0:
+        trend = "up"
+    elif pct < -2.0:
+        trend = "down"
+    else:
+        trend = "flat"
+    return trend, previous, previous_row.get("date")
+
+
+def _market_recency(date_text: str | None) -> dict[str, Any]:
+    dt = _parse_market_datetime(date_text)
+    if not dt:
+        return {"age_days": None, "is_stale": True, "recency_status": "unknown_date"}
+    now = datetime.now(timezone.utc)
+    age_days = max(0, int((now - dt).total_seconds() // 86400))
+    max_age = int(os.getenv("WFP_HDX_MARKET_MAX_AGE_DAYS", "90") or "90")
+    return {
+        "age_days": age_days,
+        "is_stale": age_days > max_age,
+        "recency_status": "stale" if age_days > max_age else "recent_enough",
+        "max_age_days": max_age,
+    }
+
+
+def _fetch_wfp_hdx_market_price(crop: str | None, location_or_market: str | None) -> dict[str, Any]:
+    global _wfp_hdx_market_error_cache
+    if not _market_source_enabled() or not crop:
+        return {"available": False, "reason": "wfp_hdx_disabled_or_crop_missing"}
+    error_ttl = int(os.getenv("WFP_HDX_MARKET_ERROR_TTL_SEC", "600") or "600")
+    if _wfp_hdx_market_error_cache and time.time() - _wfp_hdx_market_error_cache[0] <= error_ttl:
+        return {"available": False, "reason": _wfp_hdx_market_error_cache[1]}
+    try:
+        rows, csv_url = _load_wfp_hdx_market_rows()
+    except Exception as exc:
+        reason = f"wfp_hdx_error: {exc}"
+        _wfp_hdx_market_error_cache = (time.time(), reason)
+        return {"available": False, "reason": reason}
+
+    records = _wfp_hdx_market_records(rows, csv_url)
+    row, history, match = _find_wfp_hdx_market_match(records, crop, location_or_market)
+    if not row:
+        return {"available": False, "reason": match.get("reason") or "wfp_hdx_no_match", "crop": crop}
+    trend, previous_price, previous_date = _trend_from_wfp_history(history)
+    price = row.get("price")
+    currency = str(row.get("currency") or "ETB")
+    unit = str(row.get("unit") or "unit")
+    market = str(row.get("market") or location_or_market or "")
+    date = str(row.get("date") or "unknown")
+    approximate = bool(match.get("approximate"))
+    recency = _market_recency(date)
+    return {
+        "available": True,
+        "crop": crop,
+        "matched_commodity": row.get("commodity"),
+        "market": market,
+        "matched_admin1": row.get("admin1"),
+        "matched_admin2": row.get("admin2"),
+        "requested_market": location_or_market,
+        "price": price,
+        "previous_price": previous_price,
+        "previous_date": previous_date,
+        "unit": f"{currency}/{unit}" if currency and str(currency).upper() not in str(unit).upper() else unit,
+        "price_type": row.get("price_type"),
+        "price_flag": row.get("price_flag"),
+        "trend": trend,
+        "updated_at": str(date),
+        "source": "wfp_hdx",
+        "source_url": csv_url,
+        **recency,
+        "match_quality": match.get("quality"),
+        "approximate": approximate,
+        "commodity_match_score": match.get("commodity_score"),
+        "location_match_score": match.get("location_score"),
+        "personalized": bool(location_or_market and not approximate),
+        "needs_location_for_personal_price": not bool(location_or_market),
+        "location_price_unavailable": bool(location_or_market and approximate),
+        "selling_recommendation": "Use local extension/market confirmation before selling large volume.",
+    }
+
+
+def _wfp_hdx_market_year_filter() -> str:
+    return os.getenv("WFP_HDX_MARKET_YEAR_FILTER", "2026").strip()
+
+
+def _filter_wfp_hdx_records_by_year(records: list[dict[str, Any]], year: str) -> list[dict[str, Any]]:
+    if not year or year.lower() in {"all", "0", "none", "off"}:
+        return records
+    prefix = f"{year}-"
+    filtered = [r for r in records if str(r.get("date") or "").startswith(prefix)]
+    return filtered or records
+
+
+def _wfp_hdx_market_records(rows: list[dict[str, Any]], csv_url: str) -> list[dict[str, Any]]:
+    global _wfp_hdx_records_cache
+    year = _wfp_hdx_market_year_filter()
+    cache_key = (csv_url, year, len(rows), id(rows))
+    if (
+        _wfp_hdx_records_cache
+        and _wfp_hdx_records_cache[0] == cache_key[0]
+        and _wfp_hdx_records_cache[1] == cache_key[1]
+        and _wfp_hdx_records_cache[2] == cache_key[2]
+        and _wfp_hdx_records_cache[3] == cache_key[3]
+    ):
+        return _wfp_hdx_records_cache[4]
+    records = _filter_wfp_hdx_records_by_year(_clean_wfp_hdx_market_rows(rows, csv_url), year)
+    _wfp_hdx_records_cache = (cache_key[0], cache_key[1], cache_key[2], cache_key[3], records)
+    return records
+
+
+def warm_wfp_hdx_market_cache() -> dict[str, Any]:
+    """Load, clean, and year-filter WFP/HDX market rows once at service startup."""
+    if not _market_source_enabled():
+        return {"enabled": False}
+    rows, csv_url = _load_wfp_hdx_market_rows()
+    records = _wfp_hdx_market_records(rows, csv_url)
+    year = _wfp_hdx_market_year_filter()
+    return {
+        "enabled": True,
+        "csv_source": csv_url,
+        "raw_rows": len(rows),
+        "records": len(records),
+        "year_filter": year or "all",
+    }
+
+
+def _fetch_configured_nmis_market_price(crop: str | None, location_or_market: str | None) -> dict[str, Any]:
+    """Optional live market adapter. It is inactive unless NMIS_MARKET_API_URL is configured."""
+    api_url = os.getenv("NMIS_MARKET_API_URL", "").strip()
+    if not api_url or not crop:
+        return {"available": False, "reason": "nmis_api_not_configured"}
+    try:
+        url = api_url.format(crop=crop, market=location_or_market or "", location=location_or_market or "")
+        headers = {}
+        if os.getenv("NMIS_MARKET_API_KEY"):
+            headers["Authorization"] = f"Bearer {os.getenv('NMIS_MARKET_API_KEY')}"
+        with httpx.Client(timeout=float(os.getenv("NMIS_MARKET_TIMEOUT_SEC", "12") or "12")) as client:
+            resp = client.get(url, headers=headers)
+            resp.raise_for_status()
+            payload = resp.json()
+    except Exception as exc:
+        return {"available": False, "reason": f"nmis_error: {exc}"}
+
+    rows = payload
+    if isinstance(payload, dict):
+        rows = payload.get("data") or payload.get("results") or payload.get("items") or [payload]
+    if not isinstance(rows, list):
+        return {"available": False, "reason": "nmis_response_not_list"}
+
+    crop_l = str(crop).strip().lower()
+    loc_l = str(location_or_market or "").strip().lower()
+    best: dict[str, Any] | None = None
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        row_crop = str(_first_present(item, ("crop", "crop_name", "commodity", "product", "item")) or "").lower()
+        row_market = str(_first_present(item, ("market", "market_name", "location", "region", "place")) or "")
+        if row_crop and crop_l not in row_crop and row_crop not in crop_l:
+            continue
+        if loc_l and row_market and loc_l not in row_market.lower() and row_market.lower() not in loc_l:
+            continue
+        best = item
+        break
+    if not best:
+        return {"available": False, "reason": "nmis_no_matching_price", "crop": crop, "market": location_or_market}
+
+    price = _first_present(best, ("price", "price_etb", "value", "amount", "avg_price", "average_price"))
+    if price in (None, ""):
+        return {"available": False, "reason": "nmis_price_missing", "crop": crop, "market": location_or_market}
+    unit = _first_present(best, ("unit", "price_unit", "uom")) or "ETB"
+    updated_at = _first_present(best, ("updated_at", "date", "market_day", "created_at")) or "unknown"
+    market = _first_present(best, ("market", "market_name", "location", "region", "place")) or location_or_market
+    return {
+        "available": True,
+        "crop": crop,
+        "market": market,
+        "requested_market": location_or_market,
+        "price": price,
+        "previous_price": _first_present(best, ("previous_price", "prev_price")),
+        "unit": unit,
+        "trend": str(_first_present(best, ("trend",)) or "unknown").lower(),
+        "updated_at": str(updated_at),
+        "source": "nmis_api",
+        "personalized": bool(location_or_market and market),
+        "needs_location_for_personal_price": not bool(location_or_market),
+        "selling_recommendation": "Use local extension/market confirmation before selling large volume.",
     }
 
 
@@ -692,8 +1234,11 @@ def _final_system_prompt(language_hint: str = "farmer language") -> str:
         "Use local KB and farmer history first, then weather, soil, market, prediction, and web context. "
         "Do not invent missing data. Do not add generic missing-data caveats for topics the farmer did not ask about. "
         "Mention missing data only when it is essential to safely answer the exact question. "
+        "Do not repeat the user's question. Do not mention source names in the spoken answer unless the user asks. "
+        "Do not end with generic 'consult an expert' advice unless the route is an escalation or the context says the issue is unsafe. "
+        "Treat supplemental_sources as lower-priority signposts for relevant datasets, not as direct facts unless retrieved context includes details. "
         "Avoid Markdown formatting such as **bold**, tables, and long numbered outlines. "
-        "For pesticides, chemicals, animal/human health, or severe disease, include safety warnings and advise contacting an extension worker."
+        "Sound like a calm, capable assistant: direct, respectful, and not robotic."
     )
 
 
@@ -746,6 +1291,48 @@ def _simple_market_answer(market: dict[str, Any], language: str) -> str:
         "flat": "Because the price is stable, decide based on cash need and storage capacity.",
         "unknown": "Confirm the local market price before selling a large amount.",
     }.get(str(market.get("trend") or "").lower(), "Confirm the local market price before selling a large amount.")
+    certainty_am = ""
+    certainty_en = ""
+    stale_am = ""
+    stale_en = ""
+    if market.get("source") == "mock_demo_data":
+        certainty_am = " ቀጥታ የገበያ ዋጋ አልተገኘም፤ ይህ በስርዓቱ ያለ አጠቃላይ/የሙከራ ዋጋ ነው።"
+        certainty_en = " Live market price was not available; this is a general/demo value from the system."
+    elif market.get("source") == "local_database" and not market.get("personalized"):
+        certainty_am = " ይህ የተመዘገበ አጠቃላይ ዋጋ ነው፤ የአካባቢዎ ገበያ ሊለይ ይችላል።"
+        certainty_en = " This is a stored general price; your local market may differ."
+    elif market.get("source") == "wfp_hdx" and market.get("approximate"):
+        matched = " / ".join(
+            str(x)
+            for x in (market.get("matched_commodity"), market.get("market"), market.get("matched_admin1"))
+            if x
+        )
+        certainty_am = f" ትክክለኛ ግጥሚያ ስላልተገኘ ይህ የቀረበው ቅርብ ግምታዊ ግጥሚያ ነው: {matched}።"
+        certainty_en = f" No exact match was found; this is the closest approximate match: {matched}."
+    elif market.get("source") == "wfp_hdx":
+        certainty_am = " ይህ በመዝገቡ ያለ የመጨረሻ ዋጋ ነው፤ የአካባቢ ገበያ ሊቀየር ይችላል።"
+        certainty_en = " This is the latest available record; the local market may have changed."
+    if market.get("source") == "wfp_hdx" and market.get("is_stale"):
+        stale_am = (
+            f" ማሳሰቢያ: ይህ ዋጋ {market.get('age_days')} ቀን ያህል የቆየ የመጨረሻ የተገኘ መዝገብ ነው፤ "
+            "እንደ የዛሬ ዋጋ አይጠቀሙት። ከመሸጥዎ በፊት የአካባቢ ገበያን ያረጋግጡ።"
+        )
+        stale_en = (
+            f" Warning: this is the latest available record but it is about {market.get('age_days')} days old; "
+            "do not treat it as today's price. Confirm the local market before selling."
+        )
+    date_note_am = f" የመረጃው ቀን: {market.get('updated_at')}።" if market.get("source") == "wfp_hdx" and market.get("updated_at") else ""
+    date_note_en = f" Data date: {market.get('updated_at')}." if market.get("source") == "wfp_hdx" and market.get("updated_at") else ""
+    price_type_am = (
+        f" የዋጋ አይነት: {market.get('price_type')}።"
+        if market.get("source") == "wfp_hdx" and market.get("price_type")
+        else ""
+    )
+    price_type_en = (
+        f" Price type: {market.get('price_type')}."
+        if market.get("source") == "wfp_hdx" and market.get("price_type")
+        else ""
+    )
     location_followup_am = (
         " ከተማዎን ወይም የሚጠቀሙበትን ገበያ ከነገሩኝ፣ "
         "በዳታቤዙ ካለ የዚያን ቦታ የተለየ ዋጋ እፈትሻለሁ።"
@@ -768,13 +1355,13 @@ def _simple_market_answer(market: dict[str, Any], language: str) -> str:
         else ""
     )
     return (
-        f"የ{crop_am} ዋጋ {market.get('price')} {market.get('unit')} ነው። "
-        f"አዝማሚያው {trend_am} ነው። {recommendation_am}"
-        f"{local_missing_am}{place_note}"
+        f"የ{crop_am} ዋጋ በ{market.get('market') or 'ገበያ'} {market.get('price')} {market.get('unit')} ነው። "
+        f"አዝማሚያው {trend_am} ነው። {recommendation_am}{date_note_am}{price_type_am}{certainty_am}"
+        f"{stale_am}{local_missing_am}{place_note}"
         if language == "am"
         else (
-            f"{crop} price is {market.get('price')} {market.get('unit')}; "
-            f"trend: {market.get('trend')}. {recommendation_en}{local_missing_en}{place_note}"
+            f"{crop} price in {market.get('market') or 'the matched market'} is {market.get('price')} {market.get('unit')}; "
+            f"trend: {market.get('trend')}. {recommendation_en}{date_note_en}{price_type_en}{certainty_en}{stale_en}{local_missing_en}{place_note}"
         )
     )
 
@@ -927,6 +1514,27 @@ def _simple_soil_fertilizer_answer(
     return " ".join(p for p in parts if p).strip()
 
 
+def _is_compost_general_info(question: str) -> bool:
+    q = (question or "").lower()
+    return ("ኮምፖስት" in question or "compost" in q) and any(
+        term in q or term in question
+        for term in ("ጥቅም", "ምንድን", "ምንድነው", "benefit", "what is", "why")
+    )
+
+
+def _simple_compost_answer(language: str) -> str:
+    if language == "am":
+        return (
+            "ኮምፖስት የአፈርን ኦርጋኒክ ንጥረ ነገር ይጨምራል፣ "
+            "የውሃ መያዝ አቅምን ያሻሽላል፣ አፈርን ለሰብል ሥር ይለሰልሳል፣ "
+            "እና ኬሚካል ማዳበሪያን ብቻ መመካትን ይቀንሳል።"
+        )
+    return (
+        "Compost improves soil organic matter, helps the soil hold water, "
+        "supports root growth, and reduces reliance on chemical fertilizer alone."
+    )
+
+
 def _dynamic_source_intro(context: dict[str, Any], language: str) -> str:
     """Build a short voice-friendly source phrase for live tool data."""
     sources: list[str] = []
@@ -990,6 +1598,7 @@ def build_structured_context(
     market: dict[str, Any],
     prediction: dict[str, Any],
     web_results: list[dict[str, Any]],
+    supplemental_sources: list[dict[str, str]],
 ) -> dict[str, Any]:
     return {
         "user_question": question,
@@ -1004,6 +1613,7 @@ def build_structured_context(
         "market": market,
         "prediction": prediction,
         "web_results": web_results,
+        "supplemental_sources": supplemental_sources,
     }
 
 
@@ -1027,12 +1637,42 @@ def build_smart_context_only(
         or entities.get("region_keyword")
         or (profile or {}).get("location")
     )
-    kb = search_knowledge_base(question, hits, top_k=int(os.getenv("RAG_SMART_TOP_K", "5") or "5"))
+    kb = search_knowledge_base(question, hits, top_k=int(os.getenv("RAG_SMART_TOP_K", "4") or "4"))
+    supplemental_sources = supplemental_context_block(question)
     farmer_history = get_farmer_history(phone_number, profile, history_pairs)
+    question_l = (question or "").lower()
+    crop_needs_live_context = any(
+        term in question_l or term in question
+        for term in (
+            "weather",
+            "rain",
+            "forecast",
+            "irrigat",
+            "drought",
+            "soil",
+            "market",
+            "price",
+            "ዝናብ",
+            "አየር",
+            "መስኖ",
+            "ድርቅ",
+            "አፈር",
+            "ገበያ",
+            "ዋጋ",
+        )
+    )
 
     tool_trace: list[dict[str, Any]] = [{"tool": "knowledge_base", "results": len(kb)}]
+    if supplemental_sources:
+        tool_trace.append({
+            "tool": "supplemental_source_catalog",
+            "results": len(supplemental_sources),
+            "priority": "after_kb_and_live_tools",
+        })
     weather = {"available": False, "reason": "not_routed"}
-    if routed["intent"] in {"weather_advice", "irrigation_advice", "disease_diagnosis", "crop_recommendation", "yield_prediction", "emergency_pest_or_disease"}:
+    if routed["intent"] in {"weather_advice", "irrigation_advice", "disease_diagnosis", "yield_prediction", "emergency_pest_or_disease"} or (
+        routed["intent"] == "crop_recommendation" and crop_needs_live_context
+    ):
         weather = get_weather(location)
         tool_trace.append({
             "tool": "weather",
@@ -1054,7 +1694,9 @@ def build_smart_context_only(
         if coords:
             lat, lon, soil_location_source = coords
     soil = {"available": False, "reason": "not_routed"}
-    if routed["intent"] in {"soil_advice", "fertilizer_advice", "irrigation_advice", "crop_recommendation", "yield_prediction"}:
+    if routed["intent"] in {"soil_advice", "fertilizer_advice", "irrigation_advice", "yield_prediction"} or (
+        routed["intent"] == "crop_recommendation" and crop_needs_live_context
+    ):
         soil = get_soil_data(lat, lon)
         tool_trace.append({
             "tool": "soil",
@@ -1068,7 +1710,9 @@ def build_smart_context_only(
         })
 
     ethiosis = {"available": False, "reason": "not_routed"}
-    if routed["intent"] in {"soil_advice", "fertilizer_advice", "crop_recommendation", "yield_prediction", "irrigation_advice"}:
+    if routed["intent"] in {"soil_advice", "fertilizer_advice", "yield_prediction", "irrigation_advice"} or (
+        routed["intent"] == "crop_recommendation" and crop_needs_live_context
+    ):
         ethiosis = get_ethiosis_baseline(location, crop, soil)
         tool_trace.append({
             "tool": "ethiosis",
@@ -1078,7 +1722,9 @@ def build_smart_context_only(
         })
 
     soil_water = {"available": False, "reason": "not_routed"}
-    if routed["intent"] in {"soil_advice", "fertilizer_advice", "irrigation_advice", "crop_recommendation", "yield_prediction"}:
+    if routed["intent"] in {"soil_advice", "fertilizer_advice", "irrigation_advice", "yield_prediction"} or (
+        routed["intent"] == "crop_recommendation" and crop_needs_live_context
+    ):
         soil_water = get_copernicus_soil_water_index(lat, lon, weather=weather)
         tool_trace.append({
             "tool": "soil_water",
@@ -1091,13 +1737,23 @@ def build_smart_context_only(
         })
 
     market = {"available": False, "reason": "not_routed"}
-    if routed["intent"] in {"market_price", "crop_recommendation", "yield_prediction"}:
+    if routed["intent"] in {"market_price", "yield_prediction"} or (
+        routed["intent"] == "crop_recommendation" and crop_needs_live_context
+    ):
         market = get_market_price(crop, location, local_price_func=local_market_price_func)
         tool_trace.append({
             "tool": "market",
             "available": market.get("available"),
             "source": market.get("source"),
             "market": market.get("market"),
+            "matched_commodity": market.get("matched_commodity"),
+            "match_quality": market.get("match_quality"),
+            "approximate": market.get("approximate"),
+            "price_type": market.get("price_type"),
+            "trend": market.get("trend"),
+            "recency_status": market.get("recency_status"),
+            "age_days": market.get("age_days"),
+            "is_stale": market.get("is_stale"),
             "personalized": market.get("personalized"),
             "reason": market.get("reason"),
         })
@@ -1124,6 +1780,7 @@ def build_smart_context_only(
         market=market,
         prediction=prediction,
         web_results=web,
+        supplemental_sources=supplemental_sources,
     )
     return context, tool_trace, kb
 
@@ -1169,6 +1826,8 @@ def run_smart_advisory(
     if routed_intent == "weather_advice":
         answer = _simple_weather_answer(weather, lang)
         return SmartResult(answer, context, kb, False, tool_trace)
+    if routed_intent == "fertilizer_advice" and _is_compost_general_info(question):
+        return SmartResult(_simple_compost_answer(lang), context, kb, False, tool_trace)
     if routed_intent in {"soil_advice", "fertilizer_advice", "irrigation_advice"}:
         answer = _simple_soil_fertilizer_answer(
             soil=soil,
@@ -1188,7 +1847,7 @@ def run_smart_advisory(
     user_block = (
         "Final compact context follows. Answer only from this context. "
         "Only mention missing data if it is essential to the user's exact question; otherwise give the useful advice and stop.\n\n"
-        + _compact(context, max_chars=int(os.getenv("RAG_SMART_CONTEXT_CHARS", "8500") or "8500"))
+        + _compact(context, max_chars=int(os.getenv("RAG_SMART_CONTEXT_CHARS", "4500") or "4500"))
     )
     messages = prepare_rag_llm_messages(system, [], user_block, backend)
     answer, used_backend = run_sync_llm(backend, messages, fast=True)

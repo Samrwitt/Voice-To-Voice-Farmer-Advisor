@@ -602,8 +602,17 @@ def _learn_farmer_memory_from_interaction(
         or data.get("crop_type")
         or data.get("commodity")
     )
-    location = data.get("location") or data.get("region") or data.get("region_keyword")
+    location = (
+        data.get("location")
+        or data.get("location_en")
+        or data.get("location_keyword")
+        or data.get("region")
+        or data.get("region_en")
+        or data.get("region_keyword")
+    )
     language = data.get("language") or data.get("preferred_language")
+    name = data.get("farmer_name") or data.get("name") or data.get("full_name")
+    farm_size = data.get("farm_size_ha") or data.get("farm_size")
     learned: list[str] = []
     if intent:
         learned.append(f"last_intent={intent}")
@@ -611,7 +620,11 @@ def _learn_farmer_memory_from_interaction(
         learned.append(f"crop={crop}")
     if location:
         learned.append(f"location={location}")
-    if not any([crop, location, language, intent]):
+    if farm_size:
+        learned.append(f"farm_size_ha={farm_size}")
+    if name:
+        learned.append(f"name={name}")
+    if not any([crop, location, language, intent, name, farm_size]):
         return
 
     try:
@@ -654,20 +667,24 @@ def _learn_farmer_memory_from_interaction(
                 cur.execute(
                     """
                     INSERT INTO farmers_kb
-                      (phone_number, location, preferred_language, crops, notes, registered_at, updated_at)
-                    VALUES (%s, %s, COALESCE(%s, 'am'), %s::jsonb, %s, NOW(), NOW())
+                      (phone_number, name, location, preferred_language, crops, farm_size, notes, registered_at, updated_at)
+                    VALUES (%s, %s, %s, COALESCE(%s, 'am'), %s::jsonb, %s, %s, NOW(), NOW())
                     ON CONFLICT (phone_number) DO UPDATE SET
+                      name = COALESCE(EXCLUDED.name, farmers_kb.name),
                       location = COALESCE(EXCLUDED.location, farmers_kb.location),
                       preferred_language = COALESCE(EXCLUDED.preferred_language, farmers_kb.preferred_language),
                       crops = COALESCE(EXCLUDED.crops, farmers_kb.crops),
+                      farm_size = COALESCE(EXCLUDED.farm_size, farmers_kb.farm_size),
                       notes = COALESCE(EXCLUDED.notes, farmers_kb.notes),
                       updated_at = NOW();
                     """,
                     (
                         p,
+                        str(name) if name else None,
                         str(location) if location else None,
                         str(language) if language else None,
                         json.dumps(existing_crops, ensure_ascii=False) if existing_crops else None,
+                        float(farm_size) if farm_size else None,
                         notes or None,
                     ),
                 )

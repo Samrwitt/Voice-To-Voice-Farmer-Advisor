@@ -9,9 +9,14 @@ import os
 from typing import Any
 
 from farmer_rag_stack.context_utils import retrieval_query_for
-from farmer_rag_stack.nlu_farmer import augment_retrieval_query_with_nlu, parse_farmer_nlu
+from farmer_rag_stack.nlu_farmer import (
+    augment_retrieval_query_with_nlu,
+    build_search_queries_for_nlu,
+    parse_farmer_nlu,
+)
 from farmer_rag_stack.retrieval_ranking import rank_pg_hits
-from chroma_retrieve import merge_pg_chroma_hits, retrieve_chroma_mirror_hits
+from farmer_rag_stack.source_catalog import supplemental_retrieval_terms
+from chroma_retrieve import dedupe_hits_by_content_prefix, merge_pg_chroma_hits, retrieve_chroma_mirror_hits
 
 
 def ranked_hits_for_voice_query(
@@ -34,23 +39,51 @@ def ranked_hits_for_voice_query(
         retrieval_query_for(nlu.retrieval_query or query_text, conv_msgs),
         farmer_nlu,
     )
+    search_queries = farmer_nlu.search_queries or build_search_queries_for_nlu(rq, farmer_nlu)
+    supplemental_terms = supplemental_retrieval_terms(query_text)
+    if supplemental_terms:
+        search_queries = tuple(list(search_queries) + [f"{rq}\n{supplemental_terms}"])
     pool = max(12, int(os.environ.get("RAG_PG_RETRIEVE_POOL", "40")))
-    raw_hits, best = rag_pg.retrieve_for_query(
-        rq,
-        top_k=pool,
-        max_l2_distance=max_l2_distance,
-        region=user_region,
-    )
+    raw_hits: list[dict[str, Any]] = []
+    best = 999.0
+    for search_q in search_queries[: max(1, int(os.getenv("RAG_REWRITE_MAX_QUERIES", "4") or "4"))]:
+        hh, bb = rag_pg.retrieve_for_query(
+            search_q,
+            top_k=pool,
+            max_l2_distance=max_l2_distance,
+            region=user_region,
+        )
+        raw_hits.extend(hh)
+        best = min(best, bb)
     pg_hits = [h for h in raw_hits if float(h.get("distance", 999)) <= max_l2_distance]
+    keyword_hits: list[dict[str, Any]] = []
+    if os.environ.get("RAG_PG_KEYWORD_SEARCH", "1").strip().lower() not in ("0", "false", "no", "off"):
+        keyword_k = max(8, int(os.getenv("RAG_PG_KEYWORD_TOP_K", "18").strip() or "18"))
+        for search_q in search_queries[: max(1, int(os.getenv("RAG_REWRITE_MAX_QUERIES", "4") or "4"))]:
+            keyword_hits.extend(rag_pg.keyword_search_for_query(search_q, top_k=keyword_k, region=user_region))
+        if keyword_hits:
+            best = min(best, min(float(h.get("distance", 999)) for h in keyword_hits))
     chroma_k = max(8, int(os.getenv("RAG_CHROMA_TOP_K", "18").strip() or "18"))
-    chroma_hits = retrieve_chroma_mirror_hits(rq, top_k=chroma_k)
-    merged = merge_pg_chroma_hits(pg_hits, chroma_hits)
+    chroma_hits: list[dict[str, Any]] = []
+    for search_q in search_queries[:1]:
+        chroma_hits.extend(retrieve_chroma_mirror_hits(search_q, top_k=chroma_k))
+    merged = merge_pg_chroma_hits(dedupe_hits_by_content_prefix(pg_hits + keyword_hits), chroma_hits)
     diagnostics: dict[str, Any] = {
         "query": rq,
+        "analysis": {
+            "crop": farmer_nlu.crop_id,
+            "problem": farmer_nlu.problem,
+            "location": farmer_nlu.location,
+            "season": farmer_nlu.season,
+            "goal": farmer_nlu.goal,
+            "aspect": farmer_nlu.aspect,
+        },
+        "rewritten_queries": list(search_queries),
         "user_region": user_region,
         "max_l2_distance": max_l2_distance,
         "pg_raw_count": len(raw_hits),
         "pg_filtered_count": len(pg_hits),
+        "keyword_count": len(keyword_hits),
         "chroma_count": len(chroma_hits),
         "merged_count": len(merged),
         "best_distance": best,
@@ -64,7 +97,10 @@ def ranked_hits_for_voice_query(
             max_l2_distance=max_l2_distance,
             region=user_region,
         )
-        return [h for h in hh if float(h.get("distance", 999)) <= max_l2_distance]
+        extra = [h for h in hh if float(h.get("distance", 999)) <= max_l2_distance]
+        if os.environ.get("RAG_PG_KEYWORD_SEARCH", "1").strip().lower() not in ("0", "false", "no", "off"):
+            extra.extend(rag_pg.keyword_search_for_query(q, top_k=pool, region=user_region))
+        return extra
 
     keep = max(4, int(os.environ.get("RAG_PG_FINAL_TOP_K", "6")))
     hits = merged

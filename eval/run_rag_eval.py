@@ -16,6 +16,7 @@ import json
 import os
 import sys
 import time
+from statistics import mean, median
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -111,6 +112,71 @@ def _check_rubric(case_id: str, resp: dict, latency_ms: float, rubric: dict) -> 
     return errs
 
 
+def _pct(num: int, den: int) -> float | None:
+    if den <= 0:
+        return None
+    return round((num / den) * 100.0, 1)
+
+
+def _percentile(values: list[float], pct: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    idx = min(len(ordered) - 1, max(0, int((pct / 100.0) * len(ordered) + 0.999999) - 1))
+    return round(ordered[idx], 1)
+
+
+def _aggregate_metrics(cases: list[dict], report: list[dict]) -> dict:
+    by_id = {row.get("id"): row for row in report}
+
+    scenario_total = 0
+    scenario_ok = 0
+    grounding_total = 0
+    grounding_ok = 0
+    grounding_not_total = 0
+    grounding_not_ok = 0
+
+    for case in cases:
+        rubric = case.get("rubric") or {}
+        row = by_id.get(case.get("id")) or {}
+
+        expected_scenario = rubric.get("expect_scenario")
+        if expected_scenario:
+            scenario_total += 1
+            scenario_ok += int(row.get("scenario") == expected_scenario)
+
+        expected_grounding = rubric.get("expect_trust_grounding")
+        if expected_grounding:
+            grounding_total += 1
+            grounding_ok += int(row.get("grounding") == expected_grounding)
+
+        forbidden_grounding = rubric.get("expect_trust_grounding_not") or []
+        if forbidden_grounding:
+            grounding_not_total += 1
+            grounding_not_ok += int(row.get("grounding") not in forbidden_grounding)
+
+    latencies = [float(row["latency_ms"]) for row in report if isinstance(row.get("latency_ms"), (int, float))]
+    passed = sum(1 for row in report if row.get("ok"))
+    references = [int(row.get("references") or 0) for row in report if "references" in row]
+
+    return {
+        "cases_total": len(cases),
+        "cases_passed": passed,
+        "case_pass_rate_pct": _pct(passed, len(cases)),
+        "scenario_accuracy_pct": _pct(scenario_ok, scenario_total),
+        "scenario_cases": scenario_total,
+        "expected_grounding_accuracy_pct": _pct(grounding_ok, grounding_total),
+        "expected_grounding_cases": grounding_total,
+        "forbidden_grounding_pass_rate_pct": _pct(grounding_not_ok, grounding_not_total),
+        "forbidden_grounding_cases": grounding_not_total,
+        "latency_ms_mean": round(mean(latencies), 1) if latencies else None,
+        "latency_ms_p50": round(median(latencies), 1) if latencies else None,
+        "latency_ms_p95": _percentile(latencies, 95),
+        "latency_ms_max": round(max(latencies), 1) if latencies else None,
+        "avg_references": round(mean(references), 1) if references else None,
+    }
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument(
@@ -119,6 +185,11 @@ def main() -> int:
         default=Path(__file__).resolve().parent / "golden_questions.json",
     )
     ap.add_argument("--phone", default=os.getenv("EVAL_PHONE") or f"eval_bot_{int(time.time())}")
+    ap.add_argument(
+        "--same-phone",
+        action="store_true",
+        help="Reuse one phone number across all cases to test personalization carry-over.",
+    )
     ap.add_argument("--session-prefix", default="eval_session")
     args = ap.parse_args()
 
@@ -135,8 +206,9 @@ def main() -> int:
             all_errs.append(f"{cid}: empty question")
             continue
         session = f"{args.session_prefix}_{i}_{int(time.time())}"
+        phone = args.phone if args.same_phone else f"{args.phone}_{i}"
         try:
-            resp, wall_ms = _post_rag_answer(base, q, args.phone, session)
+            resp, wall_ms = _post_rag_answer(base, q, phone, session)
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="ignore") if e.fp else ""
             all_errs.append(f"{cid}: HTTP {e.code} {body[:300]}")
@@ -165,7 +237,14 @@ def main() -> int:
             }
         )
 
-    print(json.dumps({"base_url": base, "cases": report, "failures": all_errs}, indent=2, ensure_ascii=False))
+    metrics = _aggregate_metrics(cases, report)
+    print(
+        json.dumps(
+            {"base_url": base, "metrics": metrics, "cases": report, "failures": all_errs},
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
     if all_errs:
         print("\nFAILED:", len(all_errs), "check(s)", file=sys.stderr)
         return 1

@@ -589,6 +589,29 @@ def _extract_region_entities(text: str) -> dict[str, Any]:
     return out
 
 
+def _extract_profile_entities(text: str) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    farm_size = re.search(
+        r"([0-9]+(?:\.[0-9]+)?)\s*(?:ha|hectare|hectares|ሄክታር)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if farm_size:
+        out["farm_size_ha"] = float(farm_size.group(1))
+
+    name_match = re.search(
+        r"(?:ስሜ|የኔ\s+ስም|my\s+name\s+is|i\s+am)\s+([\u1200-\u137fA-Za-z][\u1200-\u137fA-Za-z .'-]{1,50})",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if name_match:
+        name = re.split(r"\s+(?:ነው|ነኝ|from|ከ|በ|and)\b", name_match.group(1).strip(), maxsplit=1)[0]
+        name = name.strip(" ,፣።.")
+        if 2 <= len(name) <= 50:
+            out["farmer_name"] = name
+    return out
+
+
 def _is_market_price_intent(text: str, lower: str) -> bool:
     """True when the farmer is asking commodity/market price, not rate/dose."""
     has_market = any(_contains(text, lower, k) for k in MARKET_KEYWORDS)
@@ -677,6 +700,7 @@ def analyze_intent(text: str) -> NLUResult:
     lower = stripped.lower()
     entities = _extract_crop_entities(stripped)
     entities.update(_extract_region_entities(stripped))
+    entities.update(_extract_profile_entities(stripped))
 
     # Market price has its own data path in the main app.
     if _is_market_price_intent(stripped, lower):
