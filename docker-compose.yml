@@ -34,8 +34,8 @@ services:
 
   rag-service:
     build:
-      context: rag_service
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: rag_service/Dockerfile
     container_name: rag_service
     depends_on:
       postgres:
@@ -223,6 +223,9 @@ services:
       VAD_TTS_CHUNK_MAX_CHARS: "140"
       VAD_AUDIO_LOG_EVERY: "0"
       MAX_CONCURRENT_ASR: 2
+      VAD_ASR_CONFIRMATION_GATE: "1"
+      VAD_CONFIRMATION_MIN_WORDS: "3"
+      VAD_CONFIRMATION_MIN_CONFIDENCE: "0.68"
     volumes:
       - vad_utterances:/app/utterances
       - logic_data:/app/data:ro

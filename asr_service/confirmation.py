@@ -147,4 +147,8 @@ def build_confirmation_prompt(corrected_text: str) -> str:
     assumed = re.sub(r"\s+", " ", (corrected_text or "").strip())
     if not assumed:
         return "የሰማሁትን በትክክል አላረጋገጥኩም። እባክዎ ጥያቄዎን እንደገና ይናገሩ።"
-    return f"የሰማሁት ይህ ነው፦ {assumed}። ትክክል ነው? እባክዎ አዎ ወይም አይ ይበሉ።"
+    return (
+            f"የሰማሁት ይህ ነው፦ {assumed}። "
+            "ልክ ከሆነ አዎ ወይም።"
+            "ልክ ካልሆነ ደግሞ አይ ይበሉ።"
+        )

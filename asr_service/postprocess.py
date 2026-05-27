@@ -1,173 +1,19 @@
-import re
 import os
 import requests
 from rapidfuzz import process, fuzz
 
 from confirmation import build_confirmation_prompt, needs_confirmation
 from domain_terms import get_asr_vocabulary
+from shared.farmer_text_normalize import (
+    basic_asr_cleanup,
+    correct_known_agri_phrases,
+    normalize_amharic_homophones,
+    normalize_amharic_pronunciation,
+    normalize_farmer_query,
+)
 # from config import USE_HOSTED_LLM_FIX
 # Hosted Groq/Gemini correction is disabled for now to avoid ASR token usage.
 # from hosted_llm_fix import hosted_fix_enabled, semantic_correction_hosted
-
-
-
-def clean_repetitions(text: str, max_repeat: int = 2) -> str:
-    words = text.split()
-    cleaned = []
-
-    last_word = None
-    repeat_count = 0
-
-    for word in words:
-        if word == last_word:
-            repeat_count += 1
-        else:
-            repeat_count = 1
-            last_word = word
-
-        if repeat_count <= max_repeat:
-            cleaned.append(word)
-
-    return " ".join(cleaned)
-
-
-def basic_asr_cleanup(text: str) -> str:
-    text = "" if text is None else str(text)
-    text = text.replace("\u200c", "").replace("\u200d", "")
-    text = text.replace("�", "")
-    text = re.sub(r"\s+", " ", text).strip()
-    text = clean_repetitions(text, max_repeat=2)
-    return text
-
-
-AMHARIC_HOMOPHONE_MAP = {
-    "ሐ": "ሀ", "ኀ": "ሀ", "ሃ": "ሀ", "ሓ": "ሀ", "ኃ": "ሀ", "ኻ": "ሀ",
-    "ሑ": "ሁ", "ኁ": "ሁ", "ኹ": "ሁ",
-    "ሒ": "ሂ", "ኂ": "ሂ", "ኺ": "ሂ",
-    "ሔ": "ሄ", "ኄ": "ሄ", "ኼ": "ሄ",
-    "ሕ": "ህ", "ኅ": "ህ", "ኽ": "ህ",
-    "ሖ": "ሆ", "ኆ": "ሆ", "ኾ": "ሆ",
-
-    "ኣ": "አ", "ዐ": "አ", "ዓ": "አ",
-    "ዑ": "ኡ",
-    "ዒ": "ኢ",
-    "ዔ": "ኤ",
-    "ዕ": "እ",
-    "ዖ": "ኦ",
-
-    "ሠ": "ሰ", "ሡ": "ሱ", "ሢ": "ሲ", "ሣ": "ሳ", "ሤ": "ሴ", "ሥ": "ስ", "ሦ": "ሶ",
-
-    "ፀ": "ጸ", "ፁ": "ጹ", "ፂ": "ጺ", "ፃ": "ጻ", "ፄ": "ጼ", "ፅ": "ጽ", "ፆ": "ጾ",
-}
-
-
-def normalize_amharic_homophones(text: str) -> str:
-    text = basic_asr_cleanup(text)
-    text = "".join(AMHARIC_HOMOPHONE_MAP.get(ch, ch) for ch in text)
-    return re.sub(r"\s+", " ", text).strip()
-
-
-LABIALIZED_TO_FULL_MAP = {
-    "ኋ": "ሁአ",
-    "ሏ": "ሉአ",
-    "ሟ": "ሙአ",
-    "ሯ": "ሩአ",
-    "ሷ": "ሱአ",
-    "ሿ": "ሹአ",
-    "ቋ": "ቁአ",
-    "ቧ": "ቡአ",
-    "ቯ": "ቩአ",
-    "ቷ": "ቱአ",
-    "ቿ": "ቹአ",
-    "ኗ": "ኑአ",
-    "ኟ": "ኙአ",
-    "ኳ": "ኩአ",
-    "ዋ": "ውአ",
-    "ጓ": "ጉአ",
-    "ዟ": "ዙአ",
-    "ዧ": "ዡአ",
-    "ዷ": "ዱአ",
-    "ጇ": "ጁአ",
-    "ጧ": "ጡአ",
-    "ጯ": "ጩአ",
-    "ጿ": "ጹአ",
-    "ፏ": "ፉአ",
-    "ፗ": "ፑአ",
-}
-
-SADIS_WA_TO_FULL_MAP = {
-    "ህዋ": "ሁአ",
-    "ልዋ": "ሉአ",
-    "ምዋ": "ሙአ",
-    "ርዋ": "ሩአ",
-    "ስዋ": "ሱአ",
-    "ሥዋ": "ሱአ",
-    "ሽዋ": "ሹአ",
-    "ቅዋ": "ቁአ",
-    "ብዋ": "ቡአ",
-    "ቭዋ": "ቩአ",
-    "ትዋ": "ቱአ",
-    "ችዋ": "ቹአ",
-    "ንዋ": "ኑአ",
-    "ኝዋ": "ኙአ",
-    "ክዋ": "ኩአ",
-    "ግዋ": "ጉአ",
-    "ዝዋ": "ዙአ",
-    "ዥዋ": "ዡአ",
-    "ድዋ": "ዱአ",
-    "ጅዋ": "ጁአ",
-    "ጥዋ": "ጡአ",
-    "ጭዋ": "ጩአ",
-    "ጽዋ": "ጹአ",
-    "ፅዋ": "ጹአ",
-    "ፍዋ": "ፉአ",
-    "ፕዋ": "ፑአ",
-}
-
-PRONUNCIATION_VARIANT_MAP = {
-    **SADIS_WA_TO_FULL_MAP,
-    **LABIALIZED_TO_FULL_MAP,
-}
-
-
-def normalize_amharic_pronunciation(text: str) -> str:
-    text = normalize_amharic_homophones(text)
-
-    for src in sorted(PRONUNCIATION_VARIANT_MAP.keys(), key=len, reverse=True):
-        text = text.replace(src, PRONUNCIATION_VARIANT_MAP[src])
-
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def correct_known_agri_phrases(text: str) -> str:
-    """Repair common multi-word ASR splits that single-token fuzzy matching misses."""
-    normalized = re.sub(r"\s+", " ", (text or "").strip())
-    if not normalized:
-        return ""
-
-    # Example observed from SIP audio:
-    # "የአስ ቫር አ ሲዳን ማጅመት ከምኑ ይታወቃል"
-    # should be routed as "የአፈር አሲዳማነት ምልክት ከምን ይታወቃል".
-    normalized = re.sub(r"\bየ?አስ\s+ቫር\s+አ\s+ሲዳን\b", "የአፈር አሲዳማነት", normalized)
-    normalized = re.sub(r"\bየ?አፈር?\s+ራሲ\s+ዳማነት\b", "የአፈር አሲዳማነት", normalized)
-    normalized = re.sub(r"\bየ?አሰ\s+ፊዳብ\b", "የአፈር አሲዳማነት", normalized)
-    normalized = re.sub(r"\bየ?አስ\s+ቫር\b", "የአፈር", normalized)
-    normalized = re.sub(r"\bአ\s+ሲዳን\b|\bአሲዳን\b|\bሲዳን\b", "አሲዳማነት", normalized)
-    normalized = re.sub(r"\bማጅመት\b|\bመጅመት\b|\bማጅኘት\b", "ምልክት", normalized)
-    normalized = re.sub(r"\bከምኑ\b", "ከምን", normalized)
-    normalized = re.sub(r"\bበውን\b", "በምን", normalized)
-    normalized = re.sub(r"\bተወቃል\b", "ይታወቃል", normalized)
-
-    compact = normalized.replace(" ", "")
-    soilish = any(token in compact for token in ("የአፈር", "አፈር", "አስቫር", "አሰፊዳብ", "ፊዳብ"))
-    acidish = any(token in compact for token in ("አሲዳ", "ሲዳ", "ዳማነት", "ራሲዳማነት", "ፊዳብ"))
-    questionish = any(token in compact for token in ("ይታወቃል", "ታወቃል", "ምልክት", "በምን", "ከምን"))
-    if soilish and acidish:
-        if questionish:
-            return "የአፈር አሲዳማነት ምልክት በምን ይታወቃል"
-        return "የአፈር አሲዳማነት"
-
-    return re.sub(r"\s+", " ", normalized).strip()
 
 
 def correct_domain_terms_with_meta(text: str, threshold: int | None = None) -> tuple[str, dict]:
@@ -242,8 +88,6 @@ def detect_unusual_words(text: str, min_len: int = 3) -> list[str]:
 
     for word in text.split():
         if len(word) >= min_len and word not in vocab:
-            # This is intentionally simple for demo.
-            # Later you can merge ALFFA lexicon + KB vocabulary.
             unusual.append(word)
 
     return unusual
@@ -254,18 +98,6 @@ def _apply_semantic_correction(domain_corrected: str) -> tuple[str, str | None, 
     Returns ``(final_text, semantic_corrected_or_none, fix_backend)``.
     fix_backend: groq | gemini | none
     """
-    # Hosted Groq/Gemini correction is intentionally commented out for now.
-    # use_hosted = USE_HOSTED_LLM_FIX in ("1", "true", "yes", "on") or (
-    #     USE_HOSTED_LLM_FIX == "auto" and hosted_fix_enabled()
-    # )
-    # if use_hosted:
-    #     try:
-    #         fixed, backend = semantic_correction_hosted(domain_corrected)
-    #         if backend and backend != "none" and fixed.strip():
-    #             return fixed, fixed, backend
-    #     except Exception as exc:
-    #         print(f"Hosted ASR fix failed, falling back: {exc}")
-
     return domain_corrected, None, None
 
 
@@ -277,6 +109,7 @@ def postprocess_asr_transcript(raw_text: str, acoustic_confidence: float | None 
     domain_corrected, fuzzy_meta = correct_domain_terms_with_meta(phrase_corrected)
 
     final_text, semantic_corrected, fix_backend = _apply_semantic_correction(domain_corrected)
+    final_text = normalize_farmer_query(final_text)
 
     unusual_words = detect_unusual_words(final_text)
     from confirmation import transcript_quality_confidence

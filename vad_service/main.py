@@ -16,6 +16,14 @@ from voice_flow import (
     chunk_tts_text,
     classify_confirmation_reply_from_asr,
 )
+from shared.confirmation_policy import (
+    CLARIFY_REPROMPT_AM,
+    apply_normalized_transcript_to_asr_result,
+    best_transcript_from_asr,
+    vad_confirmation_gate_enabled,
+    vad_flow_decision,
+)
+from shared.farmer_text_normalize import normalize_farmer_query
 
 
 app = FastAPI(title="Silero VAD Service")
@@ -324,9 +332,12 @@ async def handle_completed_utterance(
         if pending_transcript:
             confirmation_reply = classify_confirmation_reply_from_asr(asr_result)
             if confirmation_reply == "yes":
-                transcript = pending_transcript
-                confirmed_pending_transcript = True
                 pending_meta = session_state.pending_confirmation_asr_meta or {}
+                transcript = best_transcript_from_asr(
+                    {**pending_meta, "transcript": pending_transcript}
+                )
+                transcript = normalize_farmer_query(transcript)
+                confirmed_pending_transcript = True
                 print(
                     f"[ASR CONFIRMED] session={session_id}, transcript={transcript!r}",
                     flush=True,
@@ -334,15 +345,17 @@ async def handle_completed_utterance(
                 session_state.pending_confirmation_transcript = None
                 session_state.pending_confirmation_asr_meta = None
                 session_state.pending_confirmation_utterance_path = None
-                asr_result = {
-                    **pending_meta,
-                    "transcript": pending_transcript,
-                    "text": pending_transcript,
-                    "final_transcript": pending_transcript,
-                    "structured_transcript": pending_transcript,
-                    "needs_confirmation": False,
-                    "confirmation_reply": "yes",
-                }
+                asr_result = apply_normalized_transcript_to_asr_result(
+                    {
+                        **pending_meta,
+                        "transcript": transcript,
+                        "text": transcript,
+                        "final_transcript": transcript,
+                        "structured_transcript": transcript,
+                        "needs_confirmation": False,
+                        "confirmation_reply": "yes",
+                    }
+                )
             elif confirmation_reply == "no":
                 session_state.pending_confirmation_transcript = None
                 session_state.pending_confirmation_asr_meta = None
@@ -429,6 +442,9 @@ async def handle_completed_utterance(
                 )
                 return
 
+        asr_result = apply_normalized_transcript_to_asr_result(asr_result)
+        transcript = asr_result.get("transcript")
+
         from transcript_quality import GIBBERISH_REPLY_AM, is_asr_gibberish
 
         conf = asr_result.get("confidence")
@@ -476,10 +492,56 @@ async def handle_completed_utterance(
             )
             return
 
+        flow_decision = vad_flow_decision(asr_result)
         if (
-            os.getenv("VAD_ASR_CONFIRMATION_GATE", "1").strip().lower()
-            in ("1", "true", "yes", "on")
-            and asr_result.get("needs_confirmation")
+            not confirmed_pending_transcript
+            and flow_decision == "reprompt"
+        ):
+            rag_answer = CLARIFY_REPROMPT_AM
+            print(
+                f"[ASR CLARIFY REPROMPT] session={session_id}, "
+                f"transcript={transcript!r}, conf={conf_f}",
+                flush=True,
+            )
+            await safe_send(
+                websocket,
+                send_lock,
+                {
+                    "event": "rag_answer",
+                    "session_id": session_id,
+                    "utterance_path": utterance_path,
+                    "response": rag_answer,
+                    "references": [],
+                    "trust": {"grounding": "vad_clarify"},
+                    "meta": {"reason": "vad_clarify_reprompt"},
+                    "message": "Utterance unclear; asking user to repeat",
+                },
+            )
+            await safe_send(
+                websocket,
+                send_lock,
+                {
+                    "event": "tts_started",
+                    "session_id": session_id,
+                    "utterance_path": utterance_path,
+                    "message": "Synthesizing voice response...",
+                },
+            )
+            session_state.playback_task = asyncio.create_task(
+                play_advisor_response(
+                    websocket=websocket,
+                    send_lock=send_lock,
+                    session_id=session_id,
+                    utterance_path=utterance_path,
+                    rag_answer=rag_answer,
+                    playback_sample_rate=playback_sample_rate,
+                )
+            )
+            return
+
+        if (
+            vad_confirmation_gate_enabled()
+            and flow_decision == "confirm"
             and not confirmed_pending_transcript
         ):
             session_state.pending_confirmation_transcript = transcript
@@ -487,11 +549,12 @@ async def handle_completed_utterance(
                 "raw_transcript": asr_result.get("raw_transcript"),
                 "final_transcript": asr_result.get("final_transcript"),
                 "structured_transcript": asr_result.get("structured_transcript"),
+                "domain_corrected_transcript": asr_result.get("domain_corrected_transcript"),
                 "confidence": asr_result.get("confidence"),
                 "acoustic_confidence": asr_result.get("acoustic_confidence"),
                 "fuzzy": asr_result.get("fuzzy"),
                 "transcript_fix_backend": asr_result.get("transcript_fix_backend"),
-                "needs_confirmation": asr_result.get("needs_confirmation"),
+                "needs_confirmation": False,
                 "confirmation_prompt": asr_result.get("confirmation_prompt"),
                 "unusual_words": asr_result.get("unusual_words"),
                 "engine": asr_result.get("engine"),
@@ -503,7 +566,8 @@ async def handle_completed_utterance(
                 asr_result.get("confirmation_prompt"),
             )
             print(
-                f"[ASR CONFIRMATION] session={session_id}, transcript={transcript!r}",
+                f"[ASR CONFIRMATION] session={session_id}, transcript={transcript!r}, "
+                f"decision={flow_decision}",
                 flush=True,
             )
             await safe_send(
@@ -565,11 +629,13 @@ async def handle_completed_utterance(
                 "acoustic_confidence": asr_result.get("acoustic_confidence"),
                 "fuzzy": asr_result.get("fuzzy"),
                 "transcript_fix_backend": asr_result.get("transcript_fix_backend"),
-                "needs_confirmation": asr_result.get("needs_confirmation"),
+                "needs_confirmation": False,
+                "confirmation_handled_by_vad": True,
                 "confirmation_prompt": asr_result.get("confirmation_prompt"),
                 "unusual_words": asr_result.get("unusual_words"),
                 "engine": asr_result.get("engine"),
                 "audio_id": asr_result.get("audio_id"),
+                "vad_normalized_transcript": asr_result.get("vad_normalized_transcript"),
             },
         )
 

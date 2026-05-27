@@ -8,7 +8,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --default-timeout=100 --retries=10 silero-vad --no-deps
 
+COPY shared/ /app/shared/
 COPY vad_service/*.py /app/
+
+ENV PYTHONPATH=/app
 
 RUN mkdir -p /app/utterances
 EXPOSE 8010
