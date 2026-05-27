@@ -14,7 +14,10 @@ import time
 from pathlib import Path
 from database import (
     collection, add_to_escalation, log_conversation,
-    get_conversation_history, get_market_price, register_farmer,
+    get_conversation_history,
+    get_market_price,
+    get_recent_conversation_by_phone,
+    register_farmer,
     get_farmer_profile, get_alerts_for_region, set_session_state,
     get_session_state, insert_call_record, log_interaction_record,
     get_dynamic_knowledge, set_dynamic_knowledge,
@@ -154,7 +157,27 @@ class RagDebugContextRequest(BaseModel):
     retrieve: bool = True
 
 
-def _inherit_missing_entities_from_history(nlu, history_pairs: list[tuple[str, str]]) -> None:
+def _history_mentions_market(role: str, message: str) -> bool:
+    msg = (message or "").strip()
+    if not msg:
+        return False
+    if role == "user":
+        prior = analyze_intent(msg)
+        return getattr(prior, "primary_intent", "") == "market_price"
+    if role == "assistant":
+        return any(
+            token in msg
+            for token in ("ብር/100", "ዋጋ በ", "የጤፍ ዋጋ", "የስንዴ ዋጋ", "ገበያ", "wfp_hdx", "14000")
+        )
+    return False
+
+
+def _inherit_missing_entities_from_history(
+    nlu,
+    history_pairs: list[tuple[str, str]],
+    *,
+    query_text: str = "",
+) -> None:
     """
     Carry crop/location context across short voice follow-ups in the same session.
     The NLU result is mutable, so downstream routing, retrieval, and smart tools
@@ -172,27 +195,25 @@ def _inherit_missing_entities_from_history(nlu, history_pairs: list[tuple[str, s
         "location_en",
         "location_keyword",
     )
-    if all(entities.get(key) for key in ("crop_en",)):
-        return
 
     inherited_from_market = False
     for role, message in reversed(history_pairs or []):
-        if role != "user" or not (message or "").strip():
+        if not (message or "").strip():
             continue
-        prior = analyze_intent(message)
-        prior_entities = getattr(prior, "entities", {}) or {}
-        prior_was_market = getattr(prior, "primary_intent", "") == "market_price"
+        prior_entities: dict = {}
+        prior_was_market = _history_mentions_market(role, message)
+        if role == "user":
+            prior = analyze_intent(message)
+            prior_entities = getattr(prior, "entities", {}) or {}
         copied = False
         for key in wanted:
             if not entities.get(key) and prior_entities.get(key):
                 entities[key] = prior_entities[key]
                 copied = True
-        if copied and prior_was_market:
+        if prior_was_market:
             inherited_from_market = True
         if copied:
             entities["context_source"] = "session_history"
-        if entities.get("crop_en"):
-            break
 
     has_place_now = bool(
         entities.get("location_en")
@@ -200,15 +221,42 @@ def _inherit_missing_entities_from_history(nlu, history_pairs: list[tuple[str, s
         or entities.get("region_en")
         or entities.get("region_keyword")
     )
-    if (
-        inherited_from_market
-        and has_place_now
-        and getattr(nlu, "primary_intent", "unknown") in {"unknown", "general_agronomy"}
-    ):
+    q = (query_text or "").strip()
+    location_followup = has_place_now and len(q) < 96 and not any(
+        token in q for token in ("ዋጋ", "ገበያ", "price", "market", "ሽያጭ")
+    )
+    if inherited_from_market and location_followup and getattr(nlu, "primary_intent", "unknown") in {
+        "unknown",
+        "general_agronomy",
+        "soil_fertility",
+        "crop_production",
+    }:
         nlu.primary_intent = "market_price"
         nlu.confidence = max(float(getattr(nlu, "confidence", 0.0) or 0.0), 0.78)
         nlu.retrieval_query = "market price follow-up with location"
         entities["intent_source"] = "session_history_market_followup"
+
+
+def _voice_tool_fast_route(scenario_decision, nlu, profile, *, query_text: str = "") -> bool:
+    """Routes that can answer from live tools without KB retrieval."""
+    if scenario_decision.needs_clarification:
+        return False
+    hint = scenario_decision.route_hint
+    if hint in {"market", "weather"}:
+        return True
+    if hint != "kb_tool":
+        return False
+    from farmer_rag_stack.smart_advisory import _is_compost_general_info
+
+    if _is_compost_general_info(query_text):
+        return True
+    entities = getattr(nlu, "entities", {}) or {}
+    return bool(
+        entities.get("location_en")
+        or entities.get("location_keyword")
+        or entities.get("region_en")
+        or (profile or {}).get("location")
+    )
 
 
 def _require_metrics_token(authorization: Optional[str] = Header(None)) -> None:
@@ -459,11 +507,19 @@ def is_amharic(text: str) -> bool:
 
 # ── Grounded answer without LLM (combine top chunks, Amharic framing) ───────
 def compose_grounded_answer_no_llm(query_text: str, hits: list[dict], max_chars: int = 3200) -> str:
+    from farmer_rag_stack.smart_advisory import strip_provider_names_from_voice
+
     if not hits:
         return ""
+    voice_compose = os.environ.get("RAG_VOICE_COMPOSE_FIRST", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
     if len(hits) == 1:
-        return (hits[0].get("content") or "")[:max_chars]
-    intro = "ከሰነዶች የተገኘው መረጃ እንደሚከተለው ነው።\n\n"
+        return strip_provider_names_from_voice((hits[0].get("content") or "")[:max_chars])
+    intro = "" if voice_compose else "ከሰነዶች የተገኘው መረጃ እንደሚከተለው ነው።\n\n"
     parts: list[str] = []
     budget = max(200, max_chars - len(intro) - 40)
     per = budget // min(len(hits), 3)
@@ -473,7 +529,8 @@ def compose_grounded_answer_no_llm(query_text: str, hits: list[dict], max_chars:
             continue
         cap = min(len(body), per)
         parts.append(f"({i}) {body[:cap]}")
-    return (intro + "\n\n".join(parts))[:max_chars]
+    body = ("\n\n".join(parts) if not intro else intro + "\n\n".join(parts))
+    return strip_provider_names_from_voice(body[:max_chars])
 
 
 def _format_expert_delivery_text(delivery: dict | None) -> str:
@@ -1227,8 +1284,13 @@ async def rag_answer(req: RagAnswerRequest):
     expert_delivery = _format_expert_delivery_text(expert_delivery_payload)
 
     hist = get_conversation_history(req.session_id, limit=6)
-    hist_pairs = list(hist)
-    _inherit_missing_entities_from_history(nlu, hist_pairs)
+    phone_hist = get_recent_conversation_by_phone(
+        req.phone_number,
+        limit=4,
+        exclude_session_id=req.session_id,
+    )
+    hist_pairs = list(phone_hist) + list(hist)
+    _inherit_missing_entities_from_history(nlu, hist_pairs, query_text=query_text)
 
     crop_name = getattr(nlu, "entities", {}).get("crop_en") if nlu else None
     nlu_location = getattr(nlu, "entities", {}).get("location_en") if nlu else None
@@ -1331,6 +1393,8 @@ async def rag_answer(req: RagAnswerRequest):
         "መርጨት",
         "መርጨ",
         "ርጭት",
+        "እጠቀም",
+        "መጠቀም",
         "dose",
         "dosage",
         "rate",
@@ -1356,10 +1420,8 @@ async def rag_answer(req: RagAnswerRequest):
             nlu=nlu,
         )
 
-    if (
-        scenario_decision.route_hint in {"market", "weather"}
-        and os.environ.get("RAG_SMART_PIPELINE", "1").strip().lower() not in ("0", "false", "no", "off")
-    ):
+    smart_on = os.environ.get("RAG_SMART_PIPELINE", "1").strip().lower() not in ("0", "false", "no", "off")
+    if smart_on and _voice_tool_fast_route(scenario_decision, nlu, profile, query_text=query_text):
         try:
             smart = run_smart_advisory(
                 question=query_text,
@@ -1465,24 +1527,37 @@ async def rag_answer(req: RagAnswerRequest):
             return out_hit
 
     max_d = float(os.environ.get("RAG_PG_MAX_L2_DISTANCE", str(RAG_PG_MAX_L2_DISTANCE)))
-    try:
-        hits, _rq, _farmer_nlu, best, retrieval_diag = ranked_hits_for_voice_query(
-            query_text=query_text,
-            nlu=nlu,
-            user_region=user_region,
-            hist_pairs=hist_pairs,
-            max_l2_distance=max_d,
-        )
-    except (FileNotFoundError, OSError) as exc:
-        logger.error("RAG embedding model is missing: %s", exc)
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "error": "embedding_model_missing_or_incomplete",
-                "message": str(exc),
-                "fix": "Run `python download_models.py`, or set KB_EMBEDDING_MODEL to an existing SentenceTransformer path/model.",
-            },
-        ) from exc
+    hits: list[dict] = []
+    best: float | None = None
+    retrieval_diag: dict = {}
+    skip_retrieval = smart_on and _voice_tool_fast_route(
+        scenario_decision, nlu, profile, query_text=query_text
+    )
+    if skip_retrieval:
+        retrieval_diag = {
+            "skipped": True,
+            "reason": "tool_fast_route",
+            "route_hint": scenario_decision.route_hint,
+        }
+    else:
+        try:
+            hits, _rq, _farmer_nlu, best, retrieval_diag = ranked_hits_for_voice_query(
+                query_text=query_text,
+                nlu=nlu,
+                user_region=user_region,
+                hist_pairs=hist_pairs,
+                max_l2_distance=max_d,
+            )
+        except (FileNotFoundError, OSError) as exc:
+            logger.error("RAG embedding model is missing: %s", exc)
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "embedding_model_missing_or_incomplete",
+                    "message": str(exc),
+                    "fix": "Run `python download_models.py`, or set KB_EMBEDDING_MODEL to an existing SentenceTransformer path/model.",
+                },
+            ) from exc
 
     agro_max = chemical_safety.agrochemical_max_l2_distance(max_d)
     kb_grounded = voice_guards.kb_grounded_for_voice(hits, best, max_d)
@@ -1581,6 +1656,17 @@ async def rag_answer(req: RagAnswerRequest):
             logger.warning("Smart advisory pipeline failed; falling back to legacy RAG path: %s", exc)
 
     if hits:
+        compose_first = os.environ.get("RAG_VOICE_COMPOSE_FIRST", "1").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+        if compose_first and not answer.strip():
+            composed = compose_grounded_answer_no_llm(query_text, hits)
+            if (composed or "").strip():
+                answer = composed
+                used_compose = True
         if not answer.strip():
             llm_try = (
                 try_llm_assistant_response(
@@ -1597,10 +1683,11 @@ async def rag_answer(req: RagAnswerRequest):
             if llm_try.strip():
                 answer = llm_try
                 used_llm = True
-    if not answer.strip() and hits:
-        answer = compose_grounded_answer_no_llm(query_text, hits)
-        if (answer or "").strip():
-            used_compose = True
+        if not answer.strip():
+            composed = compose_grounded_answer_no_llm(query_text, hits)
+            if (composed or "").strip():
+                answer = composed
+                used_compose = True
 
     if dyn and answer:
         final = f"{dyn}\n\n{answer}"
@@ -1648,8 +1735,10 @@ async def rag_answer(req: RagAnswerRequest):
     if voice_cap > 0 and len(final) > voice_cap:
         final = final[: max(0, voice_cap - 3)].rstrip() + "..."
 
-    final = normalize_text(final)
-    current_response = normalize_text(current_response)
+    from farmer_rag_stack.smart_advisory import strip_provider_names_from_voice
+
+    final = strip_provider_names_from_voice(normalize_text(final))
+    current_response = strip_provider_names_from_voice(normalize_text(current_response))
 
     latency_ms = (time.perf_counter() - t0) * 1000
     sla_h = int(os.getenv("ESCALATION_SLA_HOURS", "48") or "48")

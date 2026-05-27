@@ -474,7 +474,7 @@ def get_ethiosis_baseline(location: str | None, crop: str | None, soil: dict[str
     if crop:
         recommendations.append(f"ለ{_amharic_crop_name(crop)} የNPS/UREA መጠን ከወረዳ/ቀበሌ ምክር እና የአፈር ምርመራ ጋር ይወሰን።")
     if not recommendations:
-        recommendations.append("የማዳበሪያ ውሳኔን በአፈር ምርመራ፣ በሰብል አይነት እና በአካባቢ EthioSIS ምክር ላይ ያድርጉ።")
+        recommendations.append("የማዳበሪያ ውሳኔን በአፈር ምርመራ፣ በሰብል አይነት እና በአካባቢ የአፈር ካርታ ምክር ላይ ያድርጉ።")
     return {
         "available": True,
         "source": "EthioSIS baseline",
@@ -1242,9 +1242,38 @@ def _final_system_prompt(language_hint: str = "farmer language") -> str:
     )
 
 
+_PROVIDER_NAME_PATTERNS = (
+    r"EthioSIS",
+    r"SoilGrids",
+    r"Copernicus",
+    r"Open-Meteo",
+    r"ISRIC",
+    r"NMiS",
+    r"HDX",
+    r"wfp_hdx",
+)
+
+
+def strip_provider_names_from_voice(text: str) -> str:
+    """Remove data-provider labels from spoken farmer answers."""
+    out = (text or "").strip()
+    if not out:
+        return ""
+    for pat in _PROVIDER_NAME_PATTERNS:
+        out = re.sub(pat, "", out, flags=re.IGNORECASE)
+    out = re.sub(
+        r"የአየር መረጃው ከ\s*ነው።",
+        "የአየር ሁኔታው እንደሚከተለው ነው።",
+        out,
+    )
+    out = re.sub(r"\s{2,}", " ", out)
+    out = re.sub(r"\s+።", "።", out)
+    return out.strip()
+
+
 def sanitize_voice_advice(answer: str, question: str) -> str:
     """Remove LLM boilerplate that is unhelpful for voice answers."""
-    text = (answer or "").strip()
+    text = strip_provider_names_from_voice(answer)
     if not text:
         return ""
 
@@ -1368,28 +1397,30 @@ def _simple_market_answer(market: dict[str, Any], language: str) -> str:
 
 def _simple_weather_answer(weather: dict[str, Any], language: str) -> str:
     if weather.get("available"):
-        source_label = (
-            "Open-Meteo አልተገኘም፤ ጊዜያዊ የቦታ ግምት"
-            if weather.get("source") == "offline_location_estimate"
-            else "Open-Meteo"
-        )
         if language == "am":
             summary = "ዝናብ ይጠበቃል" if weather.get("summary") == "rain_expected" else "በአብዛኛው ደረቅ ሊሆን ይችላል"
+            rain_now = weather.get("rain_now_mm")
+            if rain_now is None:
+                rain_now = weather.get("rainfall_now_mm")
             return (
-                f"የአየር መረጃው ከ{source_label} ነው። ቦታ: {weather.get('location')}። "
+                f"ቦታ: {weather.get('location')}። "
                 f"ሙቀት {weather.get('temperature_c')}°C፣ እርጥበት {weather.get('humidity_pct')}%፣ "
-                f"አሁን ዝናብ {weather.get('rain_now_mm') if weather.get('rain_now_mm') is not None else weather.get('rainfall_now_mm')} ሚሜ፣ "
+                f"አሁን ዝናብ {rain_now} ሚሜ፣ "
                 f"የ7 ቀን ዝናብ {weather.get('rainfall_7d_mm')} ሚሜ ነው። {summary}።"
             )
         return (
-            f"Open-Meteo weather for {weather.get('location')}: temperature {weather.get('temperature_c')} C, "
+            f"Weather for {weather.get('location')}: temperature {weather.get('temperature_c')} C, "
             f"humidity {weather.get('humidity_pct')}%, current rain {weather.get('rain_now_mm')}, "
             f"7-day rainfall {weather.get('rainfall_7d_mm')} mm."
         )
     reason = weather.get("reason") or "unknown"
     if reason == "location_missing":
         return "የአየር መረጃ ለመፈተሽ ከተማዎን ወይም አካባቢዎን ይንገሩኝ።" if language == "am" else "Tell me your town or area to check weather."
-    return f"የOpen-Meteo የአየር መረጃ አልተገኘም። ምክንያት: {reason}" if language == "am" else f"Open-Meteo weather was not available: {reason}"
+    return (
+        "የአየር መረጃ አልተገኘም። ትንሽ ቆይተው ይሞክሩ ወይም አካባቢዎን ይግለጹ።"
+        if language == "am"
+        else f"Weather was not available: {reason}"
+    )
 
 
 def _scaled_soil_ph(value: Any) -> float | None:
@@ -1440,11 +1471,15 @@ def _simple_soil_answer(soil: dict[str, Any], language: str) -> str:
         reason = soil.get("reason") or "unknown"
         if reason == "coordinates_missing":
             return (
-                "የSoilGrids የአፈር መረጃ ለመፈተሽ latitude እና longitude ወይም ከተማ/አካባቢ ይስጡኝ።"
+                "የአፈር መረጃ ለመፈተሽ ከተማዎን ወይም ወረዳ/አካባቢዎን ይንገሩኝ።"
                 if language == "am"
-                else "Give latitude/longitude or a town/area to check SoilGrids soil data."
+                else "Tell me your town or district to check soil information."
             )
-        return f"የSoilGrids የአፈር መረጃ አልተገኘም። ምክንያት: {reason}" if language == "am" else f"SoilGrids soil data was not available: {reason}"
+        return (
+            "የአፈር መረጃ አልተገኘም። አካባቢዎን ይግለጹ ወይም የአፈር ምርመራ ያድርጉ።"
+            if language == "am"
+            else f"Soil data was not available: {reason}"
+        )
 
     ph = _scaled_soil_ph(soil.get("ph_h2o"))
     texture = soil.get("soil_texture") or "unknown"
@@ -1511,7 +1546,40 @@ def _simple_soil_fertilizer_answer(
         parts.append("ኮምፖስት/ፍግ ይጨምሩ፣ ከዚያ የማዳበሪያ መጠንን በአፈር ምርመራ ያረጋግጡ።")
     elif not ethiosis.get("available"):
         parts.append("ትክክለኛ መጠን ለመስጠት ሰብል፣ ወረዳ/ቀበሌ እና የአፈር ምርመራ ያስፈልጋሉ።")
-    return " ".join(p for p in parts if p).strip()
+    return strip_provider_names_from_voice(" ".join(p for p in parts if p).strip())
+
+
+def _voice_kb_excerpt_from_hits(hits: list[dict[str, Any]], *, max_chars: int = 520) -> str:
+    """Fast grounded voice answer from ranked KB hits (no final LLM)."""
+    if not hits:
+        return ""
+    try:
+        max_dist = float(
+            os.getenv(
+                "RAG_VOICE_KB_MAX_L2",
+                os.getenv("RAG_PG_MAX_L2_DISTANCE", "1.35"),
+            )
+            or "1.35"
+        )
+    except ValueError:
+        max_dist = 1.35
+    ranked = sorted(hits, key=lambda h: float(h.get("distance", 999)))
+    top = ranked[0]
+    if float(top.get("distance", 999)) > max_dist:
+        return ""
+    cap = max(120, max_chars)
+    parts: list[str] = []
+    per = max(80, cap // min(2, len(ranked[:2])))
+    for h in ranked[:2]:
+        body = (h.get("content") or "").strip()
+        if body:
+            parts.append(body[:per])
+    if not parts:
+        return ""
+    text = " ".join(parts)
+    if len(text) > cap:
+        text = text[: max(0, cap - 3)].rstrip() + "..."
+    return text
 
 
 def _is_compost_general_info(question: str) -> bool:
@@ -1814,29 +1882,45 @@ def run_smart_advisory(
 
     # Cheap deterministic paths keep live tool answers working even without a final LLM.
     lang = (profile or {}).get("preferred_language") or (profile or {}).get("primary_language") or "am"
+    def _finish_voice(answer: str, *, used_llm: bool) -> SmartResult:
+        cleaned = strip_provider_names_from_voice(sanitize_voice_advice(answer, question))
+        if not used_llm:
+            cleaned = _ensure_spoken_source_reference(cleaned, context, lang)
+        return SmartResult(cleaned, context, kb, used_llm, tool_trace)
+
     if routed_intent == "market_price" and market.get("available"):
-        answer = _simple_market_answer(market, lang)
-        return SmartResult(
-            _ensure_spoken_source_reference(answer, context, lang),
-            context,
-            kb,
-            False,
-            tool_trace,
-        )
+        return _finish_voice(_simple_market_answer(market, lang), used_llm=False)
     if routed_intent == "weather_advice":
-        answer = _simple_weather_answer(weather, lang)
-        return SmartResult(answer, context, kb, False, tool_trace)
+        return _finish_voice(_simple_weather_answer(weather, lang), used_llm=False)
     if routed_intent == "fertilizer_advice" and _is_compost_general_info(question):
-        return SmartResult(_simple_compost_answer(lang), context, kb, False, tool_trace)
+        return _finish_voice(_simple_compost_answer(lang), used_llm=False)
     if routed_intent in {"soil_advice", "fertilizer_advice", "irrigation_advice"}:
-        answer = _simple_soil_fertilizer_answer(
-            soil=soil,
-            ethiosis=ethiosis,
-            soil_water=soil_water,
-            prediction=prediction,
-            language=lang,
+        return _finish_voice(
+            _simple_soil_fertilizer_answer(
+                soil=soil,
+                ethiosis=ethiosis,
+                soil_water=soil_water,
+                prediction=prediction,
+                language=lang,
+            ),
+            used_llm=False,
         )
-        return SmartResult(answer, context, kb, False, tool_trace)
+
+    skip_final_llm = os.getenv("RAG_SMART_SKIP_LLM_ON_KB", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+    if skip_final_llm and hits:
+        try:
+            cap = int(os.getenv("RAG_VOICE_KB_EXCERPT_CHARS", "520") or "520")
+        except ValueError:
+            cap = 520
+        excerpt = _voice_kb_excerpt_from_hits(hits, max_chars=cap)
+        if excerpt:
+            tool_trace.append({"tool": "kb_excerpt", "chars": len(excerpt)})
+            return _finish_voice(excerpt, used_llm=False)
 
     backend = os.getenv("RAG_SMART_FINAL_BACKEND", "gemini").strip().lower()
     if backend not in {"gemini", "groq", "openai"}:
@@ -1851,7 +1935,5 @@ def run_smart_advisory(
     )
     messages = prepare_rag_llm_messages(system, [], user_block, backend)
     answer, used_backend = run_sync_llm(backend, messages, fast=True)
-    answer = sanitize_voice_advice(answer, question)
-    answer = _ensure_spoken_source_reference(answer, context, lang)
     tool_trace.append({"tool": "final_llm", "backend": used_backend})
-    return SmartResult(answer.strip(), context, kb, True, tool_trace)
+    return _finish_voice(answer, used_llm=True)

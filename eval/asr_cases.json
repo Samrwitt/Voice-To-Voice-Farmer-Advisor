@@ -1,0 +1,46 @@
+[
+  {
+    "id": "short_greeting_tts_loopback",
+    "audio_path": "eval/tts_outputs/short_greeting.wav",
+    "reference": "ሰላም፣ እንዴት ነዎት?",
+    "rubric": {
+      "max_latency_ms": 12000,
+      "max_rtf": 8.0,
+      "max_wer": 0.8,
+      "max_cer": 0.45
+    }
+  },
+  {
+    "id": "farmer_advice_medium_tts_loopback",
+    "audio_path": "eval/tts_outputs/farmer_advice_medium.wav",
+    "reference": "ለስንዴ ማሳዎ ዘር ከመዝራት በፊት መሬቱን በጥሩ ሁኔታ ያዘጋጁ። አፈር እርጥበት ካለው የተሻለ ውጤት ይሰጣል።",
+    "rubric": {
+      "max_latency_ms": 20000,
+      "max_rtf": 4.0,
+      "max_wer": 0.9,
+      "max_cer": 0.55
+    }
+  },
+  {
+    "id": "safety_message_tts_loopback",
+    "audio_path": "eval/tts_outputs/safety_message.wav",
+    "reference": "ፀረ ተባይ ከመጠቀምዎ በፊት የምርቱን መመሪያ ያንብቡ፣ ጓንት ይጠቀሙ፣ እና የአካባቢ ግብርና ባለሙያን ያማክሩ።",
+    "rubric": {
+      "max_latency_ms": 20000,
+      "max_rtf": 4.0,
+      "max_wer": 0.9,
+      "max_cer": 0.55
+    }
+  },
+  {
+    "id": "long_voice_answer_tts_loopback",
+    "audio_path": "eval/tts_outputs/long_voice_answer.wav",
+    "reference": "የበቆሎ ማሳ ለማዘጋጀት መጀመሪያ አፈሩን በደንብ ያርሱ። የተሻለ ውጤት ለማግኘት ዘሩን በትክክለኛ ርቀት ይዝሩ፣ እንክርዳድን በጊዜው ያስወግዱ፣ እና የዝናብ ሁኔታን ይከታተሉ።",
+    "rubric": {
+      "max_latency_ms": 26000,
+      "max_rtf": 4.0,
+      "max_wer": 0.9,
+      "max_cer": 0.55
+    }
+  }
+]

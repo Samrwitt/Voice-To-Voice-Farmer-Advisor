@@ -436,6 +436,73 @@ def get_conversation_history(session_id: str, limit: int = 5):
     return list(reversed(history))
 
 
+def get_recent_conversation_by_phone(
+    phone_number: str,
+    *,
+    limit: int = 4,
+    exclude_session_id: str | None = None,
+) -> list[tuple[str, str]]:
+    """Recent turns for this phone (any session) — used for short voice follow-ups."""
+    phone = (phone_number or "").strip()
+    if not phone:
+        return []
+    if _pg_enabled():
+        try:
+            import psycopg
+            with psycopg.connect(POSTGRES_URL) as conn:
+                with conn.cursor() as cur:
+                    if exclude_session_id:
+                        cur.execute(
+                            """
+                            SELECT role, message
+                            FROM conversation_history
+                            WHERE phone_number = %s AND session_id <> %s
+                            ORDER BY timestamp DESC
+                            LIMIT %s;
+                            """,
+                            (phone, exclude_session_id, limit),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            SELECT role, message
+                            FROM conversation_history
+                            WHERE phone_number = %s
+                            ORDER BY timestamp DESC
+                            LIMIT %s;
+                            """,
+                            (phone, limit),
+                        )
+                    rows = cur.fetchall() or []
+                    return list(reversed(rows))
+        except Exception as exc:
+            print(f"[DB] get_recent_conversation_by_phone (Postgres) failed: {exc}")
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    if exclude_session_id:
+        c.execute(
+            """
+            SELECT role, message FROM conversation_history
+            WHERE phone_number = ? AND session_id <> ?
+            ORDER BY timestamp DESC LIMIT ?
+            """,
+            (phone, exclude_session_id, limit),
+        )
+    else:
+        c.execute(
+            """
+            SELECT role, message FROM conversation_history
+            WHERE phone_number = ?
+            ORDER BY timestamp DESC LIMIT ?
+            """,
+            (phone, limit),
+        )
+    history = c.fetchall()
+    conn.close()
+    return list(reversed(history))
+
+
 def get_farmer_memory_context(
     phone_number: str,
     *,
