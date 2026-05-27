@@ -845,16 +845,22 @@ def _trigger_expert_response_call(
     db: Session,
     *,
     audio_path: Optional[str] = None,
-    response_text: Optional[str] = None,
 ) -> dict:
     if os.getenv("EXPERT_RESPONSE_CALL_ENABLED", "1").strip().lower() not in ("1", "true", "yes", "on"):
         return {"status": "disabled"}
 
     phone = (_phone_number_for_escalation(e, db) or "").strip()
+    original_query = (getattr(e, "query", None) or "").strip()
+    callback_message_parts: list[str] = []
+    if original_query:
+        callback_message_parts.append(f"ጥያቄዎ ይህ ነበር፦ {original_query}")
+    callback_message_parts.append("በባለሙያችን የተቀዳ የድምፅ መልስ ይህ ነው።")
+    callback_message = " ".join(callback_message_parts).strip()
+
     if not phone:
         return {"status": "skipped", "reason": "missing_phone_number"}
-    if not (audio_path or response_text):
-        return {"status": "skipped", "reason": "missing_audio_or_text"}
+    if not audio_path:
+        return {"status": "skipped", "reason": "missing_audio_response"}
     if _escalation_session_is_active(e, db):
         return {"status": "pending", "reason": "original_call_session_active"}
 
@@ -865,8 +871,7 @@ def _trigger_expert_response_call(
                 "escalation_id": e.id,
                 "phone_number": phone,
                 "expert_audio_path": audio_path,
-                "expert_response_text": response_text,
-                "message": "የባለሙያ መልስ ዝግጁ ነው።",
+                "message": callback_message,
             },
             timeout=8,
         )
@@ -881,7 +886,6 @@ def _trigger_expert_response_call_after_session_end(
     escalation_id: int,
     *,
     audio_path: Optional[str] = None,
-    response_text: Optional[str] = None,
 ) -> None:
     max_wait = int(os.getenv("EXPERT_RESPONSE_CALLBACK_WAIT_SECONDS", "300") or "300")
     poll = max(1, int(os.getenv("EXPERT_RESPONSE_CALLBACK_POLL_SECONDS", "5") or "5"))
@@ -899,7 +903,6 @@ def _trigger_expert_response_call_after_session_end(
                     esc,
                     db,
                     audio_path=audio_path,
-                    response_text=response_text,
                 )
                 print(f"[EXPERT CALLBACK] delayed callback report: {report}")
                 return
@@ -921,17 +924,15 @@ def _queue_or_trigger_expert_response_call(
     background_tasks: BackgroundTasks,
     *,
     audio_path: Optional[str] = None,
-    response_text: Optional[str] = None,
 ) -> dict:
     if _escalation_session_is_active(e, db):
         background_tasks.add_task(
             _trigger_expert_response_call_after_session_end,
             e.id,
             audio_path=audio_path,
-            response_text=response_text,
         )
         return {"status": "pending", "reason": "will_call_after_original_session_ends"}
-    return _trigger_expert_response_call(e, db, audio_path=audio_path, response_text=response_text)
+    return _trigger_expert_response_call(e, db, audio_path=audio_path)
 
 
 @router.get("/escalations")
@@ -1012,16 +1013,7 @@ def respond_escalation(
     esc.status = "answered"
     esc.updated_at = datetime.utcnow()
     db.commit()
-    callback_report = {"status": "skipped", "reason": "audio_response_not_present"}
-    if not esc.expert_audio_path:
-        callback_report = _queue_or_trigger_expert_response_call(
-            esc,
-            db,
-            background_tasks,
-            response_text=req.answer,
-        )
-        if callback_report.get("status") == "failed":
-            print(f"[EXPERT CALLBACK] text response call failed: {callback_report}")
+    callback_report = {"status": "skipped", "reason": "audio_response_required_for_callback"}
     out = _escalation_dict(esc, db)
     out["expert_callback"] = callback_report
     return out

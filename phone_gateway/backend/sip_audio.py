@@ -451,19 +451,26 @@ def register_alert_call_payload(call_id: str, payload: dict) -> None:
 
 async def play_alert_message(sink: AudioSocketPlaybackSink, text: str) -> None:
     tts_url = os.getenv("TTS_SERVICE_URL", "http://tts-service:8009/synthesize").strip()
+    print(f"[CALLBACK TTS] start chars={len((text or '').strip())}", flush=True)
     async with httpx.AsyncClient(timeout=60.0) as client:
         for chunk in chunk_tts_text(text):
             response = await client.post(tts_url, json={"text": chunk})
             response.raise_for_status()
             await stream_wav_to_audiosocket(sink, response.content)
             await asyncio.sleep(0.12)
+    print("[CALLBACK TTS] complete", flush=True)
 
 
 async def play_recorded_audio_file(sink: AudioSocketPlaybackSink, audio_path: str) -> None:
     path = Path(audio_path)
     if not path.exists() or not path.is_file():
         raise FileNotFoundError(f"Expert audio file not found: {audio_path}")
+    print(
+        f"[CALLBACK EXPERT AUDIO] start path={audio_path} size={path.stat().st_size}",
+        flush=True,
+    )
     await stream_wav_to_audiosocket(sink, path.read_bytes())
+    print("[CALLBACK EXPERT AUDIO] complete", flush=True)
 
 
 async def handle_alert_audiosocket_call(
@@ -490,7 +497,6 @@ async def handle_alert_audiosocket_call(
         payload = _alert_call_payloads.pop(call_id, {})
         message = (payload.get("alert_message") or "").strip()
         expert_audio_path = (payload.get("expert_audio_path") or "").strip()
-        expert_response_text = (payload.get("expert_response_text") or "").strip()
         severity = (payload.get("severity") or "warning").strip()
         if severity == "critical":
             prefix = "አስቸኳይ ማስጠንቀቂያ። "
@@ -507,11 +513,33 @@ async def handle_alert_audiosocket_call(
                     "የባለሙያ መልስ ዝግጁ ነው። አሁን እናጫውታለን።",
                 )
             )
+            add_event("expert_callback_intro_start", {
+                "call_id": call_id,
+                "phone_number": payload.get("phone_number"),
+                "escalation_id": payload.get("escalation_id"),
+                "intro_chars": len(intro or ""),
+            })
             if intro:
                 await play_alert_message(sink, intro)
+            add_event("expert_callback_intro_done", {
+                "call_id": call_id,
+                "phone_number": payload.get("phone_number"),
+                "escalation_id": payload.get("escalation_id"),
+            })
+            add_event("expert_callback_audio_start", {
+                "call_id": call_id,
+                "phone_number": payload.get("phone_number"),
+                "escalation_id": payload.get("escalation_id"),
+                "expert_audio_path": expert_audio_path,
+            })
             await play_recorded_audio_file(sink, expert_audio_path)
-        elif expert_response_text:
-            await play_alert_message(sink, message or f"የባለሙያ መልስ። {expert_response_text}")
+            add_event("expert_callback_audio_done", {
+                "call_id": call_id,
+                "phone_number": payload.get("phone_number"),
+                "escalation_id": payload.get("escalation_id"),
+            })
+        elif severity == "expert_response":
+            raise RuntimeError("Expert callback requires recorded expert audio.")
         elif message:
             await play_alert_message(sink, prefix + message)
         add_event("alert_call_played", {

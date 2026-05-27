@@ -124,8 +124,7 @@ class AlertCallRequest(BaseModel):
 class ExpertResponseCallRequest(BaseModel):
     escalation_id: int
     phone_number: str
-    expert_audio_path: str | None = None
-    expert_response_text: str | None = None
+    expert_audio_path: str
     message: str | None = None
 
 
@@ -589,14 +588,13 @@ async def place_alert_call(req: AlertCallRequest):
 
 @app.post("/api/expert-responses/call")
 async def place_expert_response_call(req: ExpertResponseCallRequest):
-    """Originate a SIP call and play a recorded or spoken expert response."""
+    """Originate a SIP call and play a recorded expert response."""
     phone = (req.phone_number or "").strip()
     audio_path = (req.expert_audio_path or "").strip()
-    response_text = (req.expert_response_text or "").strip()
-    if not phone or not (audio_path or response_text):
+    if not phone or not audio_path:
         raise HTTPException(
             status_code=400,
-            detail="phone_number and expert_audio_path or expert_response_text are required",
+            detail="phone_number and expert_audio_path are required",
         )
 
     call_id = str(uuid.uuid4())
@@ -610,7 +608,6 @@ async def place_expert_response_call(req: ExpertResponseCallRequest):
             "target_region": "expert_response",
             "alert_message": (req.message or "").strip(),
             "expert_audio_path": audio_path,
-            "expert_response_text": response_text,
             "severity": "expert_response",
         },
     )
