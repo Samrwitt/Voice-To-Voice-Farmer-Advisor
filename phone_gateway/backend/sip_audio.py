@@ -249,6 +249,17 @@ def _cancel_playback(state: SipPlaybackState, *, reason: str) -> None:
         task.cancel()
 
 
+def _should_cancel_for_speech_started(state: SipPlaybackState) -> bool:
+    """
+    Echo during greeting often triggers speech_started even when caller has not
+    spoken yet. By default, do not barge-in cancel greeting for that event.
+    """
+    cancel_greeting = parse_bool_env("SIP_BARGE_IN_CANCEL_GREETING", "0")
+    if state.playback_label == "greeting" and not cancel_greeting:
+        return False
+    return True
+
+
 def _start_playback_task(
     state: SipPlaybackState,
     label: str,
@@ -283,7 +294,8 @@ async def forward_vad_events_to_sip(vad_ws, sink: AudioSocketPlaybackSink, state
             elif event_name == "speech_started":
                 update_vad_status("speech_started", data)
                 # Barge-in: if the caller starts speaking, stop any ongoing playback
-                _cancel_playback(state, reason="speech_started")
+                if _should_cancel_for_speech_started(state):
+                    _cancel_playback(state, reason="speech_started")
             elif event_name == "speech_ended":
                 update_vad_status("speech_ended", data)
                 add_utterance(
@@ -292,7 +304,18 @@ async def forward_vad_events_to_sip(vad_ws, sink: AudioSocketPlaybackSink, state
                     speech_probability=data.get("speech_probability"),
                 )
                 utterance_path = data.get("utterance_path")
-                if utterance_path and utterance_path not in processing_ack_played_for:
+                duration_seconds = data.get("duration_seconds")
+                try:
+                    duration_seconds = float(duration_seconds) if duration_seconds is not None else 0.0
+                except (TypeError, ValueError):
+                    duration_seconds = 0.0
+                min_ack_seconds = float(os.getenv("SIP_PROCESSING_ACK_MIN_UTTERANCE_SEC", "1.2") or "1.2")
+
+                if (
+                    utterance_path
+                    and utterance_path not in processing_ack_played_for
+                    and duration_seconds >= min_ack_seconds
+                ):
                     processing_ack_played_for.add(utterance_path)
                     # Cap memory for long calls.
                     if len(processing_ack_played_for) > 50:

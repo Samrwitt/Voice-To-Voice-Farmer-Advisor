@@ -39,11 +39,12 @@ from greeting_utils import (
 )
 from quality_metrics import quality_snapshot
 from trust_meta import build_voice_trust_meta, maybe_append_trust_footer
-from rag_retrieval import ranked_hits_for_voice_query
 import chemical_safety
 import response_cache
 import scenario_router
 import voice_guards
+import importlib
+import threading
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("logic_service")
@@ -60,7 +61,6 @@ async def lifespan(app: FastAPI):
     # Optional: auto-ingest local kb_documents/ folder on first boot.
     # IMPORTANT: run in a background thread so the API becomes responsive fast.
     try:
-        import threading
         from bootstrap_ingest import auto_ingest_if_empty
 
         def _run():
@@ -88,15 +88,23 @@ async def lifespan(app: FastAPI):
 
         def _warm_market():
             try:
-                from farmer_rag_stack.smart_advisory import warm_wfp_hdx_market_cache
-
-                mrep = warm_wfp_hdx_market_cache()
+                smart_advisory = _get_smart_advisory_module()
+                mrep = smart_advisory.warm_wfp_hdx_market_cache()
                 if mrep.get("enabled"):
                     logger.info("WFP/HDX market cache warmup: %s", mrep)
             except Exception as exc:
                 logger.warning("WFP/HDX market cache warmup failed: %s", exc)
 
         threading.Thread(target=_warm_market, daemon=True).start()
+
+        def _warm_retrieval_lazy():
+            try:
+                ranked = _get_ranked_hits_for_voice_query()
+                logger.info("RAG retrieval lazy module warmed: %s", getattr(ranked, "__name__", "callable"))
+            except Exception as exc:
+                logger.warning("RAG retrieval lazy warmup failed: %s", exc)
+
+        threading.Thread(target=_warm_retrieval_lazy, daemon=True).start()
     except Exception as exc:
         logger.warning("KB auto-ingest setup skipped: %s", exc)
     yield
@@ -121,6 +129,32 @@ STT_URL = os.environ.get("STT_URL", "http://stt_service:8000/transcribe")
 # Speed is a priority; this service is designed to return grounded responses
 # without requiring an LLM dependency. Keep llm=None.
 llm = None
+
+
+_lazy_import_lock = threading.Lock()
+_ranked_hits_for_voice_query_fn = None
+_smart_advisory_module = None
+
+
+def _get_ranked_hits_for_voice_query():
+    global _ranked_hits_for_voice_query_fn
+    if _ranked_hits_for_voice_query_fn is not None:
+        return _ranked_hits_for_voice_query_fn
+    with _lazy_import_lock:
+        if _ranked_hits_for_voice_query_fn is None:
+            module = importlib.import_module("rag_retrieval")
+            _ranked_hits_for_voice_query_fn = module.ranked_hits_for_voice_query
+    return _ranked_hits_for_voice_query_fn
+
+
+def _get_smart_advisory_module():
+    global _smart_advisory_module
+    if _smart_advisory_module is not None:
+        return _smart_advisory_module
+    with _lazy_import_lock:
+        if _smart_advisory_module is None:
+            _smart_advisory_module = importlib.import_module("farmer_rag_stack.smart_advisory")
+    return _smart_advisory_module
 
 
 # ── Pydantic Models ──────────────────────────────────────────────────────────
@@ -246,9 +280,7 @@ def _voice_tool_fast_route(scenario_decision, nlu, profile, *, query_text: str =
         return True
     if hint != "kb_tool":
         return False
-    from farmer_rag_stack.smart_advisory import _is_compost_general_info
-
-    if _is_compost_general_info(query_text):
+    if _get_smart_advisory_module()._is_compost_general_info(query_text):
         return True
     entities = getattr(nlu, "entities", {}) or {}
     return bool(
@@ -507,8 +539,7 @@ def is_amharic(text: str) -> bool:
 
 # ── Grounded answer without LLM (combine top chunks, Amharic framing) ───────
 def compose_grounded_answer_no_llm(query_text: str, hits: list[dict], max_chars: int = 3200) -> str:
-    from farmer_rag_stack.smart_advisory import strip_provider_names_from_voice
-
+    strip_provider_names_from_voice = _get_smart_advisory_module().strip_provider_names_from_voice
     if not hits:
         return ""
     voice_compose = os.environ.get("RAG_VOICE_COMPOSE_FIRST", "1").strip().lower() not in (
@@ -846,7 +877,7 @@ def _generate_core_rag_response(query_text: str, phone_number: str, session_id: 
     from farmer_rag_stack.assistant import try_llm_assistant_response
 
     if use_pg:
-        hits, retrieval_query, farmer_nlu, closest_distance, retrieval_diag = ranked_hits_for_voice_query(
+        hits, retrieval_query, farmer_nlu, closest_distance, retrieval_diag = _get_ranked_hits_for_voice_query()(
             query_text=query_text,
             nlu=nlu,
             user_region=user_region,
@@ -1240,7 +1271,7 @@ async def rag_answer(req: RagAnswerRequest):
     - generation: RAG-folder-style assistant (Groq/Gemini) when enabled, else chunk composition
     """
     from farmer_rag_stack.assistant import try_llm_assistant_response
-    from farmer_rag_stack.smart_advisory import run_smart_advisory
+    run_smart_advisory = _get_smart_advisory_module().run_smart_advisory
 
     t0 = time.perf_counter()
     raw_query_text = (req.text or "").strip()
@@ -1541,7 +1572,7 @@ async def rag_answer(req: RagAnswerRequest):
         }
     else:
         try:
-            hits, _rq, _farmer_nlu, best, retrieval_diag = ranked_hits_for_voice_query(
+            hits, _rq, _farmer_nlu, best, retrieval_diag = _get_ranked_hits_for_voice_query()(
                 query_text=query_text,
                 nlu=nlu,
                 user_region=user_region,
@@ -1735,8 +1766,7 @@ async def rag_answer(req: RagAnswerRequest):
     if voice_cap > 0 and len(final) > voice_cap:
         final = final[: max(0, voice_cap - 3)].rstrip() + "..."
 
-    from farmer_rag_stack.smart_advisory import strip_provider_names_from_voice
-
+    strip_provider_names_from_voice = _get_smart_advisory_module().strip_provider_names_from_voice
     final = strip_provider_names_from_voice(normalize_text(final))
     current_response = strip_provider_names_from_voice(normalize_text(current_response))
 
@@ -1841,7 +1871,7 @@ async def rag_debug_context(req: RagDebugContextRequest):
     Build the exact structured context used by the smart advisory pipeline,
     without calling Gemini. Useful for chat/session tests and cost-free debugging.
     """
-    from farmer_rag_stack.smart_advisory import build_smart_context_only
+    build_smart_context_only = _get_smart_advisory_module().build_smart_context_only
 
     query_text = (req.text or "").strip()
     if not query_text:
@@ -1872,7 +1902,7 @@ async def rag_debug_context(req: RagDebugContextRequest):
     if req.retrieve:
         max_d = float(os.environ.get("RAG_PG_MAX_L2_DISTANCE", str(RAG_PG_MAX_L2_DISTANCE)))
         try:
-            hits, retrieval_query, _farmer_nlu, best, retrieval_diag = ranked_hits_for_voice_query(
+            hits, retrieval_query, _farmer_nlu, best, retrieval_diag = _get_ranked_hits_for_voice_query()(
                 query_text=query_text,
                 nlu=nlu,
                 user_region=user_region,
