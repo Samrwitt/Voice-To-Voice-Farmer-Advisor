@@ -5,6 +5,8 @@ python-multipart
 pydantic
 faster-whisper
 ctranslate2
+nvidia-cublas-cu12
+nvidia-cuda-runtime-cu12
 librosa
 soundfile
 numpy

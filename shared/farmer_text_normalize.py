@@ -90,7 +90,20 @@ def correct_known_agri_phrases(text: str) -> str:
     # rewrite substantive farmer questions.
     normalized = re.sub(r"\bሳላም\b", "ሰላም", normalized)
     normalized = re.sub(r"\bነዎች\b", "ነዎት", normalized)
+    normalized = re.sub(
+        r"\bሰላም\s+እንዴት\s+ላድርግ\s+ነዎት\b",
+        "ሰላም እንዴት ነዎት",
+        normalized,
+    )
     normalized = re.sub(r"\bአምነ[ውህ]ት\b", "እንዴት ነዎት", normalized)
+    normalized = re.sub(r"\bለስ\s+እንዲህ\b", "ለስንዴ", normalized)
+    normalized = re.sub(r"\bበቈሎ\b", "በቆሎ", normalized)
+    normalized = re.sub(r"\bመጀ\s+ምሬ\b", "መጀመሪያ", normalized)
+    normalized = re.sub(r"\bመጀመር\b", "መጀመሪያ", normalized)
+    normalized = re.sub(r"\bበፊቱ\b", "በፊት", normalized)
+    normalized = re.sub(r"\bባጢሩ\b", "በጥሩ", normalized)
+    normalized = re.sub(r"\bያዘ\s+ጋጁ\b", "ያዘጋጁ", normalized)
+    normalized = re.sub(r"\bመሬቱ\b", "መሬቱን", normalized)
 
     normalized = re.sub(r"\bየ?አስ\s+ቫር\s+አ\s+ሲዳን\b", "የአፈር አሲዳማነት", normalized)
     normalized = re.sub(r"\bየ?አፈር?\s+ራሲ\s+ዳማነት\b", "የአፈር አሲዳማነት", normalized)

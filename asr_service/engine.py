@@ -3,6 +3,7 @@ import base64
 import mimetypes
 import os
 import time
+import wave
 from pathlib import Path
 from typing import Any
 
@@ -13,10 +14,14 @@ from config import (
     MODEL_DIR,
     DEVICE,
     COMPUTE_TYPE,
+    CPU_COMPUTE_TYPE,
+    GPU_COMPUTE_TYPE,
     LANGUAGE,
     TASK,
     BEAM_SIZE,
     MAX_NEW_TOKENS,
+    ASR_MAX_NEW_TOKENS_CAP,
+    ASR_MAX_NEW_TOKENS_DYNAMIC,
     REPETITION_PENALTY,
     NO_REPEAT_NGRAM_SIZE,
     USE_VAD,
@@ -31,6 +36,69 @@ from postprocess import postprocess_asr_transcript
 
 logger = logging.getLogger("asr-engine")
 logging.basicConfig(level=logging.INFO)
+
+def _cuda_device_count() -> int:
+    try:
+        import ctranslate2 as ct2  # faster-whisper uses CT2 under the hood
+
+        return int(getattr(ct2, "get_cuda_device_count", lambda: 0)() or 0)
+    except Exception:
+        return 0
+
+
+def _resolve_whisper_device_and_compute_type() -> tuple[str, str]:
+    """
+    Supports ASR_DEVICE=auto:
+    - if CUDA is available -> cuda + float16
+    - else -> cpu + int8
+    """
+    requested = (DEVICE or "").strip().lower()
+    gpu_requested = requested in ("auto", "cuda", "cuda_if_available", "gpu", "gpu_if_available")
+    if gpu_requested:
+        if _cuda_device_count() > 0:
+            return "cuda", GPU_COMPUTE_TYPE
+        return "cpu", CPU_COMPUTE_TYPE
+
+    # Explicit device overrides everything.
+    if requested:
+        if requested not in ("cpu", "cuda"):
+            raise ValueError(f"Unsupported ASR_DEVICE={DEVICE!r}. Use auto/cpu/cuda.")
+        # When explicitly setting device, keep the legacy ASR_COMPUTE_TYPE behavior.
+        return requested, COMPUTE_TYPE
+    return "cpu", CPU_COMPUTE_TYPE
+
+
+def _audio_duration_sec(audio_path: str | Path) -> float | None:
+    try:
+        with wave.open(str(audio_path), "rb") as wf:
+            return wf.getnframes() / float(wf.getframerate())
+    except Exception:
+        return None
+
+
+WHISPER_CONTEXT_TOKENS = 448
+
+
+def _prompt_token_reserve() -> int:
+    """Tokens consumed by initial_prompt; must stay under Whisper context (448)."""
+    if not _whisper_initial_prompt():
+        return 16
+    return int(os.getenv("ASR_INITIAL_PROMPT_TOKEN_RESERVE", "232") or "232")
+
+
+def _max_new_tokens_for_audio(audio_path: str | Path) -> int:
+    """Scale decode budget with clip length — Amharic needs more tokens than English."""
+    ceiling = WHISPER_CONTEXT_TOKENS - _prompt_token_reserve()
+    ceiling = min(ceiling, ASR_MAX_NEW_TOKENS_CAP)
+    base = min(MAX_NEW_TOKENS, ceiling)
+    if not ASR_MAX_NEW_TOKENS_DYNAMIC:
+        return max(96, base)
+    duration = _audio_duration_sec(audio_path)
+    if duration is None or duration <= 0:
+        return max(96, base)
+    # ~30–40 tokens/sec works for our small Amharic CT2 model on farmer speech.
+    scaled = int(duration * 36) + 64
+    return max(96, min(ceiling, max(base, scaled)))
 
 
 def _whisper_initial_prompt() -> str | None:
@@ -108,32 +176,73 @@ class WhisperASREngine:
         if not model_path.exists():
             raise FileNotFoundError(f"ASR model folder not found: {MODEL_DIR}")
 
-        logger.info("Loading Whisper ASR from: %s (device=%s)", MODEL_DIR, DEVICE)
+        device, compute_type = _resolve_whisper_device_and_compute_type()
+        logger.info(
+            "Loading Whisper ASR from: %s (device=%s compute_type=%s)",
+            MODEL_DIR,
+            device,
+            compute_type,
+        )
+        self.device = device
+        self.compute_type = compute_type
         self.model = WhisperModel(
             str(model_path),
-            device=DEVICE,
-            compute_type=COMPUTE_TYPE,
+            device=device,
+            compute_type=compute_type,
         )
-        logger.info("Whisper ASR loaded successfully.")
+        logger.info("Whisper ASR loaded on %s (%s)", device, compute_type)
 
     def transcribe(self, audio_path: str | Path) -> dict:
         start_time = time.time()
         logger.info("Whisper transcribing: %s", audio_path)
 
-        segments_iter, info = self.model.transcribe(
-            str(audio_path),
-            language=LANGUAGE,
-            task=TASK,
-            beam_size=BEAM_SIZE,
-            temperature=0.0,
-            initial_prompt=_whisper_initial_prompt(),
-            vad_filter=USE_VAD,
-            vad_parameters=dict(threshold=0.6, min_speech_duration_ms=400),
-            condition_on_previous_text=CONDITION_ON_PREVIOUS_TEXT,
-            max_new_tokens=MAX_NEW_TOKENS,
-            repetition_penalty=REPETITION_PENALTY,
-            no_repeat_ngram_size=NO_REPEAT_NGRAM_SIZE,
-        )
+        max_tokens = _max_new_tokens_for_audio(audio_path)
+        logger.info("Whisper max_new_tokens=%s for %s", max_tokens, audio_path)
+
+        # Safety retry: if prompt+max_new_tokens exceed Whisper context, shrink
+        # the budget and retry once or twice (prevents 500s during eval).
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                segments_iter, info = self.model.transcribe(
+                    str(audio_path),
+                    language=LANGUAGE,
+                    task=TASK,
+                    beam_size=BEAM_SIZE,
+                    # Allow fallback temperatures so Whisper retries on greedy failures
+                    # instead of producing silence or repetition loops.
+                    temperature=[0.0, 0.2, 0.4],
+                    initial_prompt=_whisper_initial_prompt(),
+                    vad_filter=USE_VAD,
+                    # Silero inside faster-whisper: strips long silence *between* speech chunks.
+                    # For full saved utterances, pauses between clauses should stay in the WAV.
+                    vad_parameters=dict(
+                        threshold=0.35,
+                        min_speech_duration_ms=200,
+                        min_silence_duration_ms=500,
+                        speech_pad_ms=300,
+                    ),
+                    condition_on_previous_text=CONDITION_ON_PREVIOUS_TEXT,
+                    max_new_tokens=max_tokens,
+                    repetition_penalty=REPETITION_PENALTY,
+                    no_repeat_ngram_size=NO_REPEAT_NGRAM_SIZE,
+                )
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+                msg = str(exc)
+                if "combined length of the prompt" in msg and "max_length" in msg:
+                    max_tokens = max(96, int(max_tokens * 0.85) - 16)
+                    logger.warning(
+                        "Whisper context overflow; retry attempt=%s new_max_new_tokens=%s",
+                        attempt,
+                        max_tokens,
+                    )
+                    continue
+                raise
+        if last_exc is not None:
+            raise last_exc
 
         segments = []
         texts = []
@@ -164,36 +273,44 @@ class WhisperASREngine:
 
 
 def _first_env_key(*names: str) -> str:
+    keys = _all_gemini_api_keys(*names)
+    return keys[0] if keys else ""
+
+
+def _all_gemini_api_keys(*names: str) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
     for name in names:
         raw = os.getenv(name, "").strip()
         if not raw:
             continue
-        first = next((part.strip() for part in raw.split(",") if part.strip()), "")
-        if first:
-            return first
-    return ""
+        for part in raw.replace(";", ",").split(","):
+            k = part.strip().strip('"').strip("'")
+            if k and k not in seen:
+                seen.add(k)
+                out.append(k)
+    return out
 
 
 class GeminiASREngine:
     engine_name = "gemini_audio"
 
     def __init__(self):
+        from gemini_keys import paid_gemini_keys_for_asr_audio
+
         self.model = GEMINI_ASR_MODEL
-        self.api_key = _first_env_key(
-            "ASR_GEMINI_API_KEY",
-            "FREE_GEMINI_API_KEYS",
-            "FREE_GEMINI_API_KEY",
-            "GEMINI_API_KEYS",
-            "GEMINI_API_KEY",
-            "GOOGLE_API_KEY",
-            "GENAI_API_KEY",
-        )
-        if not self.api_key:
+        self.api_keys = paid_gemini_keys_for_asr_audio()
+        if not self.api_keys:
             raise RuntimeError(
-                "Gemini ASR needs ASR_GEMINI_API_KEY, GEMINI_API_KEY, GEMINI_API_KEYS, "
-                "FREE_GEMINI_API_KEYS, GOOGLE_API_KEY, or GENAI_API_KEY."
+                "Gemini audio ASR needs a paid key: ASR_GEMINI_API_KEY, GEMINI_API_KEY, "
+                "GEMINI_API_KEY_BACKUP, or GOOGLE_API_KEY (free keys are for text fix only)."
             )
-        logger.info("Gemini ASR configured with model=%s", self.model)
+        self.api_key = self.api_keys[0]
+        logger.info(
+            "Gemini ASR configured with model=%s (%s key(s))",
+            self.model,
+            len(self.api_keys),
+        )
 
     def _mime_type(self, audio_path: str | Path) -> str:
         guessed, _ = mimetypes.guess_type(str(audio_path))
@@ -238,15 +355,31 @@ class GeminiASREngine:
             },
         }
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
-        resp = requests.post(
-            url,
-            headers={"x-goog-api-key": self.api_key, "Content-Type": "application/json"},
-            json=payload,
-            timeout=GEMINI_ASR_TIMEOUT_SEC,
-        )
-        if resp.status_code >= 400:
-            raise RuntimeError(f"Gemini ASR HTTP {resp.status_code}: {resp.text[:500]}")
-        data = resp.json()
+        data = None
+        last_error = ""
+        for key_idx, api_key in enumerate(self.api_keys):
+            resp = requests.post(
+                url,
+                headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
+                json=payload,
+                timeout=GEMINI_ASR_TIMEOUT_SEC,
+            )
+            if resp.status_code < 400:
+                data = resp.json()
+                self.api_key = api_key
+                break
+            last_error = f"HTTP {resp.status_code}: {resp.text[:500]}"
+            if resp.status_code in (429, 503) and key_idx + 1 < len(self.api_keys):
+                logger.warning(
+                    "Gemini ASR key %s/%s rate-limited (%s), trying next key",
+                    key_idx + 1,
+                    len(self.api_keys),
+                    resp.status_code,
+                )
+                continue
+            raise RuntimeError(f"Gemini ASR {last_error}")
+        if data is None:
+            raise RuntimeError(f"Gemini ASR exhausted keys: {last_error}")
         parts = (
             ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts")
             or []

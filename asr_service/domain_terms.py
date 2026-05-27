@@ -8,29 +8,63 @@ from pathlib import Path
 
 
 BASE_DOMAIN_TERMS = [
-    # Crops and agricultural products
-    "ስንዴ", "በቆሎ", "ጤፍ", "ገብስ", "ማሽላ", "ማሽላ", "ሰርገኛ",
+    # Crops and agricultural products — base forms
+    "ስንዴ", "በቆሎ", "ጤፍ", "ገብስ", "ማሽላ", "ሰርገኛ",
     "ቲማቲም", "ድንች", "ሽንኩርት", "ቡና", "ሰሊጥ", "ምስር", "ሽምብራ",
     "ቦሎቄ", "አተር", "ምርት", "ሰብል", "እህል", "ጥራጥሬ", "ቅባት ሰብል",
 
-    # Soil, fertility, and water
+    # Inflected / prefixed crop forms that Whisper commonly outputs
+    # ስንዴ (wheat)
+    "ለስንዴ", "ስንዴው", "ስንዴዎ", "ስንዴን", "ስንዴዎን", "የስንዴ", "ስንዴዎቻቸው",
+    # በቆሎ (maize)
+    "የበቆሎ", "ለበቆሎ", "በቆሎውን", "በቆሎዎ", "በቆሎ ማሳ",
+    # ጤፍ (teff)
+    "የጤፍ", "ለጤፍ", "ጤፉ", "ጤፍን",
+    # ገብስ (barley)
+    "የገብስ", "ለገብስ", "ገብሱ", "ገብሱን",
+    # ማሽላ (sorghum)
+    "የማሽላ", "ለማሽላ", "ማሽላዎ", "ማሽላውን",
+
+    # Soil, fertility, and water — base forms
     "አፈር", "የአፈር", "የአፈር ለምነት", "የአፈር አሲዳማነት", "አሲዳማነት",
     "አፈር አሲዳማነት", "ፒኤች", "ኖራ", "ምልክት", "ማዳበሪያ", "ዩሪያ", "ዳፕ", "ኮምፖስት",
     "ናይትሮጅን", "ፎስፈረስ", "ፖታሽየም", "ዘር", "ችግኝ", "መስኖ",
     "ውሃ", "እርጥበት", "የውሃ ጥበቃ", "እርከን", "ተፋሰስ",
 
-    # Pest, disease, and plant health
+    # Inflected soil/input forms
+    "አፈሩን", "አፈሩ", "ለአፈር", "የማዳበሪያ", "ማዳበሪያውን", "ማዳበሪያ ዓይነት",
+    "ዩሪያ ማዳበሪያ", "ዳፕ ማዳበሪያ", "ለዩሪያ", "ኮምፖስቱ", "የዘር",
+    "ዘሩን", "ዘሩ", "ዘር ቤት", "ዘር ምርጫ",
+    "ውሃ ማጠጣት", "መስኖ ልማት", "ውሃ ጥበቃ",
+
+    # Pest, disease, and plant health — base forms
     "ተባይ", "በሽታ", "ፈንገስ", "ቅጠል", "ሥር", "ስር", "አረም",
     "ፀረ ተባይ", "ጸረ ተባይ", "አረም መከላከል", "የተክል በሽታ",
     "ትል", "ቅማል", "ሻጋታ", "ዋግ", "ዝገት", "አንበጣ",
 
-    # Market and units
+    # Inflected pest/disease forms
+    "ፀረ ተባይ መድሃኒት", "ጸረ ተባይ ኬሚካል", "ፀረ ተባይ ዓይነት",
+    "ተባዩን", "ተባዩ", "ከተባይ", "ለተባይ",
+    "አረሙን", "አረሙ", "ከአረም", "አረምን",
+    "ቅጠሉ", "ቅጠሉን", "ቅጠል ቀለም",
+
+    # Farming operations — common verb-noun forms
+    "ማሳ", "ማሳዎ", "ማሳውን", "ማሳ ዝግጅት", "ያሳዎ",
+    "ማረስ", "ይህርሱ", "ያርሱ", "ዘር መዝራት", "ዘር ከመዝራት",
+    "ምርት ማሰባሰብ", "ምርት ማጨድ", "ድህረ ምርት", "ምርት ቅነሳ",
+    "አትክልት ስራ", "የሰብል አመራረት",
+
+    # Market and units — base forms
     "ዋጋ", "ገበያ", "ሽያጭ", "ግዢ", "ኩንታል", "ኪሎ", "ኪሎ ግራም",
     "ግራም", "ሊትር", "ሄክታር", "ብር", "ቶን",
 
+    # Inflected market/unit forms
+    "ዋጋው", "ዋጋውን", "ዋጋ ምን", "ለኩንታል", "ኩንታሉ",
+    "በሄክታር", "ለሄክታር", "ሄክታሩ",
+
     # Common English/transliterated agricultural terms that Whisper may emit
     "wheat", "maize", "teff", "barley", "sorghum", "coffee", "fertilizer",
-    "urea", "dap", "compost", "irrigation", "pest", "disease", "market",
+    "urea", "dap", "nps", "compost", "irrigation", "pest", "disease", "market",
     "price", "soil", "soil acidity", "acidic soil", "soil ph", "seed", "harvest", "post harvest",
 ]
 

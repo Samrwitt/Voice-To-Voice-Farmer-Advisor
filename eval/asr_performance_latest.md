@@ -1,20 +1,50 @@
 # ASR Performance Report
 
+- Generated: `2026-05-27T16:20:12.633175+00:00`
 - Base URL: `http://127.0.0.1:8001`
+- Engine config: `whisper_local` / runtime `whisper_local`
 - Cases: `4`
-- Passed: `1`
-- Failed: `3`
-- Mean latency: `8126.8` ms
-- p95 latency: `9307.4` ms
-- Mean RTF: `2.166`
-- Mean WER: `0.8643`
-- Mean CER: `0.5784`
+- Passed: `0`
+- Failed: `4`
+- LLM fix triggered: `0` / `4`
+- Mean latency: `117.1` ms (engine `None` ms)
+- p95 latency: `139.6` ms
+- Mean RTF: `0.026`
+- Mean WER: `None` (normalized `None`)
+- Mean CER: `None` (normalized `None`)
 
 These cases are TTS loopback clips. They are repeatable smoke tests, but real farmer-call recordings are needed for final accuracy claims.
 
-| id | ok | latency_ms | audio_sec | rtf | wer | cer | confidence | transcript |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| `short_greeting_tts_loopback` | `True` | `8599.9` | `1.521` | `5.654` | `0.6667` | `0.2` | `0.92` | ሳላም እንዴት ነዎች |
-| `farmer_advice_medium_tts_loopback` | `False` | `7403.3` | `6.18` | `1.198` | `0.9333` | `0.6981` | `0.677` | ለእስ እ ንዲህ ማሳቡ ዘር ከመዝራት በፊቱም ባጢሩ ሁኔታ |
-| `safety_message_tts_loopback` | `False` | `7071.5` | `7.334` | `0.964` | `0.8571` | `0.6481` | `0.719` | ጸረ ተባይ መጠቀም በፊት የሚህርቱን መ ማሪያ ያሙቡ |
-| `long_voice_answer_tts_loopback` | `False` | `9432.3` | `11.108` | `0.849` | `1.0` | `0.7674` | `0.684` | የበ ቆሎ ማሳ ለማ እዘጋጀት መጀ ምሬ አፈዱን በደም ቢያር |
+| id | ok | latency_ms | wer | cer | conf | fix | errors |
+| --- | --- | ---: | ---: | ---: | ---: | --- | --- |
+| `short_greeting_tts_loopback` | `False` | `86.8` | `None` | `None` | `None` | `-` | HTTP 500: {'detail': 'Library libcublas.so.12 is not found o |
+| `farmer_advice_medium_tts_loopback` | `False` | `106.6` | `None` | `None` | `None` | `-` | HTTP 500: {'detail': 'Library libcublas.so.12 is not found o |
+| `safety_message_tts_loopback` | `False` | `134.4` | `None` | `None` | `None` | `-` | HTTP 500: {'detail': 'Library libcublas.so.12 is not found o |
+| `long_voice_answer_tts_loopback` | `False` | `140.5` | `None` | `None` | `None` | `-` | HTTP 500: {'detail': 'Library libcublas.so.12 is not found o |
+
+## Transcripts
+
+### `short_greeting_tts_loopback`
+- Reference: ሰላም፣ እንዴት ነዎት?
+- Raw: None
+- Domain: None
+- Final: 
+
+### `farmer_advice_medium_tts_loopback`
+- Reference: ለስንዴ ማሳዎ ዘር ከመዝራት በፊት መሬቱን በጥሩ ሁኔታ ያዘጋጁ። አፈር እርጥበት ካለው የተሻለ ውጤት ይሰጣል።
+- Raw: None
+- Domain: None
+- Final: 
+
+### `safety_message_tts_loopback`
+- Reference: ፀረ ተባይ ከመጠቀምዎ በፊት የምርቱን መመሪያ ያንብቡ፣ ጓንት ይጠቀሙ፣ እና የአካባቢ ግብርና ባለሙያን ያማክሩ።
+- Raw: None
+- Domain: None
+- Final: 
+
+### `long_voice_answer_tts_loopback`
+- Reference: የበቆሎ ማሳ ለማዘጋጀት መጀመሪያ አፈሩን በደንብ ያርሱ። የተሻለ ውጤት ለማግኘት ዘሩን በትክክለኛ ርቀት ይዝሩ፣ እንክርዳድን በጊዜው ያስወግዱ፣ እና የዝናብ ሁኔታን ይከታተሉ።
+- Raw: None
+- Domain: None
+- Final: 
+

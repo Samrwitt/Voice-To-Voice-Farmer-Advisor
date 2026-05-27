@@ -32,9 +32,13 @@ COPY shared/ /app/shared/
 COPY asr_service/ /app/
 
 ENV PYTHONPATH=/app
-ENV ASR_DEVICE=cpu
-ENV ASR_COMPUTE_TYPE=int8
-ENV ASR_MAX_NEW_TOKENS=160
+# auto = cuda when the container sees a GPU, else cpu+int8
+ENV ASR_DEVICE=auto
+ENV ASR_GPU_COMPUTE_TYPE=float16
+ENV ASR_CPU_COMPUTE_TYPE=int8
+ENV ASR_MAX_NEW_TOKENS=384
+ENV ASR_MAX_NEW_TOKENS_DYNAMIC=1
 ENV ASR_USE_VAD=true
+ENV LD_LIBRARY_PATH=/usr/local/lib/python3.11/site-packages/nvidia/cublas/lib:/usr/local/lib/python3.11/site-packages/nvidia/cuda_runtime/lib:${LD_LIBRARY_PATH}
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001"]

@@ -1,4 +1,6 @@
+import os
 import threading
+import wave
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -6,7 +8,7 @@ from typing import Optional
 from pathlib import Path
 
 from schemas import ASRResponse, FileTranscribeRequest, PostprocessTextRequest
-from engine import create_asr_engine
+from engine import create_asr_engine, GeminiASREngine, WhisperASREngine
 from audio_utils import save_upload_file, prepare_audio_for_asr
 from config import SHARED_UTTERANCES_DIR, ASR_ENGINE
 from postprocess import postprocess_asr_transcript
@@ -40,6 +42,77 @@ asr_engine = None
 asr_engine_loading = False
 asr_engine_error: str | None = None
 _load_lock = threading.Lock()
+_gemini_fallback_engine = None
+_gemini_fallback_lock = threading.Lock()
+
+
+def _wav_duration_sec(path: Path) -> float:
+    try:
+        with wave.open(str(path), "rb") as wf:
+            rate = wf.getframerate()
+            return wf.getnframes() / rate if rate else 0.0
+    except Exception:
+        return 0.0
+
+
+def _gemini_fallback_enabled() -> bool:
+    return os.getenv("ASR_GEMINI_FALLBACK", "1").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _maybe_gemini_fallback(prepared_path: Path, whisper_result: dict) -> dict:
+    """Re-transcribe with Gemini audio when local Whisper quality is poor."""
+    if not _gemini_fallback_enabled():
+        return whisper_result
+    if not isinstance(asr_engine, WhisperASREngine):
+        return whisper_result
+    try:
+        min_words = int(os.getenv("ASR_GEMINI_FALLBACK_MIN_WORDS", "5") or "5")
+        max_conf = float(os.getenv("ASR_GEMINI_FALLBACK_MAX_CONFIDENCE", "0.84") or "0.84")
+        min_audio_sec = float(os.getenv("ASR_GEMINI_FALLBACK_MIN_AUDIO_SEC", "6") or "6")
+    except ValueError:
+        min_words, max_conf, min_audio_sec = 5, 0.84, 6.0
+
+    final = (whisper_result.get("final_transcript") or whisper_result.get("transcript") or "")
+    word_count = len([w for w in final.split() if w])
+    confidence = float(whisper_result.get("confidence") or 0.0)
+    audio_sec = _wav_duration_sec(prepared_path)
+
+    # Paid audio fallback is expensive; skip if text fix already ran or transcript looks clean.
+    if whisper_result.get("transcript_fix_backend"):
+        return whisper_result
+    unusual = [w for w in (whisper_result.get("unusual_words") or []) if len(str(w).strip()) >= 2]
+    if word_count >= 5:
+        unusual_ratio = len(unusual) / word_count
+        max_unusual = float(os.getenv("ASR_GEMINI_FALLBACK_MAX_UNUSUAL_RATIO", "0.32") or "0.32")
+        if unusual_ratio < max_unusual:
+            return whisper_result
+
+    if word_count < min_words or confidence >= max_conf:
+        return whisper_result
+    if min_audio_sec > 0 and audio_sec < min_audio_sec:
+        return whisper_result
+
+    global _gemini_fallback_engine
+    with _gemini_fallback_lock:
+        if _gemini_fallback_engine is None:
+            try:
+                _gemini_fallback_engine = GeminiASREngine()
+            except Exception as exc:
+                print(f"Gemini ASR fallback unavailable: {exc}", flush=True)
+                return whisper_result
+
+    try:
+        gemini_result = _gemini_fallback_engine.transcribe(prepared_path)
+        gemini_result["engine"] = f"{whisper_result.get('engine', 'whisper_local')}+gemini_fallback"
+        return gemini_result
+    except Exception as exc:
+        print(f"Gemini ASR fallback failed: {exc}", flush=True)
+        return whisper_result
 
 
 def _load_asr_engine_background() -> None:
@@ -94,7 +167,7 @@ def health():
         status = "loading"
     else:
         status = "degraded"
-    return {
+    payload = {
         "status": status,
         "service": "asr_service",
         "engine_loaded": asr_engine is not None,
@@ -103,6 +176,16 @@ def health():
         "asr_engine_config": ASR_ENGINE,
         "asr_engine_runtime": getattr(asr_engine, "engine_name", None),
     }
+    if asr_engine is not None:
+        payload["whisper_device"] = getattr(asr_engine, "device", None)
+        payload["whisper_compute_type"] = getattr(asr_engine, "compute_type", None)
+    try:
+        from engine import _cuda_device_count
+
+        payload["cuda_devices_visible"] = _cuda_device_count()
+    except Exception:
+        payload["cuda_devices_visible"] = None
+    return payload
 
 
 @app.get("/fix-status")
@@ -169,7 +252,7 @@ async def transcribe(
         uploaded_path = save_upload_file(target_file)
         prepared_path = prepare_audio_for_asr(uploaded_path)
         result = asr_engine.transcribe(prepared_path)
-        return result
+        return _maybe_gemini_fallback(prepared_path, result)
 
 
     except Exception as e:
@@ -195,7 +278,7 @@ async def transcribe_file(request: FileTranscribeRequest):
     try:
         prepared_path = prepare_audio_for_asr(audio_path)
         result = asr_engine.transcribe(prepared_path)
-        return result
+        return _maybe_gemini_fallback(prepared_path, result)
 
 
     except Exception as e:

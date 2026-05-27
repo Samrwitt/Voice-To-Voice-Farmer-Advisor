@@ -18,6 +18,7 @@ import time
 import urllib.error
 import urllib.request
 import wave
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -126,6 +127,16 @@ def multipart_body(field_name: str, path: Path, boundary: str) -> tuple[bytes, s
     return header + data + footer, f"multipart/form-data; boundary={boundary}"
 
 
+def fetch_health(base_url: str, timeout: float = 10.0) -> dict[str, Any]:
+    url = base_url.rstrip("/") + "/health"
+    req = urllib.request.Request(url, headers={"Accept": "application/json"}, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
 def transcribe(base_url: str, audio_path: Path, timeout: float) -> tuple[int, float, dict[str, Any], str]:
     url = base_url.rstrip("/") + "/transcribe"
     boundary = "----codex-asr-eval-boundary"
@@ -183,6 +194,8 @@ def evaluate_case(case: dict[str, Any], base_url: str, timeout: float) -> dict[s
             "acoustic_confidence": payload.get("acoustic_confidence"),
             "needs_confirmation": payload.get("needs_confirmation"),
             "transcript_fix_backend": payload.get("transcript_fix_backend"),
+            "engine": payload.get("engine"),
+            "domain_corrected_transcript": payload.get("domain_corrected_transcript"),
             "raw_transcript": payload.get("raw_transcript"),
             "final_transcript": hyp,
             "segments": len(payload.get("segments") or []),
@@ -224,43 +237,50 @@ def evaluate_case(case: dict[str, Any], base_url: str, timeout: float) -> dict[s
 
 def write_markdown(report: dict[str, Any], path: Path) -> None:
     s = report["summary"]
+    health = report.get("health") or {}
     lines = [
         "# ASR Performance Report",
         "",
+        f"- Generated: `{report.get('generated_at', '')}`",
         f"- Base URL: `{report['base_url']}`",
+        f"- Engine config: `{health.get('asr_engine_config', '?')}` / runtime `{health.get('asr_engine_runtime', '?')}`",
         f"- Cases: `{s['cases']}`",
         f"- Passed: `{s['passed']}`",
         f"- Failed: `{s['failed']}`",
-        f"- Mean latency: `{s['latency_ms_mean']}` ms",
+        f"- LLM fix triggered: `{s.get('llm_fix_count', 0)}` / `{s['cases']}`",
+        f"- Mean latency: `{s['latency_ms_mean']}` ms (engine `{s.get('engine_latency_ms_mean')}` ms)",
         f"- p95 latency: `{s['latency_ms_p95']}` ms",
         f"- Mean RTF: `{s['rtf_mean']}`",
-        f"- Mean WER: `{s['wer_mean']}`",
-        f"- Mean CER: `{s['cer_mean']}`",
-        f"- Mean normalized WER: `{s['normalized_wer_mean']}`",
-        f"- Mean normalized CER: `{s['normalized_cer_mean']}`",
+        f"- Mean WER: `{s['wer_mean']}` (normalized `{s['normalized_wer_mean']}`)",
+        f"- Mean CER: `{s['cer_mean']}` (normalized `{s['normalized_cer_mean']}`)",
         "",
         "These cases are TTS loopback clips. They are repeatable smoke tests, but real farmer-call recordings are needed for final accuracy claims.",
         "",
-        "| id | ok | latency_ms | audio_sec | rtf | wer | cer | norm_wer | norm_cer | confidence | transcript |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+        "| id | ok | latency_ms | wer | cer | conf | fix | errors |",
+        "| --- | --- | ---: | ---: | ---: | ---: | --- | --- |",
     ]
     for row in report["cases"]:
-        transcript = (row.get("final_transcript") or "").replace("|", " ")[:80]
+        err = "; ".join(row.get("errors") or [])[:60] or "-"
         lines.append(
-            "| `{id}` | `{ok}` | `{lat}` | `{dur}` | `{rtf}` | `{wer}` | `{cer}` | `{nwer}` | `{ncer}` | `{conf}` | {txt} |".format(
+            "| `{id}` | `{ok}` | `{lat}` | `{wer}` | `{cer}` | `{conf}` | `{fix}` | {err} |".format(
                 id=row.get("id"),
                 ok=row.get("ok"),
                 lat=row.get("latency_ms"),
-                dur=row.get("audio_duration_sec"),
-                rtf=row.get("rtf"),
                 wer=row.get("wer"),
                 cer=row.get("cer"),
-                nwer=row.get("normalized_wer"),
-                ncer=row.get("normalized_cer"),
                 conf=row.get("confidence"),
-                txt=transcript,
+                fix=row.get("transcript_fix_backend") or "-",
+                err=err,
             )
         )
+    lines.extend(["", "## Transcripts", ""])
+    for row in report["cases"]:
+        lines.append(f"### `{row.get('id')}`")
+        lines.append(f"- Reference: {row.get('reference', '')}")
+        lines.append(f"- Raw: {row.get('raw_transcript', '')}")
+        lines.append(f"- Domain: {row.get('domain_corrected_transcript', '')}")
+        lines.append(f"- Final: {row.get('final_transcript', '')}")
+        lines.append("")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -274,21 +294,30 @@ def main() -> int:
     args = parser.parse_args()
 
     cases = json.loads(args.cases.read_text(encoding="utf-8"))
+    health = fetch_health(args.base_url, timeout=min(args.timeout, 15.0))
     rows = [evaluate_case(case, args.base_url, args.timeout) for case in cases]
     latencies = [float(r["latency_ms"]) for r in rows if isinstance(r.get("latency_ms"), (int, float))]
+    engine_latencies = [
+        float(r["engine_latency_seconds"]) * 1000.0
+        for r in rows
+        if isinstance(r.get("engine_latency_seconds"), (int, float))
+    ]
     rtfs = [float(r["rtf"]) for r in rows if isinstance(r.get("rtf"), (int, float))]
     wers = [float(r["wer"]) for r in rows if isinstance(r.get("wer"), (int, float))]
     cers = [float(r["cer"]) for r in rows if isinstance(r.get("cer"), (int, float))]
     normalized_wers = [float(r["normalized_wer"]) for r in rows if isinstance(r.get("normalized_wer"), (int, float))]
     normalized_cers = [float(r["normalized_cer"]) for r in rows if isinstance(r.get("normalized_cer"), (int, float))]
+    llm_fix_count = sum(1 for r in rows if r.get("transcript_fix_backend"))
     summary = {
         "cases": len(rows),
         "passed": sum(1 for r in rows if r["ok"]),
         "failed": sum(1 for r in rows if not r["ok"]),
+        "llm_fix_count": llm_fix_count,
         "latency_ms_mean": round(statistics.mean(latencies), 1) if latencies else None,
         "latency_ms_p50": round(statistics.median(latencies), 1) if latencies else None,
         "latency_ms_p95": percentile(latencies, 95),
         "latency_ms_max": round(max(latencies), 1) if latencies else None,
+        "engine_latency_ms_mean": round(statistics.mean(engine_latencies), 1) if engine_latencies else None,
         "rtf_mean": round(statistics.mean(rtfs), 3) if rtfs else None,
         "rtf_p95": percentile(rtfs, 95),
         "rtf_max": round(max(rtfs), 3) if rtfs else None,
@@ -298,11 +327,24 @@ def main() -> int:
         "normalized_cer_mean": round(statistics.mean(normalized_cers), 4) if normalized_cers else None,
     }
     report = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
         "base_url": args.base_url,
+        "health": health,
         "summary": summary,
         "cases": rows,
         "notes": {
-            "measured": ["latency_ms", "real_time_factor", "WER", "CER", "normalized_WER", "normalized_CER", "confidence", "language_probability"],
+            "measured": [
+                "latency_ms",
+                "engine_latency_seconds",
+                "real_time_factor",
+                "WER",
+                "CER",
+                "normalized_WER",
+                "normalized_CER",
+                "confidence",
+                "transcript_fix_backend",
+                "language_probability",
+            ],
             "loopback_caveat": "TTS-generated audio is stable for smoke tests but does not represent noisy real farmer calls.",
         },
     }

@@ -14,7 +14,14 @@ SHARED_UTTERANCES_DIR = os.getenv(
     "/shared/utterances",
 )
 
-DEVICE = os.getenv("ASR_DEVICE", "cuda")
+DEVICE = os.getenv("ASR_DEVICE", "auto")
+# Compute types:
+# - CPU: typically int8 is faster and good enough for this CT2 model.
+# - GPU: float16 is typical for speed/quality balance.
+CPU_COMPUTE_TYPE = os.getenv("ASR_CPU_COMPUTE_TYPE", "int8")
+GPU_COMPUTE_TYPE = os.getenv("ASR_GPU_COMPUTE_TYPE", "float16")
+
+# Backwards-compatible single value (used only when ASR_DEVICE is explicitly set).
 COMPUTE_TYPE = os.getenv("ASR_COMPUTE_TYPE", "float16")
 
 
@@ -34,7 +41,15 @@ ASR_USE_DOMAIN_INITIAL_PROMPT = os.getenv("ASR_USE_DOMAIN_INITIAL_PROMPT", "0").
 ASR_INITIAL_PROMPT_MAX_TERMS = int(os.getenv("ASR_INITIAL_PROMPT_MAX_TERMS", "24"))
 
 BEAM_SIZE = int(os.getenv("ASR_BEAM_SIZE", "5"))
-MAX_NEW_TOKENS = int(os.getenv("ASR_MAX_NEW_TOKENS", "160"))
+# Amharic uses many subword tokens per word; 160 often stops after one clause (~7 words).
+MAX_NEW_TOKENS = int(os.getenv("ASR_MAX_NEW_TOKENS", "384"))
+ASR_MAX_NEW_TOKENS_DYNAMIC = os.getenv("ASR_MAX_NEW_TOKENS_DYNAMIC", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+ASR_MAX_NEW_TOKENS_CAP = int(os.getenv("ASR_MAX_NEW_TOKENS_CAP", "448"))
 
 REPETITION_PENALTY = float(os.getenv("ASR_REPETITION_PENALTY", "1.2"))
 NO_REPEAT_NGRAM_SIZE = int(os.getenv("ASR_NO_REPEAT_NGRAM_SIZE", "3"))
