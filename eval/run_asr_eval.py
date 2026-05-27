@@ -26,6 +26,12 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CASES = ROOT / "eval" / "asr_cases.json"
 OUT_JSON = ROOT / "eval" / "asr_performance_latest.json"
 OUT_MD = ROOT / "eval" / "asr_performance_latest.md"
+sys.path.insert(0, str(ROOT))
+
+try:
+    from shared.farmer_text_normalize import normalize_farmer_query
+except Exception:
+    normalize_farmer_query = None
 
 
 def normalize_amharic_text(text: str) -> str:
@@ -33,6 +39,13 @@ def normalize_amharic_text(text: str) -> str:
     text = re.sub(r"[።፣፤፥፦!?.,;:\"'()\[\]{}]", " ", text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
+
+
+def normalize_for_fair_score(text: str) -> str:
+    normalized = normalize_amharic_text(text)
+    if normalize_farmer_query is None:
+        return normalized
+    return normalize_amharic_text(normalize_farmer_query(normalized))
 
 
 def levenshtein(a: list[str] | str, b: list[str] | str) -> int:
@@ -61,6 +74,22 @@ def wer(reference: str, hypothesis: str) -> float | None:
 def cer(reference: str, hypothesis: str) -> float | None:
     ref = normalize_amharic_text(reference).replace(" ", "")
     hyp = normalize_amharic_text(hypothesis).replace(" ", "")
+    if not ref:
+        return None
+    return levenshtein(ref, hyp) / len(ref)
+
+
+def normalized_wer(reference: str, hypothesis: str) -> float | None:
+    ref_words = normalize_for_fair_score(reference).split()
+    hyp_words = normalize_for_fair_score(hypothesis).split()
+    if not ref_words:
+        return None
+    return levenshtein(ref_words, hyp_words) / len(ref_words)
+
+
+def normalized_cer(reference: str, hypothesis: str) -> float | None:
+    ref = normalize_for_fair_score(reference).replace(" ", "")
+    hyp = normalize_for_fair_score(hypothesis).replace(" ", "")
     if not ref:
         return None
     return levenshtein(ref, hyp) / len(ref)
@@ -165,8 +194,12 @@ def evaluate_case(case: dict[str, Any], base_url: str, timeout: float) -> dict[s
     if case.get("reference") and status == 200:
         w = wer(case["reference"], hyp)
         c = cer(case["reference"], hyp)
+        nw = normalized_wer(case["reference"], hyp)
+        nc = normalized_cer(case["reference"], hyp)
         row["wer"] = round(w, 4) if w is not None else None
         row["cer"] = round(c, 4) if c is not None else None
+        row["normalized_wer"] = round(nw, 4) if nw is not None else None
+        row["normalized_cer"] = round(nc, 4) if nc is not None else None
 
     rubric = case.get("rubric") or {}
     if "max_latency_ms" in rubric and latency_ms > float(rubric["max_latency_ms"]):
@@ -177,6 +210,10 @@ def evaluate_case(case: dict[str, Any], base_url: str, timeout: float) -> dict[s
         errors.append(f"wer {row['wer']} > {rubric['max_wer']}")
     if "max_cer" in rubric and row.get("cer") is not None and float(row["cer"]) > float(rubric["max_cer"]):
         errors.append(f"cer {row['cer']} > {rubric['max_cer']}")
+    if "max_normalized_wer" in rubric and row.get("normalized_wer") is not None and float(row["normalized_wer"]) > float(rubric["max_normalized_wer"]):
+        errors.append(f"normalized_wer {row['normalized_wer']} > {rubric['max_normalized_wer']}")
+    if "max_normalized_cer" in rubric and row.get("normalized_cer") is not None and float(row["normalized_cer"]) > float(rubric["max_normalized_cer"]):
+        errors.append(f"normalized_cer {row['normalized_cer']} > {rubric['max_normalized_cer']}")
     if row.get("language") not in (None, "am"):
         errors.append(f"language {row.get('language')} != am")
 
@@ -199,16 +236,18 @@ def write_markdown(report: dict[str, Any], path: Path) -> None:
         f"- Mean RTF: `{s['rtf_mean']}`",
         f"- Mean WER: `{s['wer_mean']}`",
         f"- Mean CER: `{s['cer_mean']}`",
+        f"- Mean normalized WER: `{s['normalized_wer_mean']}`",
+        f"- Mean normalized CER: `{s['normalized_cer_mean']}`",
         "",
         "These cases are TTS loopback clips. They are repeatable smoke tests, but real farmer-call recordings are needed for final accuracy claims.",
         "",
-        "| id | ok | latency_ms | audio_sec | rtf | wer | cer | confidence | transcript |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+        "| id | ok | latency_ms | audio_sec | rtf | wer | cer | norm_wer | norm_cer | confidence | transcript |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
     ]
     for row in report["cases"]:
         transcript = (row.get("final_transcript") or "").replace("|", " ")[:80]
         lines.append(
-            "| `{id}` | `{ok}` | `{lat}` | `{dur}` | `{rtf}` | `{wer}` | `{cer}` | `{conf}` | {txt} |".format(
+            "| `{id}` | `{ok}` | `{lat}` | `{dur}` | `{rtf}` | `{wer}` | `{cer}` | `{nwer}` | `{ncer}` | `{conf}` | {txt} |".format(
                 id=row.get("id"),
                 ok=row.get("ok"),
                 lat=row.get("latency_ms"),
@@ -216,6 +255,8 @@ def write_markdown(report: dict[str, Any], path: Path) -> None:
                 rtf=row.get("rtf"),
                 wer=row.get("wer"),
                 cer=row.get("cer"),
+                nwer=row.get("normalized_wer"),
+                ncer=row.get("normalized_cer"),
                 conf=row.get("confidence"),
                 txt=transcript,
             )
@@ -238,6 +279,8 @@ def main() -> int:
     rtfs = [float(r["rtf"]) for r in rows if isinstance(r.get("rtf"), (int, float))]
     wers = [float(r["wer"]) for r in rows if isinstance(r.get("wer"), (int, float))]
     cers = [float(r["cer"]) for r in rows if isinstance(r.get("cer"), (int, float))]
+    normalized_wers = [float(r["normalized_wer"]) for r in rows if isinstance(r.get("normalized_wer"), (int, float))]
+    normalized_cers = [float(r["normalized_cer"]) for r in rows if isinstance(r.get("normalized_cer"), (int, float))]
     summary = {
         "cases": len(rows),
         "passed": sum(1 for r in rows if r["ok"]),
@@ -251,13 +294,15 @@ def main() -> int:
         "rtf_max": round(max(rtfs), 3) if rtfs else None,
         "wer_mean": round(statistics.mean(wers), 4) if wers else None,
         "cer_mean": round(statistics.mean(cers), 4) if cers else None,
+        "normalized_wer_mean": round(statistics.mean(normalized_wers), 4) if normalized_wers else None,
+        "normalized_cer_mean": round(statistics.mean(normalized_cers), 4) if normalized_cers else None,
     }
     report = {
         "base_url": args.base_url,
         "summary": summary,
         "cases": rows,
         "notes": {
-            "measured": ["latency_ms", "real_time_factor", "WER", "CER", "confidence", "language_probability"],
+            "measured": ["latency_ms", "real_time_factor", "WER", "CER", "normalized_WER", "normalized_CER", "confidence", "language_probability"],
             "loopback_caveat": "TTS-generated audio is stable for smoke tests but does not represent noisy real farmer calls.",
         },
     }

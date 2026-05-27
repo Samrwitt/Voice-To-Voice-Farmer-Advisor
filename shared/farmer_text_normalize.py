@@ -86,6 +86,12 @@ def correct_known_agri_phrases(text: str) -> str:
     if not normalized:
         return ""
 
+    # Common short-call variants. These are intentionally narrow so we do not
+    # rewrite substantive farmer questions.
+    normalized = re.sub(r"\bሳላም\b", "ሰላም", normalized)
+    normalized = re.sub(r"\bነዎች\b", "ነዎት", normalized)
+    normalized = re.sub(r"\bአምነ[ውህ]ት\b", "እንዴት ነዎት", normalized)
+
     normalized = re.sub(r"\bየ?አስ\s+ቫር\s+አ\s+ሲዳን\b", "የአፈር አሲዳማነት", normalized)
     normalized = re.sub(r"\bየ?አፈር?\s+ራሲ\s+ዳማነት\b", "የአፈር አሲዳማነት", normalized)
     normalized = re.sub(r"\bየ?አሰ\s+ፊዳብ\b", "የአፈር አሲዳማነት", normalized)

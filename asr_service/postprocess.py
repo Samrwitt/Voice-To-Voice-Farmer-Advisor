@@ -11,10 +11,6 @@ from shared.farmer_text_normalize import (
     normalize_amharic_pronunciation,
     normalize_farmer_query,
 )
-# from config import USE_HOSTED_LLM_FIX
-# Hosted Groq/Gemini correction is disabled for now to avoid ASR token usage.
-# from hosted_llm_fix import hosted_fix_enabled, semantic_correction_hosted
-
 
 def correct_domain_terms_with_meta(text: str, threshold: int | None = None) -> tuple[str, dict]:
     if threshold is None:
@@ -98,6 +94,19 @@ def _apply_semantic_correction(domain_corrected: str) -> tuple[str, str | None, 
     Returns ``(final_text, semantic_corrected_or_none, fix_backend)``.
     fix_backend: groq | gemini | none
     """
+    mode = os.getenv("ASR_HOSTED_LLM_FIX", "0").strip().lower()
+    if mode not in ("1", "true", "yes", "on", "auto"):
+        return domain_corrected, None, None
+    try:
+        from hosted_llm_fix import hosted_fix_enabled, semantic_correction_hosted
+
+        if hosted_fix_enabled():
+            fixed, backend = semantic_correction_hosted(domain_corrected)
+            if backend and backend != "none" and fixed.strip():
+                return fixed, fixed, backend
+    except Exception as exc:
+        print(f"Hosted ASR fix failed, falling back: {exc}")
+
     return domain_corrected, None, None
 
 
@@ -108,12 +117,30 @@ def postprocess_asr_transcript(raw_text: str, acoustic_confidence: float | None 
     phrase_corrected = correct_known_agri_phrases(pronunciation_normalized)
     domain_corrected, fuzzy_meta = correct_domain_terms_with_meta(phrase_corrected)
 
-    final_text, semantic_corrected, fix_backend = _apply_semantic_correction(domain_corrected)
-    final_text = normalize_farmer_query(final_text)
-
-    unusual_words = detect_unusual_words(final_text)
     from confirmation import transcript_quality_confidence
 
+    unusual_words = detect_unusual_words(domain_corrected)
+    quality_confidence = transcript_quality_confidence(
+        domain_corrected,
+        unusual_words=unusual_words,
+        fuzzy_average=fuzzy_meta.get("average_score"),
+        acoustic_confidence=acoustic_confidence,
+    )
+    confirm = needs_confirmation(
+        raw_text,
+        domain_corrected,
+        unusual_words=unusual_words,
+        confidence=quality_confidence,
+    )
+    final_text = domain_corrected
+    semantic_corrected = None
+    fix_backend = None
+    fix_threshold = float(os.getenv("ASR_LLM_FIX_CONFIDENCE_THRESHOLD", "0.68") or "0.68")
+    if confirm or quality_confidence < fix_threshold:
+        final_text, semantic_corrected, fix_backend = _apply_semantic_correction(domain_corrected)
+
+    final_text = normalize_farmer_query(final_text)
+    unusual_words = detect_unusual_words(final_text)
     quality_confidence = transcript_quality_confidence(
         final_text,
         unusual_words=unusual_words,

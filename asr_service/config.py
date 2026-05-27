@@ -21,6 +21,18 @@ COMPUTE_TYPE = os.getenv("ASR_COMPUTE_TYPE", "float16")
 LANGUAGE = os.getenv("ASR_LANGUAGE", "am")
 TASK = os.getenv("ASR_TASK", "transcribe")
 
+GEMINI_ASR_MODEL = os.getenv("ASR_GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_ASR_TIMEOUT_SEC = float(os.getenv("ASR_GEMINI_TIMEOUT_SEC", "60"))
+
+ASR_INITIAL_PROMPT = os.getenv("ASR_INITIAL_PROMPT", "").strip()
+ASR_USE_DOMAIN_INITIAL_PROMPT = os.getenv("ASR_USE_DOMAIN_INITIAL_PROMPT", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+ASR_INITIAL_PROMPT_MAX_TERMS = int(os.getenv("ASR_INITIAL_PROMPT_MAX_TERMS", "24"))
+
 BEAM_SIZE = int(os.getenv("ASR_BEAM_SIZE", "5"))
 MAX_NEW_TOKENS = int(os.getenv("ASR_MAX_NEW_TOKENS", "160"))
 

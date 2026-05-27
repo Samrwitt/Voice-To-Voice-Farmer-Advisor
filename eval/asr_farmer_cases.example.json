@@ -1,0 +1,15 @@
+[
+  {
+    "id": "farmer_real_001",
+    "audio_path": "eval/asr_farmer_audio/farmer_real_001.wav",
+    "reference": "እዚህ ትክክለኛውን የሰው ቃል በአማርኛ ያስገቡ",
+    "rubric": {
+      "max_latency_ms": 15000,
+      "max_rtf": 4.0,
+      "max_wer": 0.35,
+      "max_cer": 0.2,
+      "max_normalized_wer": 0.3,
+      "max_normalized_cer": 0.15
+    }
+  }
+]

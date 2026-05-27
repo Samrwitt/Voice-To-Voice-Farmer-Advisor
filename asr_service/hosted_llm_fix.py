@@ -276,6 +276,14 @@ def _sanitize_llm_output(text: str, fallback: str) -> str:
     # Must still look like Amharic farmer text
     if len(t) < 2:
         return fallback
+    ethiopic = sum(1 for ch in t if "\u1200" <= ch <= "\u137f")
+    letters = sum(1 for ch in t if ch.isalpha())
+    if letters and (ethiopic / max(letters, 1)) < 0.6:
+        return fallback
+    fallback_words = len((fallback or "").split())
+    output_words = len(t.split())
+    if fallback_words >= 6 and output_words < max(3, int(fallback_words * 0.45)):
+        return fallback
     return t
 
 
