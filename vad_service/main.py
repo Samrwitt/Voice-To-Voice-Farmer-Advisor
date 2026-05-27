@@ -102,6 +102,23 @@ class SessionState:
         self.pending_confirmation_utterance_path = None
 
 
+def _looks_like_expert_handoff_request(text: str) -> bool:
+    q = (text or "").strip().lower()
+    if not q:
+        return False
+    hints = (
+        "ባለሙያ",
+        "ለባለሙያ",
+        "ወደ ባለሙያ",
+        "expert",
+        "human",
+        "operator",
+        "escalate",
+        "handoff",
+    )
+    return any(token in q for token in hints)
+
+
 def split_tts_sentences(text: str) -> list[str]:
     return [
         sentence.strip()
@@ -444,6 +461,7 @@ async def handle_completed_utterance(
 
         asr_result = apply_normalized_transcript_to_asr_result(asr_result)
         transcript = asr_result.get("transcript")
+        force_rag_for_expert_request = _looks_like_expert_handoff_request(transcript)
 
         from transcript_quality import GIBBERISH_REPLY_AM, is_asr_gibberish
 
@@ -452,7 +470,11 @@ async def handle_completed_utterance(
             conf_f = float(conf) if conf is not None else None
         except (TypeError, ValueError):
             conf_f = None
-        if not confirmed_pending_transcript and is_asr_gibberish(transcript, conf_f):
+        if (
+            not confirmed_pending_transcript
+            and not force_rag_for_expert_request
+            and is_asr_gibberish(transcript, conf_f)
+        ):
             rag_answer = GIBBERISH_REPLY_AM
             print(
                 f"[ASR GIBBERISH] session={session_id}, transcript={transcript!r}, conf={conf_f}",
@@ -495,6 +517,7 @@ async def handle_completed_utterance(
         flow_decision = vad_flow_decision(asr_result)
         if (
             not confirmed_pending_transcript
+            and not force_rag_for_expert_request
             and flow_decision == "reprompt"
         ):
             rag_answer = CLARIFY_REPROMPT_AM
@@ -543,6 +566,7 @@ async def handle_completed_utterance(
             vad_confirmation_gate_enabled()
             and flow_decision == "confirm"
             and not confirmed_pending_transcript
+            and not force_rag_for_expert_request
         ):
             session_state.pending_confirmation_transcript = transcript
             session_state.pending_confirmation_asr_meta = {

@@ -157,6 +157,20 @@ def _get_smart_advisory_module():
     return _smart_advisory_module
 
 
+def _contains_unvoiceable_artifacts(text: str) -> bool:
+    """
+    Guardrail for voice output: never speak raw URLs or citation-dump artifacts.
+    """
+    s = (text or "").strip().lower()
+    if not s:
+        return False
+    if any(token in s for token in ("http://", "https://", "www.", ".com/", ".org/", ".net/")):
+        return True
+    if "researchgate" in s or "doi:" in s:
+        return True
+    return False
+
+
 # ── Pydantic Models ──────────────────────────────────────────────────────────
 class Query(BaseModel):
     text: str
@@ -1730,6 +1744,23 @@ async def rag_answer(req: RagAnswerRequest):
     current_response = final
     if expert_delivery:
         final = f"{expert_delivery}\n\n{final}"
+
+    if _contains_unvoiceable_artifacts(final):
+        return _voice_escalation_response(
+            query_text=query_text,
+            phone_number=req.phone_number,
+            session_id=req.session_id,
+            expert_delivery=expert_delivery,
+            expert_delivery_payload=expert_delivery_payload,
+            body="ይቅርታ፣ የተገኘው መልስ ለድምፅ መልቀቅ ተስማሚ አልነበረም። ጥያቄዎን ለባለሙያ አስተላልፈናል።",
+            reason_code="LOW_CONFIDENCE",
+            escalation_context="Voice guard blocked URL/citation-style response.",
+            best_distance=best,
+            hits=hits,
+            t0=t0,
+            meta_reason="voice_output_guard_escalation",
+            nlu=nlu,
+        )
 
     escalated_empty = False
     if not final:
