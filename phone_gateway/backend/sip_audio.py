@@ -51,6 +51,9 @@ DEFAULT_GREETING_AM = (
     "ሰላም ይሁንልዎ። እኔ የግብርና አማካሪ ነኝ። "
     "በምን ጉዳይ ልርዳዎት እንደምትፈልጉ ይንገሩኝ።"
 )
+DEFAULT_PROCESSING_ACK_AM = (
+    "ጥያቄዎን ተቀብለናል። መልሱን እየዘጋጀን ነው።"
+)
 
 _server: asyncio.AbstractServer | None = None
 _alert_server: asyncio.AbstractServer | None = None
@@ -228,7 +231,38 @@ async def safe_send_to_sink(sink: AudioSocketPlaybackSink, payload: dict | bytes
         return False
 
 
-async def forward_vad_events_to_sip(vad_ws, sink: AudioSocketPlaybackSink):
+class SipPlaybackState:
+    """
+    Tracks any currently running playback task (greeting / ack / answer) so we
+    can implement barge-in by cancelling playback when the caller starts talking.
+    """
+
+    def __init__(self):
+        self.playback_task: asyncio.Task | None = None
+        self.playback_label: str | None = None
+
+
+def _cancel_playback(state: SipPlaybackState, *, reason: str) -> None:
+    task = state.playback_task
+    if task and not task.done():
+        print(f"[BARGE-IN] Cancelling playback ({state.playback_label}) due to {reason}", flush=True)
+        task.cancel()
+
+
+def _start_playback_task(
+    state: SipPlaybackState,
+    label: str,
+    coro,
+) -> asyncio.Task:
+    _cancel_playback(state, reason=f"starting_{label}")
+    task = asyncio.create_task(coro)
+    state.playback_task = task
+    state.playback_label = label
+    return task
+
+
+async def forward_vad_events_to_sip(vad_ws, sink: AudioSocketPlaybackSink, state: SipPlaybackState):
+    processing_ack_played_for: set[str] = set()
     try:
         async for message in vad_ws:
             if isinstance(message, bytes):
@@ -248,6 +282,8 @@ async def forward_vad_events_to_sip(vad_ws, sink: AudioSocketPlaybackSink):
                 update_vad_status("vad_ready", data)
             elif event_name == "speech_started":
                 update_vad_status("speech_started", data)
+                # Barge-in: if the caller starts speaking, stop any ongoing playback
+                _cancel_playback(state, reason="speech_started")
             elif event_name == "speech_ended":
                 update_vad_status("speech_ended", data)
                 add_utterance(
@@ -255,6 +291,17 @@ async def forward_vad_events_to_sip(vad_ws, sink: AudioSocketPlaybackSink):
                     duration_seconds=data.get("duration_seconds"),
                     speech_probability=data.get("speech_probability"),
                 )
+                utterance_path = data.get("utterance_path")
+                if utterance_path and utterance_path not in processing_ack_played_for:
+                    processing_ack_played_for.add(utterance_path)
+                    # Cap memory for long calls.
+                    if len(processing_ack_played_for) > 50:
+                        processing_ack_played_for.clear()
+                    _start_playback_task(
+                        state,
+                        "processing_ack",
+                        play_processing_acknowledgement(sink),
+                    )
             elif event_name in ("asr_transcript", "transcript_ready"):
                 add_event("asr_transcript", data)
                 update_utterance_transcript(
@@ -358,6 +405,21 @@ async def play_opening_greeting(sink: AudioSocketPlaybackSink) -> None:
     except Exception as exc:
         print(f"[SIP GREETING FAILED] {exc}", flush=True)
         add_event("sip_greeting_failed", {"error": str(exc)})
+
+
+async def play_processing_acknowledgement(sink: AudioSocketPlaybackSink) -> None:
+    if not parse_bool_env("SIP_PLAY_PROCESSING_ACK", "1"):
+        return
+
+    text = os.getenv("SIP_PROCESSING_ACK_AM", DEFAULT_PROCESSING_ACK_AM).strip()
+    if not text:
+        return
+
+    try:
+        await play_alert_message(sink, text)
+    except Exception as exc:
+        print(f"[SIP PROCESSING ACK FAILED] {exc}", flush=True)
+        add_event("sip_processing_ack_failed", {"error": str(exc)})
 
 
 def register_alert_call_payload(call_id: str, payload: dict) -> None:
@@ -505,14 +567,14 @@ async def handle_sip_audiosocket_call(
 
     vad_ws = None
     vad_event_task = None
-    greeting_task = None
+    playback_state = SipPlaybackState()
     chunk_count = 0
     total_audio_bytes = 0
 
     try:
         vad_ws = await websockets.connect(vad_url)
-        vad_event_task = asyncio.create_task(forward_vad_events_to_sip(vad_ws, sink))
-        greeting_task = asyncio.create_task(play_opening_greeting(sink))
+        vad_event_task = asyncio.create_task(forward_vad_events_to_sip(vad_ws, sink, playback_state))
+        _start_playback_task(playback_state, "greeting", play_opening_greeting(sink))
 
         if first_media_packet:
             _, payload = first_media_packet
@@ -573,10 +635,11 @@ async def handle_sip_audiosocket_call(
             "error": str(exc),
         })
     finally:
-        if greeting_task and not greeting_task.done():
-            greeting_task.cancel()
+        # Stop any playback still running
+        _cancel_playback(playback_state, reason="call_end")
+        if playback_state.playback_task:
             try:
-                await greeting_task
+                await playback_state.playback_task
             except asyncio.CancelledError:
                 pass
             except Exception:
