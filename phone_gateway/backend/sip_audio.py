@@ -277,6 +277,10 @@ async def forward_vad_events_to_sip(vad_ws, sink: AudioSocketPlaybackSink, state
     try:
         async for message in vad_ws:
             if isinstance(message, bytes):
+                # Prevent mixed/garbled audio: if VAD is already streaming synthesized
+                # response audio, stop local filler playback first.
+                if state.playback_label == "processing_ack":
+                    _cancel_playback(state, reason="vad_tts_stream_started")
                 sent = await safe_send_to_sink(sink, message)
                 if not sent:
                     break
@@ -344,10 +348,16 @@ async def forward_vad_events_to_sip(vad_ws, sink: AudioSocketPlaybackSink, state
                     )
             elif event_name == "tts_ready":
                 add_event("tts_ready", data)
+                if state.playback_label == "processing_ack":
+                    _cancel_playback(state, reason="tts_ready")
                 tts_url = data.get("tts_url") or data.get("audio_url")
                 utterance_path = data.get("utterance_path")
                 if tts_url and utterance_path:
                     update_utterance_tts(utterance_path, tts_url)
+            elif event_name == "tts_started":
+                add_event("tts_started", data)
+                if state.playback_label == "processing_ack":
+                    _cancel_playback(state, reason="tts_started")
             else:
                 add_event(event_name, data)
 
@@ -480,9 +490,10 @@ async def handle_alert_audiosocket_call(
     peer = writer.get_extra_info("peername")
     try:
         call_id = str(uuid.uuid4())
+        # For expert callback legs, prefer alert-specific sample rate config.
         sample_rate = parse_int_env(
-            "SIP_AUDIOSOCKET_SAMPLE_RATE",
-            parse_int_env("SIP_ALERT_AUDIOSOCKET_SAMPLE_RATE", 8000),
+            "SIP_ALERT_AUDIOSOCKET_SAMPLE_RATE",
+            parse_int_env("SIP_AUDIOSOCKET_SAMPLE_RATE", 8000),
         )
         packet_kind, payload = await asyncio.wait_for(read_audiosocket_packet(reader), timeout=10.0)
         if packet_kind == AUDIOSOCKET_KIND_UUID:
