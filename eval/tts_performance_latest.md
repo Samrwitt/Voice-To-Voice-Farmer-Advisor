@@ -4,9 +4,9 @@
 - Cases: `4`
 - Passed: `4`
 - Failed: `0`
-- Mean latency: `2275.1` ms
-- p95 latency: `3538.2` ms
-- Mean RTF: `0.459`
+- Mean latency: `2155.6` ms
+- p95 latency: `3680.9` ms
+- Mean RTF: `0.397`
 
 Automated metrics: HTTP success, synthesis latency, real-time factor, WAV sample rate/channels/bit depth, loudness proxy, clipping ratio, and silence ratio.
 
@@ -14,7 +14,7 @@ Not measured automatically: MOS, CMOS, MUSHRA, PESQ, STOI, speaker similarity, a
 
 | id | ok | latency_ms | duration_sec | rtf | rms_dbfs | peak_dbfs | clipping | silence |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `short_greeting` | `True` | `1394.4` | `1.521` | `0.917` | `-17.2` | `-3.9` | `0.0` | `0.2857` |
-| `farmer_advice_medium` | `True` | `1578.7` | `6.18` | `0.255` | `-16.1` | `-1.3` | `0.0` | `0.1129` |
-| `safety_message` | `True` | `2385.5` | `7.334` | `0.325` | `-15.9` | `-1.5` | `0.0` | `0.2044` |
-| `long_voice_answer` | `True` | `3741.6` | `11.108` | `0.337` | `-16.0` | `-2.0` | `0.0` | `0.1673` |
+| `short_greeting` | `True` | `1061.3` | `1.522` | `0.697` | `-17.3` | `-3.9` | `0.0` | `0.2857` |
+| `farmer_advice_medium` | `True` | `1752.3` | `6.18` | `0.284` | `-16.1` | `-1.3` | `0.0` | `0.1129` |
+| `safety_message` | `True` | `1794.9` | `7.314` | `0.245` | `-15.9` | `-1.6` | `0.0` | `0.1995` |
+| `long_voice_answer` | `True` | `4013.7` | `11.108` | `0.361` | `-16.0` | `-2.0` | `0.0` | `0.1673` |

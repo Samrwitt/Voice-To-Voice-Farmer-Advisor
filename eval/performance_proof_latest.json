@@ -2,25 +2,25 @@
   "base_url": "http://127.0.0.1:8004",
   "metrics": {
     "cases_total": 12,
-    "cases_passed": 12,
-    "case_pass_rate_pct": 100.0,
-    "scenario_accuracy_pct": 100.0,
+    "cases_passed": 11,
+    "case_pass_rate_pct": 91.7,
+    "scenario_accuracy_pct": 85.7,
     "scenario_cases": 7,
     "expected_grounding_accuracy_pct": 100.0,
     "expected_grounding_cases": 5,
     "forbidden_grounding_pass_rate_pct": 100.0,
     "forbidden_grounding_cases": 3,
-    "latency_ms_mean": 3651.3,
-    "latency_ms_p50": 383.1,
-    "latency_ms_p95": 13557.6,
-    "latency_ms_max": 13557.6,
-    "avg_references": 1
+    "latency_ms_mean": 1581.1,
+    "latency_ms_p50": 73.8,
+    "latency_ms_p95": 6481.1,
+    "latency_ms_max": 6481.1,
+    "avg_references": 1.2
   },
   "cases": [
     {
       "id": "greeting_amharic",
       "ok": true,
-      "latency_ms": 87.6,
+      "latency_ms": 60.3,
       "trust_latency_ms": null,
       "grounding": "greeting",
       "scenario": "greeting_only",
@@ -30,28 +30,28 @@
     {
       "id": "wheat_altitude",
       "ok": true,
-      "latency_ms": 10787.3,
-      "trust_latency_ms": 10599.5,
+      "latency_ms": 5507.1,
+      "trust_latency_ms": 5478.6,
       "grounding": "kb_unknown",
       "scenario": "crop_production",
       "references": 3,
-      "response_preview": "ችሉ የመስኖ መሠረተ-ልማቶች መሟላታቸውን ማረጋገጥ ያስፈልጋል፡፡ የአፈር ጨዋማነት እንዳይስፋፋ የመስኖ ውሃን በአግባቡ መጠቀም አስፈላጊ ነው፡፡ ውሃው ማሳ ላይ እንዳይተኛ ማድረግና ከተኛም ቶሎ ማጠንፈፍ ያስፈልጋል፡፡ በተጨማሪም አፈሩ ጨዋማ ከሆነ በማጠብ"
+      "response_preview": "ማሳሰቢያዎች: mbjbj ችሉ የመስኖ መሠረተ-ልማቶች መሟላታቸውን ማረጋገጥ ያስፈልጋል፡፡ የአፈር ጨዋማነት እንዳይስፋፋ የመስኖ ውሃን በአግባቡ መጠቀም አስፈላጊ ነው፡፡ ውሃው ማሳ ላይ እንዳይተኛ ማድረግና ከተኛም ቶሎ ማጠንፈፍ ያስፈልጋል፡፡ በተጨማሪም አ"
     },
     {
       "id": "wheat_production_no_escalation",
       "ok": true,
-      "latency_ms": 4492.5,
-      "trust_latency_ms": 4406.0,
+      "latency_ms": 1105.0,
+      "trust_latency_ms": 1073.1,
       "grounding": "kb_unknown",
       "scenario": "crop_production",
       "references": 3,
-      "response_preview": "ptoria spp) የስንዴ ቅጠል ቆርምድ በሽታ አምጪ ተህዋስ Septoria tritici blotch ስሆን የዛላ ምች በሽታን የሚያስከትለው ደግሞ Septoria nodorum blotch በመባል ይታወቃል፡፡ ለበሽታ አምጭ ተህዋስ ወበቃማና በአማካኝ ከ20-2"
+      "response_preview": "ማሳሰቢያዎች: mbjbj ptoria spp) የስንዴ ቅጠል ቆርምድ በሽታ አምጪ ተህዋስ Septoria tritici blotch ስሆን የዛላ ምች በሽታን የሚያስከትለው ደግሞ Septoria nodorum blotch በመባል ይታወቃል፡፡ ለበሽታ አምጭ ተህዋስ ወበ"
     },
     {
       "id": "fertilizer_general",
       "ok": true,
-      "latency_ms": 198.7,
-      "trust_latency_ms": 194.8,
+      "latency_ms": 66.1,
+      "trust_latency_ms": 64.5,
       "grounding": "clarification",
       "scenario": "fertilizer",
       "references": 0,
@@ -60,8 +60,8 @@
     {
       "id": "wheat_fertilizer_region_clarification",
       "ok": true,
-      "latency_ms": 299.9,
-      "trust_latency_ms": 294.6,
+      "latency_ms": 73.7,
+      "trust_latency_ms": 71.8,
       "grounding": "clarification",
       "scenario": "fertilizer",
       "references": 0,
@@ -69,19 +69,19 @@
     },
     {
       "id": "teff_price_intent",
-      "ok": true,
-      "latency_ms": 1093.2,
-      "trust_latency_ms": 1006.0,
-      "grounding": "tools",
-      "scenario": "market_price",
-      "references": 0,
-      "response_preview": "የጤፍ ዋጋ በAsayta 14000.0 ብር/100 ኪሎ ግራም ነው። አዝማሚያው እየቀነሰ ነው። ዋጋው እየቀነሰ ከሆነ ብዙ ጊዜ ከመጠበቅ በፊት የአካባቢ ገበያን ያረጋግጡ። የመረጃው ቀን: 2026-03-15። የዋጋ አይነት: Retail። ይህ በመዝገቡ ያለ የመ"
+      "ok": false,
+      "latency_ms": 1170.4,
+      "trust_latency_ms": 1143.1,
+      "grounding": "kb_unknown",
+      "scenario": "crop_production",
+      "references": 3,
+      "response_preview": "ማሳሰቢያዎች: mbjbj ጥያቄ፦ ጤፍ የተሻሻሉ ዝርያዎች ምርትን እንዴት ያሻሽላሉ? ምላሽ፦ በኢትዮጵያ የግብርና ምርምር ሥርዓት እስከ 2014 ዓ.ም ድረስ 58 የተሻሻሉ የጤፍ ዝርያዎች ተለቀው አገልግሎት ላይ እንዲውሉ ተደርገዋል፡፡ ከነዚህ ውስጥ በአገር "
     },
     {
       "id": "weather_missing_location_clarifies",
       "ok": true,
-      "latency_ms": 199.4,
-      "trust_latency_ms": 197.3,
+      "latency_ms": 65.2,
+      "trust_latency_ms": 63.8,
       "grounding": "clarification",
       "scenario": "weather",
       "references": 0,
@@ -90,18 +90,18 @@
     {
       "id": "coffee_pest",
       "ok": true,
-      "latency_ms": 12076.3,
-      "trust_latency_ms": 11900.6,
+      "latency_ms": 4233.0,
+      "trust_latency_ms": 4202.1,
       "grounding": "kb_unknown",
       "scenario": "pest_disease",
       "references": 3,
-      "response_preview": "ጥያቄ፦ ለቡና ፍሬው የእቅፉ ጠቀሜታ ምንድነው? ምላሽ፦ እቅፉ፣ የዘር ኮት በመባልም ይታወቃል፣ የቡና ፍሬው ውጫዊው ሽፋን ነው። የቡና ፍሬ በማደግ እና በማቀነባበር ወቅት እንደ መከላከያ ሽፋን ሆኖ ያገለግላል. እንደ እርጥበት፣ነፍሳት እና አካላዊ ጉዳት "
+      "response_preview": "ማሳሰቢያዎች: mbjbj ጥያቄ፦ ለቡና ፍሬው የእቅፉ ጠቀሜታ ምንድነው? ምላሽ፦ እቅፉ፣ የዘር ኮት በመባልም ይታወቃል፣ የቡና ፍሬው ውጫዊው ሽፋን ነው። የቡና ፍሬ በማደግ እና በማቀነባበር ወቅት እንደ መከላከያ ሽፋን ሆኖ ያገለግላል. እንደ እርጥበት፣ነፍ"
     },
     {
       "id": "compost_benefit",
       "ok": true,
-      "latency_ms": 426.8,
-      "trust_latency_ms": 251.4,
+      "latency_ms": 70.5,
+      "trust_latency_ms": 38.5,
       "grounding": "tools",
       "scenario": "fertilizer",
       "references": 0,
@@ -110,18 +110,18 @@
     {
       "id": "barley_region",
       "ok": true,
-      "latency_ms": 13557.6,
-      "trust_latency_ms": 13333.1,
+      "latency_ms": 6481.1,
+      "trust_latency_ms": 6449.0,
       "grounding": "kb_unknown",
       "scenario": "crop_production",
       "references": 3,
-      "response_preview": "ጥያቄ፦ ረጅም ቁመት ላላቸው የገብስ ዘሮች ምን ያህል ዘር ያስፈልጋል? ምላሽ፦ በሄክታር 100-125 ኪ.ግ. ባዋል፡፡ በሚገባ ታርሶ የለሰለሰና ከአረም የጸዳ ማሳ ማዘጋጀት፤ ከአረም ነጻ የሆነ ዘር መጠቀም፤ በመስመርና ቀድሞ መዝራት፤ ከተዘራ ከ18-20 "
+      "response_preview": "ማሳሰቢያዎች: mbjbj ጥያቄ፦ ረጅም ቁመት ላላቸው የገብስ ዘሮች ምን ያህል ዘር ያስፈልጋል? ምላሽ፦ በሄክታር 100-125 ኪ.ግ. ባዋል፡፡ በሚገባ ታርሶ የለሰለሰና ከአረም የጸዳ ማሳ ማዘጋጀት፤ ከአረም ነጻ የሆነ ዘር መጠቀም፤ በመስመርና ቀድሞ መዝራ"
     },
     {
       "id": "urea_timing",
       "ok": true,
-      "latency_ms": 256.4,
-      "trust_latency_ms": 251.8,
+      "latency_ms": 67.0,
+      "trust_latency_ms": 65.6,
       "grounding": "clarification",
       "scenario": "fertilizer",
       "references": 0,
@@ -130,13 +130,18 @@
     {
       "id": "agrochemical_safety_escalates",
       "ok": true,
-      "latency_ms": 339.5,
-      "trust_latency_ms": 335.6,
+      "latency_ms": 74.0,
+      "trust_latency_ms": 72.0,
       "grounding": "escalation",
       "scenario": "safety_agrochemical",
       "references": 0,
       "response_preview": "ለመድሐኒት መጠን፣ የመርጨት ጊዜ፣ መገናኛና የደህንነት ጥያቄዎች ከዚህ ስልክ አጠቃላይ መረጃ ብቻ ሙሉ መልስ ልንሰጥ አንችልም። እባክዎን የገበር ልማት ባለሙያ፣ ኮኦፕ ወይም የአካባቢ ተቋም ይጠይቁ። ጥያቄዎን ለባለሙያ አስተላልፈናል።"
     }
   ],
-  "failures": []
+  "failures": [
+    "teff_price_intent: scenario expected 'market_price' got 'crop_production'"
+  ],
+  "command": "python3 eval/run_rag_eval.py",
+  "exit_code": 1,
+  "generated_at": "2026-05-28T07:37:14.932454+00:00"
 }

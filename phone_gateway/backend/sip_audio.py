@@ -49,7 +49,7 @@ AUDIOSOCKET_RATE_KINDS = {
 
 DEFAULT_GREETING_AM = (
     "ሰላም ይሁንልዎ። እኔ የግብርና አማካሪ ነኝ። "
-    "በምን ጉዳይ ልርዳዎት እንደምትፈልጉ ይንገሩኝ።"
+    "በምን ጉዳይ ልረዳዎት እንደምትፈልጉ ይንገሩኝ።"
 )
 DEFAULT_PROCESSING_ACK_AM = (
     "ጥያቄዎን ተቀብለናል። መልሱን እየዘጋጀን ነው።"
@@ -58,6 +58,10 @@ DEFAULT_PROCESSING_ACK_AM = (
 _server: asyncio.AbstractServer | None = None
 _alert_server: asyncio.AbstractServer | None = None
 _alert_call_payloads: dict[str, dict] = {}
+_sip_call_semaphore: asyncio.Semaphore | None = None
+_alert_call_semaphore: asyncio.Semaphore | None = None
+_active_sip_calls = 0
+_active_alert_calls = 0
 
 
 def audiosocket_kind_for_sample_rate(sample_rate: int) -> int:
@@ -77,6 +81,8 @@ def parse_int_env(name: str, default: int) -> int:
 
 
 SIP_AUDIO_LOG_EVERY = parse_int_env("SIP_AUDIO_LOG_EVERY", 0)
+SIP_MAX_CONCURRENT_CALLS = max(1, parse_int_env("SIP_MAX_CONCURRENT_CALLS", 8))
+SIP_MAX_CONCURRENT_ALERT_CALLS = max(1, parse_int_env("SIP_MAX_CONCURRENT_ALERT_CALLS", 4))
 
 
 def summarize_sip_event(payload: dict) -> dict:
@@ -487,7 +493,115 @@ async def handle_alert_audiosocket_call(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
 ) -> None:
+    global _active_alert_calls
     peer = writer.get_extra_info("peername")
+    if _alert_call_semaphore is None:
+        print("[SIP ALERT] semaphore not initialized; rejecting connection", flush=True)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        return
+
+    if _alert_call_semaphore.locked():
+        print(
+            f"[SIP ALERT] at capacity ({SIP_MAX_CONCURRENT_ALERT_CALLS}); waiting for slot",
+            flush=True,
+        )
+
+    async with _alert_call_semaphore:
+        _active_alert_calls += 1
+        try:
+            print(
+                f"[SIP ALERT] active={_active_alert_calls}/{SIP_MAX_CONCURRENT_ALERT_CALLS}",
+                flush=True,
+            )
+            try:
+                call_id = str(uuid.uuid4())
+                sample_rate = parse_int_env(
+                    "SIP_ALERT_AUDIOSOCKET_SAMPLE_RATE",
+                    parse_int_env("SIP_AUDIOSOCKET_SAMPLE_RATE", 8000),
+                )
+                packet_kind, payload = await asyncio.wait_for(read_audiosocket_packet(reader), timeout=10.0)
+                if packet_kind == AUDIOSOCKET_KIND_UUID:
+                    call_id = decode_call_uuid(payload)
+                elif packet_kind in AUDIOSOCKET_MEDIA_RATES:
+                    sample_rate = AUDIOSOCKET_MEDIA_RATES[packet_kind]
+                elif packet_kind == AUDIOSOCKET_KIND_ERROR:
+                    raise RuntimeError(f"AudioSocket error before alert playback from {peer}: {payload.hex()}")
+                elif packet_kind == AUDIOSOCKET_KIND_HANGUP:
+                    return
+
+                payload = _alert_call_payloads.pop(call_id, {})
+                message = (payload.get("alert_message") or "").strip()
+                expert_audio_path = (payload.get("expert_audio_path") or "").strip()
+                severity = (payload.get("severity") or "warning").strip()
+                if severity == "critical":
+                    prefix = "አስቸኳይ ማስጠንቀቂያ። "
+                elif severity == "expert_response":
+                    prefix = ""
+                else:
+                    prefix = "የግብርና ማሳሰቢያ። "
+                sink = AudioSocketPlaybackSink(writer, default_sample_rate=sample_rate)
+                if expert_audio_path:
+                    intro = (
+                        message
+                        or os.getenv(
+                            "SIP_EXPERT_RESPONSE_INTRO_AM",
+                            "የባለሙያ መልስ ዝግጁ ነው። አሁን እናጫውታለን።",
+                        )
+                    )
+                    add_event("expert_callback_intro_start", {
+                        "call_id": call_id,
+                        "phone_number": payload.get("phone_number"),
+                        "escalation_id": payload.get("escalation_id"),
+                        "intro_chars": len(intro or ""),
+                    })
+                    if intro:
+                        await play_alert_message(sink, intro)
+                    add_event("expert_callback_intro_done", {
+                        "call_id": call_id,
+                        "phone_number": payload.get("phone_number"),
+                        "escalation_id": payload.get("escalation_id"),
+                    })
+                    add_event("expert_callback_audio_start", {
+                        "call_id": call_id,
+                        "phone_number": payload.get("phone_number"),
+                        "escalation_id": payload.get("escalation_id"),
+                        "expert_audio_path": expert_audio_path,
+                    })
+                    await play_recorded_audio_file(sink, expert_audio_path)
+                    add_event("expert_callback_audio_done", {
+                        "call_id": call_id,
+                        "phone_number": payload.get("phone_number"),
+                        "escalation_id": payload.get("escalation_id"),
+                    })
+                elif severity == "expert_response":
+                    raise RuntimeError("Expert callback requires recorded expert audio.")
+                elif message:
+                    await play_alert_message(sink, prefix + message)
+                add_event("alert_call_played", {
+                    "call_id": call_id,
+                    "phone_number": payload.get("phone_number"),
+                    "target_region": payload.get("target_region"),
+                    "kind": payload.get("kind") or "alert",
+                })
+            except Exception as exc:
+                print(f"[ALERT CALL ERROR] peer={peer}, error={exc}", flush=True)
+                add_event("alert_call_error", {"peer": str(peer), "error": str(exc)})
+            finally:
+                try:
+                    await write_audiosocket_packet(writer, AUDIOSOCKET_KIND_HANGUP)
+                except Exception:
+                    pass
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+        finally:
+            _active_alert_calls = max(0, _active_alert_calls - 1)
     try:
         call_id = str(uuid.uuid4())
         # For expert callback legs, prefer alert-specific sample rate config.
@@ -578,179 +692,204 @@ async def handle_sip_audiosocket_call(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
 ) -> None:
+    global _active_sip_calls
     peer = writer.get_extra_info("peername")
-    try:
-        call_leg_id, sample_rate, first_media_packet = await read_initial_audiosocket_media(
-            reader,
-            peer,
-        )
-    except asyncio.TimeoutError:
-        print(f"[SIP CALL TIMEOUT] No AudioSocket UUID/media from {peer}", flush=True)
-        return
-    except asyncio.IncompleteReadError:
-        return
-    except Exception as exc:
-        print(f"[SIP CALL START ERROR] peer={peer}, error={exc}", flush=True)
-        return
-
-    sip_caller_phone = (
-        os.getenv("SIP_DEFAULT_CALLER_PHONE_NUMBER", "sip:farmeruhamayohannes").strip()
-        or f"sip:{call_leg_id}"
-    )
-    sip_caller_name = os.getenv("SIP_DEFAULT_CALLER_NAME", "SIP Farmer").strip() or "SIP Farmer"
-
-    session = create_session(full_name=sip_caller_name, phone_number=sip_caller_phone)
-    session_id = session["session_id"]
-    recorder = AudioRecorder(session_id=session_id, sample_rate=sample_rate)
-    sink = AudioSocketPlaybackSink(writer, default_sample_rate=sample_rate)
-
-    query_params = urlencode({
-        "session_id": session_id,
-        "sample_rate": sample_rate,
-        "phone_number": sip_caller_phone,
-    })
-    vad_url = f"{os.getenv('VAD_WS_BASE_URL', 'ws://vad-service:8010/ws/vad')}?{query_params}"
-
-    start_call_monitor(
-        session_id=session_id,
-        caller_id=session.get("caller_id"),
-        caller_name=sip_caller_name,
-        caller_phone=sip_caller_phone,
-        sample_rate=sample_rate,
-        audio_format="audiosocket/pcm16",
-    )
-    add_event("sip_call_started", {
-        "session_id": session_id,
-        "call_leg_id": call_leg_id,
-        "caller_phone": sip_caller_phone,
-        "peer": str(peer),
-        "sample_rate": sample_rate,
-    })
-
-    vad_ws = None
-    vad_event_task = None
-    playback_state = SipPlaybackState()
-    chunk_count = 0
-    total_audio_bytes = 0
-
-    try:
-        vad_ws = await websockets.connect(vad_url)
-        vad_event_task = asyncio.create_task(forward_vad_events_to_sip(vad_ws, sink, playback_state))
-        _start_playback_task(playback_state, "greeting", play_opening_greeting(sink))
-
-        if first_media_packet:
-            _, payload = first_media_packet
-            await vad_ws.send(payload)
-            recorder.write_chunk(payload)
-
-        while True:
-            packet_kind, payload = await read_audiosocket_packet(reader)
-
-            if packet_kind == AUDIOSOCKET_KIND_HANGUP:
-                break
-
-            if packet_kind == AUDIOSOCKET_KIND_DTMF:
-                digit = payload.decode("utf-8", errors="ignore")
-                add_event("sip_dtmf", {
-                    "session_id": session_id,
-                    "digit": digit,
-                })
-                continue
-
-            if packet_kind == AUDIOSOCKET_KIND_ERROR:
-                add_event("sip_audiosocket_error", {
-                    "session_id": session_id,
-                    "payload": payload.hex(),
-                })
-                break
-
-            if packet_kind not in AUDIOSOCKET_MEDIA_RATES:
-                add_event("sip_unknown_packet", {
-                    "session_id": session_id,
-                    "packet_kind": packet_kind,
-                    "payload_length": len(payload),
-                })
-                continue
-
-            if payload:
-                chunk_count += 1
-                total_audio_bytes += len(payload)
-                recorder.write_chunk(payload)
-                update_audio_stats(
-                    len(payload),
-                    audio_level=calculate_pcm16_audio_level(payload),
-                )
-                await vad_ws.send(payload)
-
-                if SIP_AUDIO_LOG_EVERY > 0 and chunk_count % SIP_AUDIO_LOG_EVERY == 0:
-                    print(
-                        f"[SIP AUDIO] session={session_id}, chunks={chunk_count}, "
-                        f"bytes={total_audio_bytes}",
-                        flush=True,
-                    )
-    except asyncio.IncompleteReadError:
-        add_event("sip_call_disconnected", {"session_id": session_id})
-    except Exception as exc:
-        print(f"[SIP CALL ERROR] session={session_id}, error={exc}", flush=True)
-        add_event("sip_call_error", {
-            "session_id": session_id,
-            "error": str(exc),
-        })
-    finally:
-        # Stop any playback still running
-        _cancel_playback(playback_state, reason="call_end")
-        if playback_state.playback_task:
-            try:
-                await playback_state.playback_task
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                pass
-
-        if vad_ws:
-            try:
-                await vad_ws.send(json.dumps({"event": "end_session"}))
-            except Exception:
-                pass
-
-        if vad_event_task:
-            try:
-                await asyncio.wait_for(vad_event_task, timeout=5.0)
-            except asyncio.TimeoutError:
-                vad_event_task.cancel()
-            except Exception:
-                pass
-
-        if vad_ws:
-            try:
-                await vad_ws.close()
-            except Exception:
-                pass
-
-        audio_file = recorder.close()
-        ended_session = end_session(session_id, audio_file=audio_file)
-        end_call_monitor(audio_file_path=audio_file)
-
-        add_event("sip_call_ended", {
-            "session_id": session_id,
-            "call_leg_id": call_leg_id,
-            "duration_seconds": ended_session.get("duration_seconds"),
-        })
-
-        try:
-            await write_audiosocket_packet(writer, AUDIOSOCKET_KIND_HANGUP)
-        except Exception:
-            pass
-
+    if _sip_call_semaphore is None:
+        print("[SIP CALL] semaphore not initialized; rejecting connection", flush=True)
         writer.close()
         try:
             await writer.wait_closed()
         except Exception:
             pass
+        return
+
+    if _sip_call_semaphore.locked():
+        print(
+            f"[SIP CALL] at capacity ({SIP_MAX_CONCURRENT_CALLS}); waiting for slot",
+            flush=True,
+        )
+
+    async with _sip_call_semaphore:
+        _active_sip_calls += 1
+        try:
+            print(
+                f"[SIP CALL] active={_active_sip_calls}/{SIP_MAX_CONCURRENT_CALLS}",
+                flush=True,
+            )
+            try:
+                call_leg_id, sample_rate, first_media_packet = await read_initial_audiosocket_media(
+                    reader,
+                    peer,
+                )
+            except asyncio.TimeoutError:
+                print(f"[SIP CALL TIMEOUT] No AudioSocket UUID/media from {peer}", flush=True)
+                return
+            except asyncio.IncompleteReadError:
+                return
+            except Exception as exc:
+                print(f"[SIP CALL START ERROR] peer={peer}, error={exc}", flush=True)
+                return
+
+            sip_caller_phone = (
+                os.getenv("SIP_DEFAULT_CALLER_PHONE_NUMBER", "sip:farmeruhamayohannes").strip()
+                or f"sip:{call_leg_id}"
+            )
+            sip_caller_name = os.getenv("SIP_DEFAULT_CALLER_NAME", "SIP Farmer").strip() or "SIP Farmer"
+
+            session = create_session(full_name=sip_caller_name, phone_number=sip_caller_phone)
+            session_id = session["session_id"]
+            recorder = AudioRecorder(session_id=session_id, sample_rate=sample_rate)
+            sink = AudioSocketPlaybackSink(writer, default_sample_rate=sample_rate)
+
+            query_params = urlencode({
+                "session_id": session_id,
+                "sample_rate": sample_rate,
+                "phone_number": sip_caller_phone,
+            })
+            vad_url = f"{os.getenv('VAD_WS_BASE_URL', 'ws://vad-service:8010/ws/vad')}?{query_params}"
+
+            start_call_monitor(
+                session_id=session_id,
+                caller_id=session.get("caller_id"),
+                caller_name=sip_caller_name,
+                caller_phone=sip_caller_phone,
+                sample_rate=sample_rate,
+                audio_format="audiosocket/pcm16",
+            )
+            add_event("sip_call_started", {
+                "session_id": session_id,
+                "call_leg_id": call_leg_id,
+                "caller_phone": sip_caller_phone,
+                "peer": str(peer),
+                "sample_rate": sample_rate,
+            })
+
+            vad_ws = None
+            vad_event_task = None
+            playback_state = SipPlaybackState()
+            chunk_count = 0
+            total_audio_bytes = 0
+
+            try:
+                vad_ws = await websockets.connect(vad_url)
+                vad_event_task = asyncio.create_task(forward_vad_events_to_sip(vad_ws, sink, playback_state))
+                _start_playback_task(playback_state, "greeting", play_opening_greeting(sink))
+
+                if first_media_packet:
+                    _, payload = first_media_packet
+                    await vad_ws.send(payload)
+                    recorder.write_chunk(payload)
+
+                while True:
+                    packet_kind, payload = await read_audiosocket_packet(reader)
+
+                    if packet_kind == AUDIOSOCKET_KIND_HANGUP:
+                        break
+
+                    if packet_kind == AUDIOSOCKET_KIND_DTMF:
+                        digit = payload.decode("utf-8", errors="ignore")
+                        add_event("sip_dtmf", {
+                            "session_id": session_id,
+                            "digit": digit,
+                        })
+                        continue
+
+                    if packet_kind == AUDIOSOCKET_KIND_ERROR:
+                        add_event("sip_audiosocket_error", {
+                            "session_id": session_id,
+                            "payload": payload.hex(),
+                        })
+                        break
+
+                    if packet_kind not in AUDIOSOCKET_MEDIA_RATES:
+                        add_event("sip_unknown_packet", {
+                            "session_id": session_id,
+                            "packet_kind": packet_kind,
+                            "payload_length": len(payload),
+                        })
+                        continue
+
+                    if payload:
+                        chunk_count += 1
+                        total_audio_bytes += len(payload)
+                        recorder.write_chunk(payload)
+                        update_audio_stats(
+                            len(payload),
+                            audio_level=calculate_pcm16_audio_level(payload),
+                        )
+                        await vad_ws.send(payload)
+
+                        if SIP_AUDIO_LOG_EVERY > 0 and chunk_count % SIP_AUDIO_LOG_EVERY == 0:
+                            print(
+                                f"[SIP AUDIO] session={session_id}, chunks={chunk_count}, "
+                                f"bytes={total_audio_bytes}",
+                                flush=True,
+                            )
+            except asyncio.IncompleteReadError:
+                add_event("sip_call_disconnected", {"session_id": session_id})
+            except Exception as exc:
+                print(f"[SIP CALL ERROR] session={session_id}, error={exc}", flush=True)
+                add_event("sip_call_error", {
+                    "session_id": session_id,
+                    "error": str(exc),
+                })
+            finally:
+                # Stop any playback still running
+                _cancel_playback(playback_state, reason="call_end")
+                if playback_state.playback_task:
+                    try:
+                        await playback_state.playback_task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        pass
+
+                if vad_ws:
+                    try:
+                        await vad_ws.send(json.dumps({"event": "end_session"}))
+                    except Exception:
+                        pass
+
+                if vad_event_task:
+                    try:
+                        await asyncio.wait_for(vad_event_task, timeout=5.0)
+                    except asyncio.TimeoutError:
+                        vad_event_task.cancel()
+                    except Exception:
+                        pass
+
+                if vad_ws:
+                    try:
+                        await vad_ws.close()
+                    except Exception:
+                        pass
+
+                audio_file = recorder.close()
+                ended_session = end_session(session_id, audio_file=audio_file)
+                end_call_monitor(audio_file_path=audio_file)
+
+                add_event("sip_call_ended", {
+                    "session_id": session_id,
+                    "call_leg_id": call_leg_id,
+                    "duration_seconds": ended_session.get("duration_seconds"),
+                })
+
+                try:
+                    await write_audiosocket_packet(writer, AUDIOSOCKET_KIND_HANGUP)
+                except Exception:
+                    pass
+
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+        finally:
+            _active_sip_calls = max(0, _active_sip_calls - 1)
 
 
 async def start_sip_audiosocket_server() -> asyncio.AbstractServer | None:
-    global _server
+    global _server, _sip_call_semaphore
 
     if not parse_bool_env("SIP_AUDIOSOCKET_ENABLED", "1"):
         print("[SIP] AudioSocket server disabled", flush=True)
@@ -758,6 +897,7 @@ async def start_sip_audiosocket_server() -> asyncio.AbstractServer | None:
 
     host = os.getenv("SIP_AUDIOSOCKET_HOST", "0.0.0.0")
     port = int(os.getenv("SIP_AUDIOSOCKET_PORT", "9092"))
+    _sip_call_semaphore = asyncio.Semaphore(SIP_MAX_CONCURRENT_CALLS)
 
     _server = await asyncio.start_server(
         handle_sip_audiosocket_call,
@@ -770,7 +910,7 @@ async def start_sip_audiosocket_server() -> asyncio.AbstractServer | None:
 
 
 async def stop_sip_audiosocket_server() -> None:
-    global _server
+    global _server, _sip_call_semaphore
 
     if not _server:
         return
@@ -778,10 +918,11 @@ async def stop_sip_audiosocket_server() -> None:
     _server.close()
     await _server.wait_closed()
     _server = None
+    _sip_call_semaphore = None
 
 
 async def start_alert_audiosocket_server() -> asyncio.AbstractServer | None:
-    global _alert_server
+    global _alert_server, _alert_call_semaphore
 
     if not parse_bool_env("SIP_ALERT_AUDIOSOCKET_ENABLED", "1"):
         print("[SIP] Alert AudioSocket server disabled", flush=True)
@@ -789,16 +930,18 @@ async def start_alert_audiosocket_server() -> asyncio.AbstractServer | None:
 
     host = os.getenv("SIP_AUDIOSOCKET_HOST", "0.0.0.0")
     port = int(os.getenv("SIP_ALERT_AUDIOSOCKET_PORT", "9093"))
+    _alert_call_semaphore = asyncio.Semaphore(SIP_MAX_CONCURRENT_ALERT_CALLS)
     _alert_server = await asyncio.start_server(handle_alert_audiosocket_call, host, port)
     print(f"[SIP] Alert AudioSocket server listening on {host}:{port}", flush=True)
     return _alert_server
 
 
 async def stop_alert_audiosocket_server() -> None:
-    global _alert_server
+    global _alert_server, _alert_call_semaphore
 
     if not _alert_server:
         return
     _alert_server.close()
     await _alert_server.wait_closed()
     _alert_server = None
+    _alert_call_semaphore = None
