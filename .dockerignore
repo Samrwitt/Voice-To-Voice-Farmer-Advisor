@@ -1,0 +1,9 @@
+.git
+**/__pycache__
+**/.pytest_cache
+models/
+eval/
+*.wav
+*.mp3
+node_modules/
+admin_dashboard_frontend/node_modules/

@@ -4,17 +4,16 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.base
-    command: ["echo", "Base image built"]
+    command: [ "echo", "Base image built" ]
 
   postgres:
     # pgvector-enabled Postgres (required for fast KB retrieval)
-    # image: pgvector/pgvector:pg16
-    image: postgres:16
+    image: pgvector/pgvector:pg16
     container_name: phone_gateway_postgres
     environment:
-      POSTGRES_DB: phone_gateway_db
-      POSTGRES_USER: phone_user
-      POSTGRES_PASSWORD: phone_pass
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     ports:
       - "5432:5432"
     volumes:
@@ -25,8 +24,8 @@ services:
     container_name: farmer_advisor_minio
     command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     ports:
       - "9000:9000"
       - "9001:9001"
@@ -44,21 +43,57 @@ services:
     ports:
       - "8004:8000"
     environment:
-      POSTGRES_URL: postgresql://phone_user:phone_pass@postgres:5432/phone_gateway_db
+      POSTGRES_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       RAG_PG_MAX_L2_DISTANCE: "1.35"
-      TTS_URL: http://tts-service:8000/synthesize
+      OLLAMA_HOST: http://ollama:11434
+      OLLAMA_MODEL: qwen2.5:7b
+      RAG_ASSISTANT_LLM: "1"
+      RAG_PG_RETRIEVE_POOL: "40"
+      RAG_PG_FINAL_TOP_K: "6"
+      RAG_PG_BM25: "1"
+      RAG_PG_TOPIC_REFINE: "1"
+      RAG_TOOLS: "1"
+      RAG_WEB_MODE: "off"
+      RAG_WEB_ALLOW: "1"
+      RAG_WEATHER_TOOL: "1"
+      TTS_URL: http://tts-service:8009/synthesize
       AUTO_INGEST_KB_DIR: /app/kb_documents/amharic
+      AUTO_INGEST_KB_DIRS: /app/kb_documents/amharic,/app/RAG/KB
       AUTO_INGEST_ON_STARTUP: "true"
-      AUTO_INGEST_MAX_FILES: "20"
+      FORCE_REINDEX_KB: "true"
+      AUTO_INGEST_MAX_FILES: "100"
       EMBED_BATCH_SIZE: "8"
       HF_TOKEN: ${HF_TOKEN}
+      HF_HUB_ETAG_TIMEOUT: "60"
+      HF_HUB_DOWNLOAD_TIMEOUT: "60"
       HF_HOME: /models/huggingface
       HF_HUB_CACHE: /models/huggingface/hub
       SENTENCE_TRANSFORMERS_HOME: /models/sentence_transformers
-      # If embeddings need a different model, override KB_EMBEDDING_MODEL.
+      KB_EMBEDDING_MODEL: /models/sentence_transformers/sentence-transformers_paraphrase-multilingual-MiniLM-L12-v2
+      TRANSFORMERS_OFFLINE: "1"
+      HF_HUB_OFFLINE: "1"
+      RAG_MERGED_JSON: /app/RAG/merged.json
+      RAG_MERGED_SYNC: "true"
+      ESCALATION_SLA_HOURS: "48"
+      CALL_RECORDING_RETENTION_DAYS: "30"
+      RAG_AGROCHEM_EXPERT_ONLY: "1"
+      RAG_VOICE_LOW_CONF_ESCALATE: "1"
+      RAG_RESPONSE_CACHE_TTL_SEC: "120"
+      RAG_RESPONSE_CACHE_MAX: "512"
+      RAG_SMART_PIPELINE: ${RAG_SMART_PIPELINE:-1}
+      RAG_SMART_FINAL_BACKEND: ${RAG_SMART_FINAL_BACKEND:-gemini}
+      RAG_LLM_BACKEND: ${RAG_LLM_BACKEND:-gemini}
+      GROQ_API_KEYS: ${GROQ_API_KEYS:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GEMINI_API_KEYS: ${GEMINI_API_KEYS:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      GROQ_GEMINI_FALLBACK: ${GROQ_GEMINI_FALLBACK:-1}
+      RAG_API_KEY_COOLDOWN_SEC: ${RAG_API_KEY_COOLDOWN_SEC:-90}
     volumes:
       - ./kb_documents:/app/kb_documents:ro
-      - rag_models:/models
+      - ./RAG:/app/RAG:ro
+      - ./models:/models
 
   phone-gateway:
     build:
@@ -66,27 +101,33 @@ services:
       dockerfile: phone_gateway/Dockerfile
     container_name: phone_gateway_backend
     depends_on:
-      - postgres
-      - vad-service
+      postgres:
+        condition: service_started
+      vad-service:
+        condition: service_started
+      tts-service:
+        condition: service_started
     environment:
-      DATABASE_URL: postgresql://phone_user:phone_pass@postgres:5432/phone_gateway_db
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       RECORDINGS_DIR: /app/recordings
       VAD_WS_BASE_URL: ws://vad-service:8010/ws/vad
+      TTS_SERVICE_URL: http://tts-service:8009/synthesize
       S3_ENDPOINT_URL: http://minio:9000
       S3_REGION: us-east-1
-      S3_ACCESS_KEY_ID: minioadmin
-      S3_SECRET_ACCESS_KEY: minioadmin
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY}
       S3_BUCKET: farmer-advisor-media
 
       CREATE_DEFAULT_ADMIN: "true"
       DEFAULT_ADMIN_NAME: "System Admin"
-      DEFAULT_ADMIN_EMAIL: "admin@example.com"
-      DEFAULT_ADMIN_PASSWORD: "admin123"
+      DEFAULT_ADMIN_EMAIL: ${DEFAULT_ADMIN_EMAIL}
+      DEFAULT_ADMIN_PASSWORD: ${DEFAULT_ADMIN_PASSWORD}
       RESET_DEFAULT_ADMIN_PASSWORD: "false"
     ports:
       - "8000:8000"
     volumes:
       - call_recordings:/app/recordings
+      - vad_utterances:/app/utterances:ro
 
   pgadmin:
     image: dpage/pgadmin4
@@ -94,8 +135,8 @@ services:
     depends_on:
       - postgres
     environment:
-      PGADMIN_DEFAULT_EMAIL: admin@gmail.com
-      PGADMIN_DEFAULT_PASSWORD: admin123
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD}
     ports:
       - "5050:80"
     volumes:
@@ -116,31 +157,48 @@ services:
       - "8010:8010"
     environment:
       ASR_HTTP_URL: http://asr-service:8001/transcribe-file
+      RAG_SERVICE_URL: http://rag-service:8000
+      TTS_SERVICE_URL: http://tts-service:8009
       VAD_UTTERANCES_DIR: /app/utterances
       MAX_CONCURRENT_ASR: 2
     volumes:
       - vad_utterances:/app/utterances
 
-
   asr-service:
     build:
       context: .
       dockerfile: asr_service/Dockerfile
+      args:
+        HF_TOKEN: ${HF_TOKEN:-}
+        BAKE_SPEECHBRAIN: ${BAKE_SPEECHBRAIN:-1}
     container_name: asr_service
     ports:
       - "8001:8001"
     environment:
-      ASR_ENGINE: whisper_local
-      ASR_MODEL_PATH: /models/asr/whisper-small-amharic-bdu-8khz-aug-ct2-fp16
+      # speechbrain needs ~12GB+ Docker RAM (downloads wav2vec2-large-xlsr-53 ~1.2GB).
+      # Use whisper_local on 8GB machines (BDU CT2 model already under ./models/asr).
+      ASR_ENGINE: ${ASR_ENGINE:-whisper_local}
+      ASR_SPEECHBRAIN_SOURCE: ${ASR_SPEECHBRAIN_SOURCE:-speechbrain/asr-wav2vec2-dvoice-amharic}
+      ASR_SPEECHBRAIN_SAVEDIR: ${ASR_SPEECHBRAIN_SAVEDIR:-/opt/asr-models/speechbrain-wav2vec2-dvoice-amharic}
+      ASR_MODEL_PATH: ${ASR_MODEL_PATH:-/models/asr/whisper-small-amharic-bdu-8khz-aug-ct2-fp16}
+      HF_TOKEN: ${HF_TOKEN:-}
+      HF_HOME: ${HF_HOME:-/opt/asr-models/hf-cache}
       SHARED_UTTERANCES_DIR: /shared/utterances
-      ASR_USE_OLLAMA: "true"
+      ASR_HOSTED_LLM_FIX: ${ASR_HOSTED_LLM_FIX:-auto}
+      ASR_LLM_FIX_BACKEND: ${ASR_LLM_FIX_BACKEND:-groq_then_gemini}
+      GROQ_API_KEYS: ${GROQ_API_KEYS:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GEMINI_API_KEYS: ${GEMINI_API_KEYS:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      ASR_USE_OLLAMA: ${ASR_USE_OLLAMA:-false}
       OLLAMA_URL: http://ollama:11434
       OLLAMA_MODEL: qwen2.5:7b
     depends_on:
       - ollama
     volumes:
       - vad_utterances:/shared/utterances:ro
-      - ./models/asr:/models/asr:ro
+      - ./models/asr:/models/asr
 
   ollama:
     image: ollama/ollama:latest
@@ -168,7 +226,7 @@ services:
       base:
         condition: service_completed_successfully
     ports:
-      - "8002:8002"
+      - "8009:8009"
 
   admin-dashboard:
     image: farmer-advisor-admin-dashboard
@@ -179,7 +237,8 @@ services:
     depends_on:
       - logic-service
     ports:
-      - "3000:3000"
+      # Host 3000 is often taken (other Next.js, Grafana, etc.). Override: ADMIN_DASHBOARD_PORT=3000
+      - "${ADMIN_DASHBOARD_PORT:-3001}:3000"
     environment:
       NODE_ENV: production
       NEXT_TELEMETRY_DISABLED: 1
@@ -204,25 +263,29 @@ services:
     ports:
       - "8002:8002"
     environment:
-      DATABASE_URL: postgresql://phone_user:phone_pass@postgres:5432/phone_gateway_db
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       LOG_LEVEL: INFO
-      TTS_URL: http://tts-service:8000/synthesize
+      TTS_URL: http://tts-service:8009/synthesize
 
       HF_HOME: /models/huggingface
       HF_HUB_CACHE: /models/huggingface/hub
       SENTENCE_TRANSFORMERS_HOME: /models/sentence_transformers
       HF_TOKEN: ${HF_TOKEN}
-
+      HF_HUB_ETAG_TIMEOUT: "60"
+      HF_HUB_DOWNLOAD_TIMEOUT: "60"
+      CHROMA_EMBEDDING_MODEL: /models/sentence_transformers/sentence-transformers_paraphrase-multilingual-MiniLM-L12-v2
+      TRANSFORMERS_OFFLINE: "1"
+      HF_HUB_OFFLINE: "1"
 
       # Shared with phone-gateway so JWTs are mutually verifiable
-      JWT_SECRET_KEY: "change-this-secret-key-in-production"
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
       ACCESS_TOKEN_EXPIRE_MINUTES: "1440"
 
       # Default admin seeded into shared dashboard_users table
       CREATE_DEFAULT_ADMIN: "true"
       DEFAULT_ADMIN_NAME: "System Admin"
-      DEFAULT_ADMIN_EMAIL: "admin@example.com"
-      DEFAULT_ADMIN_PASSWORD: "admin123"
+      DEFAULT_ADMIN_EMAIL: ${DEFAULT_ADMIN_EMAIL}
+      DEFAULT_ADMIN_PASSWORD: ${DEFAULT_ADMIN_PASSWORD}
       RESET_DEFAULT_ADMIN_PASSWORD: "false"
 
       # Service health probes used by /admin/system-status
@@ -231,15 +294,17 @@ services:
       TTS_HEALTH_URL: "http://tts-service:8000/docs"
       PHONE_GATEWAY_URL: "http://phone-gateway:8000/health"
       RAG_SERVICE_URL: "http://rag-service:8000"
+      ESCALATION_SLA_HOURS: "48"
       S3_ENDPOINT_URL: http://minio:9000
+      S3_PUBLIC_ENDPOINT_URL: http://localhost:9000
       S3_REGION: us-east-1
-      S3_ACCESS_KEY_ID: minioadmin
-      S3_SECRET_ACCESS_KEY: minioadmin
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY}
 
       DATA_DIR: "/app/data"
     volumes:
       - logic_data:/app/data
-
+      - ./models:/models
 
 volumes:
   postgres_data:
@@ -250,4 +315,3 @@ volumes:
 
   logic_data:
   minio_data:
-  rag_models:

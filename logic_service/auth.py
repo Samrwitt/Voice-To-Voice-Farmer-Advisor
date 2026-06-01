@@ -113,16 +113,23 @@ def decode_access_token(token: str) -> Optional[dict]:
 
 # ── FastAPI dependencies ──────────────────────────────────────────────────────
 def get_current_user(
+    token: Optional[str] = None,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
     db: Session = Depends(get_db),
 ) -> DashboardUser:
-    if credentials is None or credentials.scheme.lower() != "bearer":
+    actual_token = None
+    if credentials and credentials.scheme.lower() == "bearer":
+        actual_token = credentials.credentials
+    elif token:
+        actual_token = token
+
+    if not actual_token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Authentication required",
         )
 
-    payload = decode_access_token(credentials.credentials)
+    payload = decode_access_token(actual_token)
     if not payload:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

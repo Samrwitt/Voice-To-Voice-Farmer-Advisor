@@ -6,6 +6,8 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 
 from vad_engine import SileroStreamingVAD
 from asr_client import transcribe_utterance_file
+from rag_client import get_rag_answer
+from tts_client import synthesize_speech
 
 
 app = FastAPI(title="Silero VAD Service")
@@ -16,7 +18,10 @@ app = FastAPI(title="Silero VAD Service")
 # ============================================================
 
 MAX_CONCURRENT_ASR = int(os.getenv("MAX_CONCURRENT_ASR", "2"))
+VAD_THRESHOLD = float(os.getenv("VAD_THRESHOLD", "0.85"))
+VAD_MIN_SPEECH_MS = int(os.getenv("VAD_MIN_SPEECH_MS", "400"))
 ASR_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_ASR)
+PLAYBACK_LOCK = asyncio.Lock()
 
 
 # ============================================================
@@ -36,43 +41,101 @@ def health_check():
 # Safe WebSocket Send
 # ============================================================
 
-async def safe_send_json(
+async def safe_send(
     websocket: WebSocket,
     send_lock: asyncio.Lock,
-    payload: dict,
+    payload: dict | bytes,
 ) -> bool:
-    """
-    Safely send JSON to the WebSocket.
-
-    Multiple coroutines may send to the same WebSocket:
-      1. the main VAD loop
-      2. background ASR tasks
-
-    The lock prevents simultaneous websocket.send_json() calls.
-
-    Returns:
-      True  -> message sent
-      False -> client disconnected / socket closed
-    """
-
+    """Safely send JSON or binary to the WebSocket."""
     try:
         async with send_lock:
-            await websocket.send_json(payload)
+            if isinstance(payload, bytes):
+                await websocket.send_bytes(payload)
+            else:
+                await websocket.send_json(payload)
         return True
-
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, RuntimeError):
         return False
-
-    except RuntimeError:
-        return False
-
     except Exception as e:
         print(f"[WS SEND ERROR] {e}", flush=True)
         return False
 
 
+class SessionState:
+    def __init__(self):
+        self.playback_task = None
+
 # ============================================================
-# ASR Handling
+# Playback Handling
+# ============================================================
+
+async def play_advisor_response(
+    websocket: WebSocket,
+    send_lock: asyncio.Lock,
+    session_id: str,
+    utterance_path: str,
+    rag_answer: str,
+):
+    """
+    Synthesizes and streams audio for a RAG answer.
+    Locked by PLAYBACK_LOCK to avoid overlapping speech.
+    """
+    async with PLAYBACK_LOCK:
+        try:
+            print(f"[TTS STARTING] text_len={len(rag_answer)}, path={utterance_path}", flush=True)
+            # ── Sentence-level Streaming ──
+            import re
+            # Split by Amharic and common sentence delimiters
+            sentences = re.split(r'(?<=[።?!])\s+', rag_answer.strip())
+            
+            print(f"[STREAMING] Total sentences: {len(sentences)}", flush=True)
+            
+            for i, sentence in enumerate(sentences):
+                if not sentence.strip():
+                    continue
+                    
+                print(f"[SENTENCE {i+1}/{len(sentences)}] Synthesizing: {sentence[:30]}...", flush=True)
+                
+                # Use a unique path for each sentence to avoid collisions
+                sentence_path = f"{utterance_path}_s{i}.wav"
+                
+                tts_path = await synthesize_speech(
+                    text=sentence,
+                    utterance_path=sentence_path
+                )
+                
+                if tts_path:
+                    try:
+                        import wave
+                        with wave.open(tts_path, "rb") as wf:
+                            # Stream raw frames
+                            chunk_size = 1024
+                            data = wf.readframes(chunk_size)
+                            while data:
+                                sent = await safe_send(websocket, send_lock, data)
+                                if not sent:
+                                    break
+                                
+                                # Small delay to prevent network congestion
+                                await asyncio.sleep(0.01)
+                                data = wf.readframes(chunk_size)
+                                
+                        print(f"[SENTENCE {i+1} DONE] Streamed.", flush=True)
+                    except Exception as e:
+                        print(f"[SENTENCE {i+1} ERROR] {e}", flush=True)
+                
+                # Optional: Add a natural pause between sentences
+                await asyncio.sleep(0.2)
+
+            print(f"[TTS STREAM DONE] session={session_id}", flush=True)
+        except asyncio.CancelledError:
+            print(f"[PLAYBACK CANCELLED] session={session_id}", flush=True)
+            raise
+        except Exception as e:
+            print(f"[PLAYBACK ERROR] session={session_id}, error={e}", flush=True)
+
+# ============================================================
+# ASR / RAG Handling
 # ============================================================
 
 async def handle_completed_utterance(
@@ -80,6 +143,8 @@ async def handle_completed_utterance(
     send_lock: asyncio.Lock,
     session_id: str,
     utterance_path: str,
+    session_state: SessionState,
+    phone_number: str = "Unknown",
 ):
     """
     Runs ASR for one completed utterance.
@@ -89,7 +154,7 @@ async def handle_completed_utterance(
     """
 
     try:
-        sent = await safe_send_json(
+        sent = await safe_send(
             websocket,
             send_lock,
             {
@@ -119,7 +184,7 @@ async def handle_completed_utterance(
                 language="am",
             )
 
-        await safe_send_json(
+        await safe_send(
             websocket,
             send_lock,
             {
@@ -127,6 +192,8 @@ async def handle_completed_utterance(
                 "session_id": session_id,
                 "utterance_path": utterance_path,
                 "transcript": asr_result.get("transcript"),
+                "transcript_raw": asr_result.get("raw_transcript"),
+                "transcript_fix_backend": asr_result.get("transcript_fix_backend"),
                 "confidence": asr_result.get("confidence"),
                 "engine": asr_result.get("engine"),
                 "audio_id": asr_result.get("audio_id"),
@@ -143,8 +210,132 @@ async def handle_completed_utterance(
             flush=True,
         )
 
+        # ── RAG Step ────────────────────────────────────────────────────────
+        transcript = asr_result.get("transcript")
+        if not transcript:
+            return
+
+        from transcript_quality import GIBBERISH_REPLY_AM, is_asr_gibberish
+
+        conf = asr_result.get("confidence")
+        try:
+            conf_f = float(conf) if conf is not None else None
+        except (TypeError, ValueError):
+            conf_f = None
+        if is_asr_gibberish(transcript, conf_f):
+            rag_answer = GIBBERISH_REPLY_AM
+            print(
+                f"[ASR GIBBERISH] session={session_id}, transcript={transcript!r}, conf={conf_f}",
+                flush=True,
+            )
+            await safe_send(
+                websocket,
+                send_lock,
+                {
+                    "event": "rag_answer",
+                    "session_id": session_id,
+                    "utterance_path": utterance_path,
+                    "response": rag_answer,
+                    "references": [],
+                    "message": "Low-confidence ASR; asking user to repeat in Amharic",
+                },
+            )
+            await safe_send(
+                websocket,
+                send_lock,
+                {
+                    "event": "tts_started",
+                    "session_id": session_id,
+                    "utterance_path": utterance_path,
+                    "message": "Synthesizing voice response...",
+                },
+            )
+            session_state.playback_task = asyncio.create_task(
+                play_advisor_response(
+                    websocket=websocket,
+                    send_lock=send_lock,
+                    session_id=session_id,
+                    utterance_path=utterance_path,
+                    rag_answer=rag_answer,
+                )
+            )
+            return
+
+        await safe_send(
+            websocket,
+            send_lock,
+            {
+                "event": "rag_started",
+                "session_id": session_id,
+                "utterance_path": utterance_path,
+                "message": "Retrieving answer from Knowledge Base...",
+            },
+        )
+
+        rag_result = await get_rag_answer(
+            text=transcript,
+            session_id=session_id,
+            phone_number=phone_number
+        )
+
+        rag_answer = rag_result.get("response")
+
+        await safe_send(
+            websocket,
+            send_lock,
+            {
+                "event": "rag_answer",
+                "session_id": session_id,
+                "utterance_path": utterance_path,
+                "response": rag_answer,
+                "references": rag_result.get("references"),
+                "trust": rag_result.get("trust"),
+                "meta": rag_result.get("meta"),
+                "message": "RAG answer generated",
+            },
+        )
+
+        print(
+            f"[RAG DONE] session={session_id}, "
+            f"file={utterance_path}, "
+            f"response={rag_answer[:50]}...",
+            flush=True,
+        )
+
+        # ── TTS Step ─────────────────────────────────────────────────────────
+        if not rag_answer:
+            return
+
+        await safe_send(
+            websocket,
+            send_lock,
+            {
+                "event": "tts_started",
+                "session_id": session_id,
+                "utterance_path": utterance_path,
+                "message": "Synthesizing voice response...",
+            },
+        )
+
+        print(f"[TTS STARTING] text_len={len(rag_answer)}, path={utterance_path}", flush=True)
+        # ── Start Playback in background ──
+        # We store it in session_state so the VAD loop can cancel it if barge-in occurs.
+        session_state.playback_task = asyncio.create_task(
+            play_advisor_response(
+                websocket=websocket,
+                send_lock=send_lock,
+                session_id=session_id,
+                utterance_path=utterance_path,
+                rag_answer=rag_answer,
+            )
+        )
+
     except Exception as e:
-        await safe_send_json(
+        import traceback
+        print(f"[FATAL ERROR in handle_completed_utterance]: {e}", flush=True)
+        traceback.print_exc()
+        
+        await safe_send(
             websocket,
             send_lock,
             {
@@ -152,7 +343,7 @@ async def handle_completed_utterance(
                 "session_id": session_id,
                 "utterance_path": utterance_path,
                 "error": str(e),
-                "message": "ASR transcription failed",
+                "message": "Processing failed",
             },
         )
 
@@ -170,6 +361,8 @@ def start_asr_task(
     send_lock: asyncio.Lock,
     session_id: str,
     utterance_path: str,
+    session_state: SessionState,
+    phone_number: str = "Unknown",
 ):
     """
     Start ASR in the background.
@@ -184,6 +377,8 @@ def start_asr_task(
             send_lock=send_lock,
             session_id=session_id,
             utterance_path=utterance_path,
+            session_state=session_state,
+            phone_number=phone_number,
         )
     )
 
@@ -214,25 +409,27 @@ async def vad_websocket(
     websocket: WebSocket,
     session_id: str = Query(...),
     sample_rate: int = Query(default=16000),
+    phone_number: str = Query(default="Unknown"),
 ):
     await websocket.accept()
 
     send_lock = asyncio.Lock()
     active_asr_tasks = set()
+    session_state = SessionState()
 
     output_dir = os.getenv("VAD_UTTERANCES_DIR", "utterances")
 
     vad = SileroStreamingVAD(
         session_id=session_id,
         sample_rate=sample_rate,
-        threshold=0.5,
-        min_speech_start_ms=120,
+        threshold=VAD_THRESHOLD,
+        min_speech_start_ms=VAD_MIN_SPEECH_MS,
         speech_end_silence_ms=900,
         speech_pad_ms=200,
         output_dir=output_dir,
     )
 
-    await safe_send_json(
+    await safe_send(
         websocket,
         send_lock,
         {
@@ -282,7 +479,7 @@ async def vad_websocket(
                     event_name = event.get("event")
                     utterance_path = event.get("utterance_path")
 
-                    await safe_send_json(
+                    await safe_send(
                         websocket,
                         send_lock,
                         {
@@ -300,6 +497,10 @@ async def vad_websocket(
                             f"[SPEECH STARTED] session={session_id}",
                             flush=True,
                         )
+                        # Barge-in: Cancel current advisor playback if they were talking
+                        if session_state.playback_task and not session_state.playback_task.done():
+                            print(f"[BARGE-IN] Interrupting advisor playback", flush=True)
+                            session_state.playback_task.cancel()
 
                     elif event_name == "speech_ended":
                         print(
@@ -315,6 +516,8 @@ async def vad_websocket(
                                 send_lock=send_lock,
                                 session_id=session_id,
                                 utterance_path=utterance_path,
+                                session_state=session_state,
+                                phone_number=phone_number,
                             )
 
             # ============================================================
@@ -330,7 +533,7 @@ async def vad_websocket(
                     if data.get("event") == "reset":
                         vad.reset()
 
-                        await safe_send_json(
+                        await safe_send(
                             websocket,
                             send_lock,
                             {
@@ -343,7 +546,7 @@ async def vad_websocket(
                         utterance_path = vad.finalize()
 
                         if utterance_path:
-                            await safe_send_json(
+                            await safe_send(
                                 websocket,
                                 send_lock,
                                 {
@@ -368,6 +571,8 @@ async def vad_websocket(
                                 send_lock=send_lock,
                                 session_id=session_id,
                                 utterance_path=utterance_path,
+                                session_state=session_state,
+                                phone_number=phone_number,
                             )
 
                         if active_asr_tasks:
@@ -383,7 +588,7 @@ async def vad_websocket(
                         utterance_path = vad.finalize()
 
                         if utterance_path:
-                            await safe_send_json(
+                            await safe_send(
                                 websocket,
                                 send_lock,
                                 {
@@ -408,6 +613,8 @@ async def vad_websocket(
                                 send_lock=send_lock,
                                 session_id=session_id,
                                 utterance_path=utterance_path,
+                                session_state=session_state,
+                                phone_number=phone_number,
                             )
 
                         if active_asr_tasks:

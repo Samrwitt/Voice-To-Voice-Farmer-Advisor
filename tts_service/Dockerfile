@@ -6,9 +6,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
 
 COPY tts_service/requirements.txt /app/requirements.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -r /app/requirements.txt
+    pip install --default-timeout=100 --retries=10 -r /app/requirements.txt
 
 COPY tts_service/ /app/
 
-EXPOSE 8002
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8002"]
+EXPOSE 8009
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8009"]

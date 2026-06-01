@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { fetchCalls } from '@/lib/api';
+import { getToken } from '@/lib/auth';
 import type { CallLog } from '@/types';
 
 export default function CallLogs() {
@@ -117,9 +118,9 @@ export default function CallLogs() {
                               controls
                               autoPlay
                               src={
-                                c.recording_path.startsWith('s3://') && c.session_id
-                                  ? `/api/admin/calls/${encodeURIComponent(c.session_id)}/audio`
-                                  : `/api/audio?path=${encodeURIComponent(c.recording_path)}`
+                                c.session_id
+                                  ? `/api/admin/calls/${encodeURIComponent(c.session_id)}/audio${(typeof window !== 'undefined' && getToken()) ? `?token=${getToken()}` : ''}`
+                                  : `/api/audio?path=${encodeURIComponent(c.recording_path)}${(typeof window !== 'undefined' && getToken()) ? `&token=${getToken()}` : ''}`
                               }
                               className="flex-1 h-9"
                             />

@@ -46,6 +46,8 @@ def start_call_monitor(
             "utterance_count": 0,
             "utterances": [],
             "audio_file_path": None,
+            "rag_response": None,
+            "tts_url": None,
         }
 
     add_event("call_started", {
@@ -131,6 +133,46 @@ def update_utterance_transcript(utterance_path: str, transcript: str, confidence
 
     if utterance:
         add_event("transcript_saved", utterance)
+
+
+def update_utterance_rag(utterance_path: str, response: str, references: list | None = None):
+    with _lock:
+        active = monitor_state.get("active_call")
+        if not active:
+            return
+
+        active["rag_response"] = response
+
+        for u in active.get("utterances", []):
+            if u.get("utterance_path") == utterance_path:
+                u["rag_response"] = response
+                u["rag_references"] = references
+                break
+
+    add_event("rag_answer", {
+        "utterance_path": utterance_path,
+        "response": response,
+        "references": references,
+    })
+
+
+def update_utterance_tts(utterance_path: str, tts_url: str):
+    with _lock:
+        active = monitor_state.get("active_call")
+        if not active:
+            return
+
+        active["tts_url"] = tts_url
+
+        for u in active.get("utterances", []):
+            if u.get("utterance_path") == utterance_path:
+                u["tts_url"] = tts_url
+                break
+
+    add_event("tts_ready", {
+        "utterance_path": utterance_path,
+        "tts_url": tts_url,
+    })
 
 
 def end_call_monitor(audio_file_path: str | None = None):

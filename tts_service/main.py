@@ -54,6 +54,8 @@ async def synthesize(req: TTSRequest):
                 "error",
                 "-i",
                 mp3_path,
+                "-af",
+                "atempo=1.2,volume=1.5",
                 "-ac",
                 "1",
                 "-ar",

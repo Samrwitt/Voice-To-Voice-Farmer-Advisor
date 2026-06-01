@@ -15,7 +15,7 @@ from database import (
     get_conversation_history, get_market_price, register_farmer,
     get_farmer_profile, get_alerts_for_region, set_session_state,
     get_session_state, insert_call_record,
-    init_db, seed_default_admin,
+    init_db, seed_default_admin, init_kb,
 )
 from migrate_sqlite import migrate_sqlite_to_postgres
 
@@ -24,7 +24,26 @@ logger = logging.getLogger("logic_service")
 
 RAG_SERVICE_URL = os.environ.get("RAG_SERVICE_URL", "").strip().rstrip("/")
 
-app = FastAPI()
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Bootstrap logic in background thread
+    def _init_bg():
+        try:
+            init_db()
+            migrate_sqlite_to_postgres()
+            seed_default_admin()
+            init_kb()
+            logger.info("Postgres, Admin, and KB initialized for logic_service.")
+        except Exception as exc:
+            logger.error("Logic service background bootstrap failed: %s", exc)
+
+    import threading
+    threading.Thread(target=_init_bg, daemon=True).start()
+    yield
+
+app = FastAPI(lifespan=lifespan)
 
 # Allow the admin dashboard (any origin in dev; tighten for prod)
 app.add_middleware(
@@ -34,18 +53,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-@app.on_event("startup")
-def _startup_db():
-    """Bootstrap Postgres schema, migrate any legacy SQLite data, and seed admin."""
-    try:
-        init_db()
-        migrate_sqlite_to_postgres()
-        seed_default_admin()
-        logger.info("Postgres initialized for logic_service.")
-    except Exception as exc:
-        logger.error("Database bootstrap failed: %s", exc)
 
 
 @app.exception_handler(Exception)
@@ -117,6 +124,44 @@ class FarmerProfile(BaseModel):
     name: str
     location: str
     preferred_language: str = "am"
+
+
+class EscalationStatusRequest(BaseModel):
+    """Farmer-facing ticket status (no question text — privacy)."""
+    phone_number: str
+    session_id: Optional[str] = None
+    limit: int = 8
+
+
+# Amharic copy for IVR / USSD / lightweight clients (product loop).
+_ESCALATION_STATUS_AM = {
+    "pending": {
+        "label": "በመጠባበቅ ላይ",
+        "detail": "ጥያቄዎ ተቀብለናል። ባለሙያ እስኪመድብ ድረስ እባክዎ ይጠብቁ።",
+    },
+    "assigned": {
+        "label": "ለባለሙያ ተሰጥቷል",
+        "detail": "ለባለሙያ ተመድቧል፤ በቅርቡ ይመለሱቦታል።",
+    },
+    "answered": {
+        "label": "መልስ ዝግጁ",
+        "detail": "ባለሙያ መልስ አዘጋጅቷል፤ በስልክዎ ቀጣይ ጥያቄ ላይ ያውቁ።",
+    },
+    "closed": {
+        "label": "ተዘጋች",
+        "detail": "ጉዳዩ ተዘጋች። ለሌላ እርዳታ ይደውሉ።",
+    },
+}
+
+
+def _iso_utc(dt) -> Optional[str]:
+    if dt is None:
+        return None
+    try:
+        s = dt.isoformat()
+        return s + "Z" if not dt.tzinfo else s
+    except Exception:
+        return None
 
 
 class E2ERequest(BaseModel):
@@ -230,7 +275,7 @@ def generate_rag_response(query_text: str, phone_number: str, session_id: str):
                 resp = data.get("response") or ""
                 if resp:
                     log_conversation(phone_number, session_id, "assistant", resp)
-                    return resp, "rag_service"
+                    return resp, "rag_service", data.get("trust")
         except Exception:
             # Fall back to local retrieval below.
             pass
@@ -239,7 +284,7 @@ def generate_rag_response(query_text: str, phone_number: str, session_id: str):
     if query_text.strip() and not is_amharic(query_text):
         resp = "እባክዎ ጥያቄዎን በአማርኛ ይናገሩ።"  # Please ask your question in Amharic.
         log_conversation(phone_number, session_id, "assistant", resp)
-        return resp, "non_amharic"
+        return resp, "non_amharic", None
 
     # ── Farmer Profile & Context ──────────────────────────────────────────────
     profile = get_farmer_profile(phone_number)
@@ -257,16 +302,16 @@ def generate_rag_response(query_text: str, phone_number: str, session_id: str):
             set_session_state(session_id, "active", None)
             resp = alerts_text + state["pending_action"]
             log_conversation(phone_number, session_id, "assistant", resp)
-            return resp, "confirmed_action"
+            return resp, "confirmed_action", None
         elif "አይ" in query_text or "no" in query_text.lower():
             set_session_state(session_id, "active", None)
             resp = "እሺ፣ እርምጃው ተሰርዟል። ሌላ ምን ልርዳዎት?"
             log_conversation(phone_number, session_id, "assistant", resp)
-            return resp, "cancelled_action"
+            return resp, "cancelled_action", None
         else:
             resp = "እባክዎን 'አዎ' ወይም 'አይ' ብለው ያረጋግጡ።"
             log_conversation(phone_number, session_id, "assistant", resp)
-            return resp, "awaiting_confirmation"
+            return resp, "awaiting_confirmation", None
 
     # ── Slot Awaiting State ───────────────────────────────────────────────────
     if state and state["current_state"] == "awaiting_slot":
@@ -281,7 +326,7 @@ def generate_rag_response(query_text: str, phone_number: str, session_id: str):
     if clarification:
         set_session_state(session_id, "awaiting_slot", query_text)
         log_conversation(phone_number, session_id, "assistant", clarification)
-        return clarification, "awaiting_slot"
+        return clarification, "awaiting_slot", None
 
     # ── Market Price Intent ───────────────────────────────────────────────────
     is_market, crop_name = detect_market_intent(query_text)
@@ -293,17 +338,17 @@ def generate_rag_response(query_text: str, phone_number: str, session_id: str):
                 price, unit, updated_at = price_data
                 resp = f"የ{crop_name} ዋጋ {price} ብር በ {unit} ነው። (የዋጋ ቀን: {updated_at})"
                 log_conversation(phone_number, session_id, "assistant", resp)
-                return resp, "market_price"
+                return resp, "market_price", None
             else:
                 resp = f"ለ{crop_name} ዋጋ መረጃ አሁን የለም። ቆይተው ይደውሉ።"
                 log_conversation(phone_number, session_id, "assistant", resp)
-                return resp, "market_price_unavailable"
+                return resp, "market_price_unavailable", None
         else:
             # Crop not specified
             resp = "ስለ ምን ሰብል ዋጋ ይፈልጋሉ? (ጤፍ፣ ስንዴ፣ ቦሎቄ፣ ወዘተ.)"
             set_session_state(session_id, "awaiting_slot", query_text)
             log_conversation(phone_number, session_id, "assistant", resp)
-            return resp, "awaiting_slot"
+            return resp, "awaiting_slot", None
 
     # ── RAG Vector Retrieval ──────────────────────────────────────────────────
     results = collection.query(query_texts=[query_text], n_results=2)
@@ -321,7 +366,7 @@ def generate_rag_response(query_text: str, phone_number: str, session_id: str):
         add_to_escalation(query_text, f"Distance: {closest_distance:.2f}. No confident KB match.")
         resp = "ይቅርታ፣ ይህንን ጥያቄ ሙሉ በሙሉ ልመልስ አልቻልኩም። ለባለሙያ አስተላልፌዋለሁ።"
         log_conversation(phone_number, session_id, "assistant", resp)
-        return resp, "escalated"
+        return resp, "escalated", None
 
     context = results["documents"][0][0]
     intent = results["metadatas"][0][0].get("intent", "unknown")
@@ -351,19 +396,22 @@ def generate_rag_response(query_text: str, phone_number: str, session_id: str):
         set_session_state(session_id, "awaiting_confirmation", response_text)
         resp = alerts_text + "ይህ እርምጃ ጥንቃቄ ይፈልጋል። ስለ ሁኔታዎ እርግጠኛ ነዎት? (አዎ ወይም አይ)"
         log_conversation(phone_number, session_id, "assistant", resp)
-        return resp, "requires_confirmation"
+        return resp, "requires_confirmation", None
 
     final_response = alerts_text + normalize_text(response_text)
     log_conversation(phone_number, session_id, "assistant", final_response)
-    return final_response, intent
+    return final_response, intent, None
 
 
 # ── API Endpoints ────────────────────────────────────────────────────────────
 
 @app.post("/ask")
 async def process_query(query: Query):
-    response_text, intent = generate_rag_response(query.text, query.phone_number, query.session_id)
-    return {"response": response_text, "intent": intent}
+    response_text, intent, trust = generate_rag_response(query.text, query.phone_number, query.session_id)
+    out = {"response": response_text, "intent": intent}
+    if trust is not None:
+        out["trust"] = trust
+    return out
 
 
 @app.get("/repeat/{session_id}")
@@ -374,6 +422,56 @@ async def repeat_last_response(session_id: str):
         if role == "assistant":
             return {"response": message}
     return {"response": "ቀዳሚ ምላሽ የለም።"}  # No previous response.
+
+
+@app.post("/product/escalation-status")
+async def product_escalation_status(body: EscalationStatusRequest):
+    """
+    Latest escalation tickets for a phone number: status only (no query text).
+    For IVR, SMS, or apps that show “your request is with an expert”.
+    """
+    from sqlalchemy import desc as sqdesc
+
+    from db import SessionLocal
+    from models import Escalation
+
+    phone = (body.phone_number or "").strip()
+    if not phone or phone.lower() == "unknown":
+        raise HTTPException(status_code=400, detail="phone_number is required")
+
+    lim = max(1, min(int(body.limit or 8), 30))
+    sla_h = int(os.environ.get("ESCALATION_SLA_HOURS", "48") or "48")
+
+    db = SessionLocal()
+    try:
+        q = db.query(Escalation).filter(Escalation.phone_number == phone)
+        sid = (body.session_id or "").strip()
+        if sid:
+            q = q.filter(Escalation.session_id == sid)
+        rows = q.order_by(sqdesc(Escalation.created_at)).limit(lim).all()
+        items = []
+        for e in rows:
+            st = (e.status or "pending").lower()
+            copy = _ESCALATION_STATUS_AM.get(st, _ESCALATION_STATUS_AM["pending"])
+            items.append(
+                {
+                    "ticket_id": e.id,
+                    "status": e.status,
+                    "status_label_am": copy["label"],
+                    "status_detail_am": copy["detail"],
+                    "reason_code": e.reason_code,
+                    "created_at": _iso_utc(e.created_at),
+                    "updated_at": _iso_utc(e.updated_at),
+                    "answered_at": _iso_utc(e.answered_at),
+                }
+            )
+        return {
+            "phone_number": phone,
+            "sla_target_hours": sla_h,
+            "items": items,
+        }
+    finally:
+        db.close()
 
 
 @app.post("/register")
@@ -416,7 +514,7 @@ async def save_call_record(
 async def simulate_call(req: E2ERequest):
     """End-to-end test endpoint: text in → logic → TTS → confirms pipeline is live."""
     transcribed_text = req.text_input
-    response_text, intent = generate_rag_response(transcribed_text, req.phone_number, req.session_id)
+    response_text, intent, trust = generate_rag_response(transcribed_text, req.phone_number, req.session_id)
 
     audio_b64 = None
     try:
@@ -428,12 +526,15 @@ async def simulate_call(req: E2ERequest):
     except Exception as e:
         logger.error(f"TTS request failed: {e}")
 
-    return {
+    payload = {
         "stt_output": transcribed_text,
         "logic_intent": intent,
         "logic_response": response_text,
-        "audio_base64_length": len(audio_b64) if audio_b64 else 0
+        "audio_base64_length": len(audio_b64) if audio_b64 else 0,
     }
+    if trust is not None:
+        payload["trust"] = trust
+    return payload
 
 
 @app.get("/system_check")

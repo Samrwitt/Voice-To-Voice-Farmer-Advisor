@@ -169,6 +169,7 @@ def retrieve_for_query(
     query_text: str,
     top_k: int = 4,
     max_l2_distance: float | None = None,
+    region: str | None = None,
 ) -> tuple[list[dict[str, Any]], float]:
     """
     Returns (hits, best_distance). Each hit:
@@ -180,14 +181,21 @@ def retrieve_for_query(
     qvec = embed_texts([query_text])[0]
     lit = _vector_literal(qvec)
 
+    # Build the WHERE clause for region filtering
+    # We always include 'ethiopia_all' (general info) plus the specific region if provided.
+    where_clause = "WHERE d.status = 'approved'"
+    query_params = [lit]
+
+    if region:
+        where_clause += " AND (d.extra->>'region' = %s OR d.extra->>'region' = 'ethiopia_all')"
+        query_params.append(region)
+    
+    query_params.extend([lit, top_k])
+
     psycopg = _load_psycopg()
     with psycopg.connect(POSTGRES_URL) as conn:
         with conn.cursor() as cur:
-            # Important: do NOT hard-filter by distance here.
-            # Some good matches can be slightly above the cutoff; callers can decide
-            # whether to escalate based on the best distance.
-            cur.execute(
-                """
+            sql = f"""
                 SELECT
                     c.id AS chunk_id,
                     c.document_id,
@@ -199,12 +207,11 @@ def retrieve_for_query(
                     d.language
                 FROM rag_kb_chunks c
                 INNER JOIN rag_kb_documents d ON d.id = c.document_id
-                WHERE d.status = 'approved'
+                {where_clause}
                 ORDER BY c.embedding <-> %s::vector
                 LIMIT %s;
-                """,
-                (lit, lit, top_k),
-            )
+            """
+            cur.execute(sql, tuple(query_params))
             rows = cur.fetchall()
 
     hits: list[dict[str, Any]] = []

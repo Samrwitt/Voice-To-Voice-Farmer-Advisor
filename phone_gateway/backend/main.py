@@ -5,11 +5,12 @@ import uuid
 from pathlib import Path
 
 import websockets
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
+import httpx
 
 from backend.database import Base, engine, SessionLocal
 from backend.models import Caller
@@ -24,6 +25,8 @@ from backend.monitor_state import (
     update_vad_status,
     add_utterance,
     update_utterance_transcript,
+    update_utterance_rag,
+    update_utterance_tts,
     end_call_monitor,
     add_event,
     get_monitor_state,
@@ -87,11 +90,43 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 FRONTEND_DIR = BASE_DIR / "frontend"
 
 app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
+app.mount("/static/utterances", StaticFiles(directory="/app/utterances"), name="utterances")
+
+
+class TtsSynthesizeBody(BaseModel):
+    """Proxy to tts-service for browser playback (same-origin; avoids exposing internal URLs)."""
+
+    text: str
+
+
+@app.post("/api/tts/synthesize")
+async def proxy_tts_synthesize(body: TtsSynthesizeBody):
+    text = (body.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Text must not be empty.")
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            upstream = await client.post(TTS_SERVICE_URL, json={"text": text})
+            upstream.raise_for_status()
+        ct = upstream.headers.get("content-type", "audio/wav")
+        return Response(content=upstream.content, media_type=ct)
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"TTS upstream error: {exc.response.status_code}",
+        ) from exc
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail=f"TTS unreachable: {exc}") from exc
 
 
 # ============================================================
 # Configuration
 # ============================================================
+
+TTS_SERVICE_URL = os.getenv(
+    "TTS_SERVICE_URL",
+    "http://tts-service:8009/synthesize",
+).strip()
 
 VAD_WS_BASE_URL = os.getenv(
     "VAD_WS_BASE_URL",
@@ -504,9 +539,18 @@ async def forward_vad_events_to_browser(vad_ws, browser_ws: WebSocket):
 
     try:
         async for message in vad_ws:
+            # Handle binary audio chunks from VAD service
+            if isinstance(message, bytes):
+                try:
+                    await browser_ws.send_bytes(message)
+                except Exception as exc:
+                    print(f"[BROWSER BINARY SEND FAILED] {exc}", flush=True)
+                    break
+                continue
+
+            # Handle JSON events
             try:
                 data = json.loads(message)
-
             except Exception:
                 data = {
                     "event": "vad_raw_message",
@@ -570,6 +614,30 @@ async def forward_vad_events_to_browser(vad_ws, browser_ws: WebSocket):
                 )
 
                 save_asr_transcript_to_db(data)
+            
+            # ------------------------------------------------------------
+            # RAG Answer ready
+            # ------------------------------------------------------------
+            elif event_name == "rag_answer":
+                response_text = data.get("response") or data.get("answer")
+                utterance_path = data.get("utterance_path")
+                references = data.get("references")
+                
+                if response_text and utterance_path:
+                    update_utterance_rag(utterance_path, response_text, references)
+
+            # ------------------------------------------------------------
+            # TTS audio ready
+            # ------------------------------------------------------------
+            elif event_name == "tts_ready":
+                tts_url = data.get("tts_url") or data.get("audio_url")
+                utterance_path = data.get("utterance_path")
+
+                if tts_url and utterance_path:
+                    update_utterance_tts(utterance_path, tts_url)
+
+            elif event_name == "tts_started":
+                add_event("tts_started", data)
 
             # ------------------------------------------------------------
             # ASR error
@@ -607,13 +675,20 @@ async def forward_vad_events_to_browser(vad_ws, browser_ws: WebSocket):
 async def call_websocket(
     websocket: WebSocket,
     caller_id: str | None = Query(default=None),
+    full_name: str | None = Query(default=None),
+    phone_number: str | None = Query(default=None),
     audio_format: str = Query(default="pcm16"),
     sample_rate: int = Query(default=16000),
 ):
     await websocket.accept()
 
-    session = create_session(caller_id=caller_id)
+    session = create_session(
+        caller_id=caller_id,
+        full_name=full_name,
+        phone_number=phone_number
+    )
     session_id = session["session_id"]
+    caller_id = session["caller_id"]
 
     caller_name, caller_phone = get_caller_details(caller_id)
 
@@ -628,11 +703,13 @@ async def call_websocket(
         audio_format=audio_format,
     )
 
-    vad_url = (
-        f"{VAD_WS_BASE_URL}"
-        f"?session_id={session_id}"
-        f"&sample_rate={sample_rate}"
-    )
+    # ── Connect to VAD Service ──
+    query_params = {
+        "session_id": session_id,
+        "sample_rate": sample_rate,
+        "phone_number": caller_phone
+    }
+    vad_url = f"{VAD_WS_BASE_URL}?" + "&".join([f"{k}={v}" for k, v in query_params.items()])
 
     vad_ws = None
     vad_event_task = None

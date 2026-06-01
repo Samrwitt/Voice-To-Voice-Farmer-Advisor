@@ -1,4 +1,5 @@
 websockets==12.0
+httpx>=0.27
 sqlalchemy
 psycopg2-binary
 python-jose[cryptography]

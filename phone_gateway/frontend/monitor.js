@@ -1,4 +1,11 @@
 const MONITOR_ENDPOINT = "/api/monitor/state";
+const POLL_MS = Math.max(250, Number.parseInt(String(window.MONITOR_POLL_MS || "650"), 10) || 650);
+
+let _lastMicTarget = 0;
+let _lastPlaybackTarget = 0;
+let _displayMic = 0;
+let _displayPlayback = 0;
+let _rafWaveform = 0;
 
 function $(id) {
   return document.getElementById(id);
@@ -23,13 +30,43 @@ function basename(path) {
   return String(path).split("/").pop();
 }
 
-function setSystemStatus(active) {
+function resetStatusBadgeClasses(el) {
+  el.classList.remove("online", "offline", "idle", "pending", "ended", "error");
+}
+
+/**
+ * Header badge: driven only by monitor API state (never a static “no call”).
+ */
+function updateCallStatusBadge(data) {
   const el = $("systemStatus");
   if (!el) return;
 
-  el.classList.toggle("online", active);
-  el.classList.toggle("offline", !active);
-  el.textContent = active ? "Active Call" : "No Active Call";
+  const call = data && data.active_call;
+  const hasSession = Boolean(call && call.session_id);
+  const status = (call && call.status) || "";
+
+  resetStatusBadgeClasses(el);
+
+  if (!hasSession) {
+    el.classList.add("idle");
+    el.textContent = "No call in progress";
+    return;
+  }
+  if (status === "ended") {
+    el.classList.add("ended");
+    el.textContent = "Last call ended";
+    return;
+  }
+  el.classList.add("online");
+  el.textContent = "Live call";
+}
+
+function setMonitorApiError() {
+  const el = $("systemStatus");
+  if (!el) return;
+  resetStatusBadgeClasses(el);
+  el.classList.add("error");
+  el.textContent = "Monitor unavailable";
 }
 
 function setStep(id, state, text) {
@@ -46,9 +83,58 @@ function setStep(id, state, text) {
   if (span) span.textContent = text || "Waiting";
 }
 
-function updateWaveform(level) {
+function effectiveMicLevelFromCall(call) {
+  const c = call || {};
+  const wf = c.waveform;
+  const last = Number(c.audio_level) || 0;
+  if (Array.isArray(wf) && wf.length) {
+    const tail = wf.slice(-56).map((x) => Number(x) || 0);
+    return Math.min(1, Math.max(last, ...tail, 0));
+  }
+  return Math.min(1, Math.max(0, last));
+}
+
+/**
+ * Advisor-side energy hint from recent gateway events (TTS streaming).
+ */
+function playbackLevelFromEvents(events) {
+  if (!events || !events.length) return 0;
+  const now = Date.now();
+  let peak = 0;
+  for (const ev of events.slice(0, 40)) {
+    const typ = String(ev.event_type || "");
+    const t = Date.parse(ev.time || "");
+    if (Number.isNaN(t) || now - t > 14000) continue;
+    if (typ === "tts_started") peak = Math.max(peak, 0.58);
+    else if (typ === "rag_answer" && now - t < 5000) peak = Math.max(peak, 0.12);
+  }
+  return Math.min(1, peak);
+}
+
+function scheduleWaveformDecayLoop() {
+  if (_rafWaveform) return;
+  const tick = () => {
+    _rafWaveform = requestAnimationFrame(tick);
+    // Ease displayed levels toward last server targets (smooth between polls).
+    const micEase = 0.28;
+    const pbEase = 0.22;
+    _displayMic += (_lastMicTarget - _displayMic) * micEase;
+    _displayPlayback += (_lastPlaybackTarget - _displayPlayback) * pbEase;
+    if (_lastPlaybackTarget < 0.02) {
+      _displayPlayback *= 0.88;
+    }
+    if (_lastMicTarget < 0.02) {
+      _displayMic *= 0.9;
+    }
+    updateWaveform(_displayMic, _displayPlayback);
+  };
+  _rafWaveform = requestAnimationFrame(tick);
+}
+
+function updateWaveform(level, playbackLevel = 0) {
   const bars = document.querySelectorAll(".wave-bar");
-  const normalized = Math.max(0, Math.min(1, Number(level || 0)));
+  const combinedLevel = Math.max(Number(level || 0), Number(playbackLevel || 0));
+  const normalized = Math.max(0, Math.min(1, combinedLevel));
 
   setText("audioLevelValue", `${Math.round(normalized * 100)}%`);
 
@@ -58,6 +144,12 @@ function updateWaveform(level) {
 
     bar.style.height = `${height}%`;
     bar.style.opacity = `${0.25 + normalized * 0.75}`;
+
+    if (playbackLevel > 0.05) {
+      bar.style.backgroundColor = "#4facfe";
+    } else {
+      bar.style.backgroundColor = "#00f2fe";
+    }
   });
 }
 
@@ -78,7 +170,7 @@ async function loadMonitor() {
   } catch (error) {
     console.error("Monitor load failed:", error);
 
-    setSystemStatus(false);
+    setMonitorApiError();
     setStep("stepGateway", "error", "Monitor API not reachable");
   }
 }
@@ -94,6 +186,8 @@ function renderMonitor(data) {
   const hasAudio = Number(call.audio_chunks || 0) > 0;
   const hasUtterance = utterances.length > 0;
   const hasTranscript = transcripts.length > 0;
+  const hasRag = utterances.some(u => u.rag_response);
+  const hasTts = utterances.some(u => u.tts_url);
 
   const vadStatus = call.vad_status || "waiting";
 
@@ -104,7 +198,7 @@ function renderMonitor(data) {
     hasUtterance
   );
 
-  setSystemStatus(hasActiveCall);
+  updateCallStatusBadge(data);
 
   setText("lastUpdated", new Date().toLocaleTimeString());
   setText("sessionId", call.session_id || "—");
@@ -117,10 +211,14 @@ function renderMonitor(data) {
   setText(
     "callStateText",
     hasActiveCall
-      ? "Call is active and audio is being processed"
+      ? vadStatus === "speech_started"
+        ? "Caller is speaking — streaming audio to VAD"
+        : hasAudio
+          ? "Call is live — listening and processing audio"
+          : "Call connected — waiting for microphone audio"
       : hasCall
-        ? "Call ended"
-        : "Waiting for incoming browser call"
+        ? "No active session — last call has ended"
+        : "No call connected — open the voice client to start a session"
   );
 
   setText("audioChunks", call.audio_chunks || 0);
@@ -128,7 +226,8 @@ function renderMonitor(data) {
   setText("vadStatus", vadStatus);
   setText("utteranceCount", call.utterance_count || utterances.length || 0);
 
-  updateWaveform(call.audio_level || 0);
+  _lastMicTarget = effectiveMicLevelFromCall(call);
+  _lastPlaybackTarget = playbackLevelFromEvents(data.events || []);
 
   renderUtterances(utterances);
   renderAsrTranscripts(transcripts);
@@ -137,10 +236,13 @@ function renderMonitor(data) {
   renderPipeline({
     call,
     hasCall,
+    hasActiveCall,
     hasAudio,
     hasVad,
     hasUtterance,
     hasTranscript,
+    hasRag,
+    hasTts,
     transcripts,
     utterances,
   });
@@ -149,6 +251,7 @@ function renderMonitor(data) {
 function renderPipeline({
   call,
   hasCall,
+  hasActiveCall,
   hasAudio,
   hasVad,
   hasUtterance,
@@ -158,8 +261,8 @@ function renderPipeline({
 }) {
   setStep(
     "stepGateway",
-    hasCall ? "success" : null,
-    hasCall ? "Session active" : "Waiting"
+    hasActiveCall ? "success" : hasCall ? "active" : null,
+    hasActiveCall ? "Session active" : hasCall ? "Call ended" : "Waiting"
   );
 
   setStep(
@@ -201,6 +304,18 @@ function renderPipeline({
       ? `${transcripts.length} transcript(s) ready`
       : "No transcript yet"
   );
+
+  setStep(
+    "stepRag",
+    hasRag ? "success" : (hasTranscript ? "active" : null),
+    hasRag ? "Answer generated" : (hasTranscript ? "Retrieving from KB..." : "Waiting")
+  );
+
+  setStep(
+    "stepTts",
+    hasTts ? "success" : (hasRag ? "active" : null),
+    hasTts ? "Audio synthesized" : (hasRag ? "Synthesizing voice..." : "Waiting")
+  );
 }
 
 function renderUtterances(utterances) {
@@ -227,7 +342,35 @@ function renderUtterances(utterances) {
 
           ${
             item.transcript
-              ? `<div class="utterance-transcript">${item.transcript}</div>`
+              ? `<div class="utterance-transcript"><strong>ASR:</strong> ${item.transcript}</div>`
+              : ""
+          }
+
+          ${
+            item.rag_response
+              ? `<div class="utterance-rag">
+                   <strong>RAG Answer:</strong> ${item.rag_response}
+                   ${
+                     item.rag_references && item.rag_references.length > 0
+                       ? `<div class="rag-sources">
+                            <hr style="opacity:0.2; margin: 8px 0;">
+                            <small>Sources:</small>
+                            ${item.rag_references.map(ref => `
+                              <div class="rag-source-item" style="font-size: 12px; margin-bottom: 4px;">
+                                📄 <strong>${ref.title || "Untitled Document"}</strong>
+                                <span style="opacity:0.7;">(dist: ${Number(ref.distance).toFixed(3)})</span>
+                              </div>
+                            `).join("")}
+                          </div>`
+                       : ""
+                   }
+                 </div>`
+              : ""
+          }
+
+          ${
+            item.tts_url
+              ? `<div class="utterance-tts"><a href="${item.tts_url}" target="_blank">🔊 Play TTS Response</a></div>`
               : ""
           }
         </div>
@@ -297,5 +440,6 @@ function renderRecentCalls(calls) {
     .join("");
 }
 
+scheduleWaveformDecayLoop();
 loadMonitor();
-setInterval(loadMonitor, 1500);
+setInterval(loadMonitor, POLL_MS);

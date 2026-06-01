@@ -4,8 +4,8 @@ Admin REST API for the dashboard frontend.
 All endpoints live under /admin and are protected by JWT bearer tokens issued
 by `auth.py`. Roles enforced:
     admin  - full access
-    da     - read farmers/calls, manage escalations and field reports
-    expert - work assigned escalations, review/approve KB docs
+    da     - Development Agent (read farmers/calls, manage escalations and field reports)
+    expert - Agricultural Expert (work assigned escalations, review/approve KB docs)
 """
 import csv
 import io
@@ -16,9 +16,9 @@ from typing import List, Optional
 
 import requests
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, EmailStr
-from sqlalchemy import case, desc, func
+from sqlalchemy import case, desc, func, text
 from sqlalchemy.orm import Session
 
 from auth import (
@@ -104,6 +104,7 @@ class AssignEscalationRequest(BaseModel):
 
 class EscalationResponseRequest(BaseModel):
     answer: str
+    expert_notes: Optional[str] = None
 
 
 class KBDocumentUpdate(BaseModel):
@@ -336,11 +337,17 @@ def deactivate_user(
 # ──────────────────────────────────────────────────────────────────────────────
 @router.get("/farmers")
 def list_farmers(
-    _: DashboardUser = Depends(get_current_user),
+    user: DashboardUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    # Prefer phone_gateway callers as the primary list (these exist even if
-    # the RAG flow hasn't created a FarmerKB row yet).
+    # Admin and DA can see all farmers.
+    # Experts can see all farmers (read-only) for context, 
+    # but the docstring suggests DA is the primary reader.
+    # We'll allow Experts to read farmers too as they need context for escalations.
+    if user.role not in ("admin", "da", "expert"):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    # Prefer phone_gateway callers as the primary list
     caller_rows = (
         db.query(Caller, FarmerProfilePG)
         .outerjoin(FarmerProfilePG, FarmerProfilePG.caller_id == Caller.caller_id)
@@ -402,9 +409,11 @@ def list_farmers(
 @router.get("/farmers/{phone_number}")
 def get_farmer(
     phone_number: str,
-    _: DashboardUser = Depends(get_current_user),
+    user: DashboardUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    if user.role not in ("admin", "da", "expert"):
+        raise HTTPException(status_code=403, detail="Access denied")
     kb = db.query(FarmerKB).filter(FarmerKB.phone_number == phone_number).first()
 
     caller = db.query(Caller).filter(Caller.phone_number == phone_number).first()
@@ -479,16 +488,22 @@ def get_farmer_calls(
 @router.get("/calls")
 def list_calls(
     limit: int = Query(default=100, le=500),
-    _: DashboardUser = Depends(get_current_user),
+    user: DashboardUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    rows = (
-        db.query(CallSessionPG, Caller)
-        .outerjoin(Caller, Caller.caller_id == CallSessionPG.caller_id)
-        .order_by(desc(CallSessionPG.start_time))
-        .limit(limit)
-        .all()
-    )
+    query = db.query(CallSessionPG, Caller).outerjoin(Caller, Caller.caller_id == CallSessionPG.caller_id)
+    
+    if user.role == "expert":
+        # Experts see calls that have an escalation assigned to them or are pending
+        query = query.join(Escalation, Escalation.session_id == CallSessionPG.session_id)\
+                     .filter(
+                         (Escalation.assigned_to_user_id == user.user_id) | 
+                         (Escalation.status == "pending")
+                     )
+    elif user.role not in ("admin", "da"):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    rows = query.order_by(desc(CallSessionPG.start_time)).limit(limit).all()
     return [
         {
             "id": cs.session_id,
@@ -506,9 +521,19 @@ def list_calls(
 @router.get("/calls/{session_id}")
 def get_call_detail(
     session_id: str,
-    _: DashboardUser = Depends(get_current_user),
+    user: DashboardUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    if user.role == "expert":
+        # Check if this expert is allowed to see this call
+        has_esc = db.query(Escalation).filter(
+            Escalation.session_id == session_id,
+            (Escalation.assigned_to_user_id == user.user_id) | (Escalation.status == "pending")
+        ).first()
+        if not has_esc:
+            raise HTTPException(status_code=403, detail="You are not assigned to this call session")
+    elif user.role not in ("admin", "da"):
+        raise HTTPException(status_code=403, detail="Access denied")
     # Primary: call session from phone_gateway
     cs = db.query(CallSessionPG).filter(CallSessionPG.session_id == session_id).first()
     caller = None
@@ -566,9 +591,19 @@ def get_call_detail(
 @router.get("/calls/{session_id}/audio")
 def get_call_audio_url(
     session_id: str,
-    _: DashboardUser = Depends(get_current_user),
+    token: Optional[str] = Query(None),
+    user: DashboardUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    if user.role == "expert":
+        has_esc = db.query(Escalation).filter(
+            Escalation.session_id == session_id,
+            (Escalation.assigned_to_user_id == user.user_id) | (Escalation.status == "pending")
+        ).first()
+        if not has_esc:
+            raise HTTPException(status_code=403, detail="Access denied")
+    elif user.role not in ("admin", "da"):
+        raise HTTPException(status_code=403, detail="Access denied")
     """
     Returns a presigned URL for the call audio stored in S3/MinIO.
     The CallSessionPG.audio_file_path is expected to be an s3://bucket/key reference.
@@ -576,15 +611,21 @@ def get_call_audio_url(
     cs = db.query(CallSessionPG).filter(CallSessionPG.session_id == session_id).first()
     if not cs or not cs.audio_file_path:
         raise HTTPException(status_code=404, detail="Audio not found")
-    if not s3_enabled():
-        raise HTTPException(status_code=503, detail="S3 is not configured")
 
-    url = presign_get_url(cs.audio_file_path, expires_seconds=900)
-    if not url:
+    # 1. Try S3/MinIO presigned redirect
+    if cs.audio_file_path.startswith("s3://"):
+        if not s3_enabled():
+            raise HTTPException(status_code=503, detail="S3 is not configured")
+        url = presign_get_url(cs.audio_file_path, expires_seconds=900)
+        if url:
+            return Response(status_code=302, headers={"Location": url})
         raise HTTPException(status_code=404, detail="Audio reference is not in S3")
 
-    # Redirect so the browser audio tag can stream it directly.
-    return Response(status_code=302, headers={"Location": url})
+    # 2. Try local file serving (if not in S3)
+    if os.path.exists(cs.audio_file_path):
+        return FileResponse(cs.audio_file_path, media_type="audio/wav")
+
+    raise HTTPException(status_code=404, detail=f"Audio not found at {cs.audio_file_path}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -603,13 +644,25 @@ def _escalation_dict(e: Escalation, db: Session) -> dict:
         "phone_number": e.phone_number,
         "session_id": e.session_id,
         "status": e.status,
+        "reason_code": e.reason_code,
+        "confidence": round(e.confidence, 4) if e.confidence is not None else None,
+        "entities": e.entities,
         "assigned_to": assignee,
         "assigned_at": _isoformat(e.assigned_at),
         "expert_response": e.expert_response,
+        "expert_notes": e.expert_notes,
         "answered_at": _isoformat(e.answered_at),
         "closed_at": _isoformat(e.closed_at),
         "timestamp": _isoformat(e.created_at),
+        "expert_audio_url": _get_expert_audio_link(e, db),
     }
+
+def _get_expert_audio_link(e: Escalation, db: Session) -> Optional[str]:
+    if not e.expert_audio_path:
+        return None
+    # If it's an S3 ref, we can't easily presign here without logic, 
+    # but the frontend will call /escalations/{id}/audio anyway.
+    return f"/api/admin/escalations/{e.id}/audio"
 
 
 @router.get("/escalations")
@@ -622,11 +675,9 @@ def list_escalations(
     if status:
         q = q.filter(Escalation.status == status)
     if user.role == "expert":
-        # Experts see escalations assigned to them or unassigned awaiting pickup
-        q = q.filter(
-            (Escalation.assigned_to_user_id == user.user_id)
-            | (Escalation.status == "pending")
-        )
+        # Experts ONLY see escalations assigned to them.
+        # (They no longer see pending ones to avoid clutter/privacy issues)
+        q = q.filter(Escalation.assigned_to_user_id == user.user_id)
     rows = q.order_by(desc(Escalation.created_at)).all()
     return [_escalation_dict(r, db) for r in rows]
 
@@ -683,11 +734,84 @@ def respond_escalation(
         raise HTTPException(status_code=403, detail="This case is not assigned to you")
 
     esc.expert_response = req.answer
+    if req.expert_notes is not None:
+        esc.expert_notes = req.expert_notes
     esc.answered_at = datetime.utcnow()
     esc.status = "answered"
     esc.updated_at = datetime.utcnow()
     db.commit()
     return _escalation_dict(esc, db)
+
+
+@router.post("/escalations/{ticket_id}/audio-response")
+async def upload_expert_audio(
+    ticket_id: int,
+    audio_file: UploadFile = File(...),
+    user: DashboardUser = Depends(require_roles("expert", "admin")),
+    db: Session = Depends(get_db),
+):
+    esc = db.query(Escalation).filter(Escalation.id == ticket_id).first()
+    if not esc:
+        raise HTTPException(status_code=404, detail="Escalation not found")
+    if user.role == "expert" and esc.assigned_to_user_id != user.user_id:
+        raise HTTPException(status_code=403, detail="This case is not assigned to you")
+
+    # Save audio file
+    recordings_dir = os.path.join(os.environ.get("DATA_DIR", "/data"), "expert_responses")
+    os.makedirs(recordings_dir, exist_ok=True)
+    filename = f"esc_{ticket_id}_{uuid.uuid4().hex[:8]}.wav"
+    file_path = os.path.join(recordings_dir, filename)
+
+    content = await audio_file.read()
+    with open(file_path, "wb") as f:
+        f.write(content)
+
+    # Optional: Upload to S3 if enabled
+    final_path = file_path
+    if s3_enabled():
+        from s3_client import upload_file as s3_upload
+        try:
+            s3_ref = s3_upload(file_path, f"expert_responses/{filename}", content_type="audio/wav")
+            if s3_ref:
+                final_path = s3_ref
+        except Exception as exc:
+            print(f"[EXPERT AUDIO] S3 upload failed, keeping local: {exc}")
+
+    esc.expert_audio_path = final_path
+    esc.answered_at = datetime.utcnow()
+    esc.status = "answered"
+    esc.updated_at = datetime.utcnow()
+    db.commit()
+    return _escalation_dict(esc, db)
+
+
+@router.get("/escalations/{ticket_id}/audio")
+def get_expert_audio(
+    ticket_id: int,
+    token: Optional[str] = Query(None),
+    user: DashboardUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    esc = db.query(Escalation).filter(Escalation.id == ticket_id).first()
+    if not esc or not esc.expert_audio_path:
+        raise HTTPException(status_code=404, detail="Audio response not found")
+
+    # RBAC check
+    if user.role == "expert" and esc.assigned_to_user_id != user.user_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    if esc.expert_audio_path.startswith("s3://"):
+        if not s3_enabled():
+            raise HTTPException(status_code=503, detail="S3 is not configured")
+        url = presign_get_url(esc.expert_audio_path, expires_seconds=900)
+        if url:
+            return Response(status_code=302, headers={"Location": url})
+        raise HTTPException(status_code=404, detail="Audio reference is not in S3")
+
+    if os.path.exists(esc.expert_audio_path):
+        return FileResponse(esc.expert_audio_path, media_type="audio/wav")
+
+    raise HTTPException(status_code=404, detail="Audio file missing")
 
 
 @router.post("/escalations/{ticket_id}/close")
@@ -907,7 +1031,7 @@ def _kb_doc_dict(d: KBDocument) -> dict:
 
 @router.get("/kb/documents")
 def list_kb_documents(
-    _: DashboardUser = Depends(get_current_user),
+    _: DashboardUser = Depends(require_roles("admin")),
     db: Session = Depends(get_db),
 ):
     rows = db.query(KBDocument).order_by(desc(KBDocument.uploaded_at)).all()
@@ -1333,6 +1457,88 @@ def da_performance(
         }
         for r in rows
     ]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Interaction records (FR16 traceability)
+# ──────────────────────────────────────────────────────────────────────────────
+@router.get("/interaction-records")
+def list_interaction_records(
+    phone_number: Optional[str] = None,
+    session_id: Optional[str] = None,
+    limit: int = Query(default=100, le=500),
+    user: DashboardUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Returns structured interaction records written by the voice/RAG pipeline.
+    These records are stored in Postgres table `interaction_records`.
+    """
+    if user.role == "expert":
+        # Experts must specify a session_id they are allowed to see
+        if not session_id:
+            # We could allow them to see all interaction records for their assigned calls, 
+            # but usually they access this from the call detail page.
+            # To be safe and compliant, we restrict to specific session_id.
+            raise HTTPException(status_code=403, detail="Access denied: Expert must specify a session_id")
+        
+        has_esc = db.query(Escalation).filter(
+            Escalation.session_id == session_id,
+            (Escalation.assigned_to_user_id == user.user_id) | (Escalation.status == "pending")
+        ).first()
+        if not has_esc:
+            raise HTTPException(status_code=403, detail="Access denied: Not authorized for this session")
+    elif user.role not in ("admin", "da"):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    # Best-effort: the table is created by rag_service. If it's missing, return empty.
+    where = []
+    params: dict = {"limit": limit}
+    if phone_number:
+        where.append("phone_number = :phone_number")
+        params["phone_number"] = phone_number
+    if session_id:
+        where.append("session_id = :session_id")
+        params["session_id"] = session_id
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+    try:
+        rows = db.execute(
+            text(
+                f"""
+                SELECT
+                  id,
+                  phone_number,
+                  session_id,
+                  intent,
+                  response_type,
+                  entities,
+                  confidence,
+                  created_at
+                FROM interaction_records
+                {where_sql}
+                ORDER BY created_at DESC
+                LIMIT :limit
+                """
+            ),
+            params,
+        ).mappings().all()
+    except Exception:
+        return []
+
+    def _row(r) -> dict:
+        return {
+            "id": int(r["id"]) if r.get("id") is not None else None,
+            "phone_number": r.get("phone_number"),
+            "session_id": r.get("session_id"),
+            "intent": r.get("intent"),
+            "response_type": r.get("response_type"),
+            "entities": r.get("entities"),
+            "confidence": float(r["confidence"]) if r.get("confidence") is not None else None,
+            "created_at": _isoformat(r.get("created_at")),
+        }
+
+    return [_row(r) for r in rows]
 
 
 # ──────────────────────────────────────────────────────────────────────────────

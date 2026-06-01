@@ -85,6 +85,18 @@ export interface CallDetail {
   transcript: TranscriptMessage[];
 }
 
+// ── Interaction records — /admin/interaction-records ─────────────────────────
+export interface InteractionRecord {
+  id: number;
+  phone_number?: string | null;
+  session_id?: string | null;
+  intent?: string | null;
+  response_type?: string | null;
+  entities?: unknown;
+  confidence?: number | null;
+  created_at?: string | null;
+}
+
 // ── Knowledge Base — /admin/kb ────────────────────────────────────────────────
 export interface KBEntry {
   id: string;
@@ -141,6 +153,7 @@ export interface EscalationCase {
   assigned_to?: { user_id: string; full_name: string; email: string } | null;
   assigned_at?: string | null;
   expert_response?: string | null;
+  expert_audio_url?: string | null;
   answered_at?: string | null;
   closed_at?: string | null;
   // legacy / mock

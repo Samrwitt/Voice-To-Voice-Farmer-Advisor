@@ -7,9 +7,16 @@ let audioContext = null;
 let mediaStream = null;
 let sourceNode = null;
 let processorNode = null;
+let playbackStartTime = 0;
 
 const DEFAULT_SERVICE_NUMBER = "8028";
 const TARGET_SAMPLE_RATE = 16000;
+
+/** Played once per session when the server confirms the call (Amharic). */
+const CALL_GREETING_AM =
+  "ሰላም ይሁንልዎ። እኔ የግብርና አማካሪ ነኝ። በምን ጉዳይ ልርዳዎት እንደምትፈልጉ ይንገሩኝ።";
+
+let greetingPlayedSessionId = null;
 
 let callerId = localStorage.getItem("caller_id");
 let callerName = localStorage.getItem("caller_name");
@@ -226,6 +233,11 @@ function stopTimer() {
 }
 
 async function startCall() {
+  // Initialize AudioContext immediately on user gesture to avoid browser blocks
+  if (!audioContext) {
+    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+  }
+
   const dialedNumber = numberDisplay ? numberDisplay.value.trim() : "";
 
   if (!callerId) {
@@ -260,7 +272,9 @@ async function startCall() {
 
     const wsUrl =
       `${protocol}://${window.location.host}/ws/call` +
-      `?caller_id=${encodeURIComponent(callerId)}` +
+      `?caller_id=${encodeURIComponent(callerId || "")}` +
+      `&full_name=${encodeURIComponent(callerName || "")}` +
+      `&phone_number=${encodeURIComponent(callerPhone || "")}` +
       `&audio_format=pcm16` +
       `&sample_rate=${TARGET_SAMPLE_RATE}`;
 
@@ -276,12 +290,22 @@ async function startCall() {
     };
 
     websocket.onmessage = (event) => {
+      if (event.data instanceof ArrayBuffer) {
+        handleIncomingAudio(event.data);
+        return;
+      }
+
       try {
         const data = JSON.parse(event.data);
 
         if (data.type === "session_started") {
           if (sessionInfo) {
             sessionInfo.innerText = `Session: ${data.session_id}`;
+          }
+          const sid = data.session_id || "";
+          if (sid && greetingPlayedSessionId !== sid) {
+            greetingPlayedSessionId = sid;
+            void playCallOpeningGreeting();
           }
         }
 
@@ -314,6 +338,8 @@ async function startCall() {
 
       cleanupAudio();
 
+      greetingPlayedSessionId = null;
+
       setStatus("Ended");
       activeCall = false;
       stopTimer();
@@ -326,8 +352,45 @@ async function startCall() {
   }
 }
 
+async function playCallOpeningGreeting() {
+  try {
+    setStatus("Advisor greeting…");
+    const res = await fetch("/api/tts/synthesize", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: CALL_GREETING_AM }),
+    });
+    if (!res.ok) {
+      console.warn("Opening greeting TTS failed:", res.status);
+      if (activeCall) setStatus("Listening...");
+      return;
+    }
+    const raw = await res.arrayBuffer();
+    const copy = raw.slice(0);
+    if (!audioContext) {
+      audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    if (audioContext.state === "suspended") {
+      await audioContext.resume();
+    }
+    const decoded = await audioContext.decodeAudioData(copy);
+    const src = audioContext.createBufferSource();
+    src.buffer = decoded;
+    src.connect(audioContext.destination);
+    src.onended = () => {
+      if (activeCall) setStatus("Listening...");
+    };
+    src.start();
+  } catch (e) {
+    console.warn("Opening greeting skipped:", e);
+    if (activeCall) setStatus("Listening...");
+  }
+}
+
 async function startPCMStreaming(stream) {
-  audioContext = new AudioContext();
+  if (!audioContext) {
+    audioContext = new AudioContext();
+  }
 
   sourceNode = audioContext.createMediaStreamSource(stream);
 
@@ -392,6 +455,48 @@ function downsampleBuffer(buffer, inputSampleRate, outputSampleRate) {
   return result;
 }
 
+function handleIncomingAudio(arrayBuffer) {
+  if (!audioContext) {
+    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+  }
+
+  // Modern browsers often suspend AudioContext until a user gesture or resume() call.
+  if (audioContext.state === "suspended") {
+    audioContext.resume();
+  }
+
+  setStatus("Advisor is talking...");
+
+  // Convert PCM16 to Float32
+  const pcm16 = new Int16Array(arrayBuffer);
+  const float32 = new Float32Array(pcm16.length);
+  for (let i = 0; i < pcm16.length; i++) {
+    // Boost volume by 1.5x
+    float32[i] = (pcm16[i] / 32768.0) * 1.5;
+  }
+
+  const audioBuffer = audioContext.createBuffer(1, float32.length, TARGET_SAMPLE_RATE);
+  audioBuffer.getChannelData(0).set(float32);
+
+  const source = audioContext.createBufferSource();
+  source.buffer = audioBuffer;
+  source.connect(audioContext.destination);
+
+  // Simple scheduling to avoid clicks
+  const currentTime = audioContext.currentTime;
+  if (playbackStartTime < currentTime) {
+    playbackStartTime = currentTime + 0.05;
+  }
+  source.start(playbackStartTime);
+  playbackStartTime += audioBuffer.duration;
+
+  // Clear "Talking" status after a delay (approx when audio finishes)
+  clearTimeout(window.statusTimeout);
+  window.statusTimeout = setTimeout(() => {
+    if (activeCall) setStatus("Listening...");
+  }, 1500);
+}
+
 function float32ToPCM16(float32Array) {
   const pcm16 = new Int16Array(float32Array.length);
 
@@ -425,6 +530,45 @@ function endCall() {
   }
 
   cleanupAudio();
+}
+
+async function testAudio() {
+  try {
+    console.log("Starting audio test...");
+    if (!audioContext) {
+      audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    
+    // Explicitly wait for resume
+    if (audioContext.state === "suspended") {
+      console.log("Resuming suspended AudioContext...");
+      await audioContext.resume();
+    }
+    
+    console.log("Context state:", audioContext.state);
+    
+    const osc = audioContext.createOscillator();
+    const gain = audioContext.createGain();
+    
+    osc.type = "sine";
+    osc.frequency.setValueAtTime(440, audioContext.currentTime);
+    
+    gain.gain.setValueAtTime(0.5, audioContext.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioContext.currentTime + 0.5);
+    
+    osc.connect(gain);
+    gain.connect(audioContext.destination);
+    
+    osc.start();
+    osc.stop(audioContext.currentTime + 0.5);
+    
+    console.log("Audio test beep played");
+    alert("You should have heard a short beep. If not, check your speakers/volume.");
+    
+  } catch (err) {
+    console.error("Audio test failed:", err);
+    alert("Audio test failed: " + err.message);
+  }
 }
 
 function cleanupAudio() {

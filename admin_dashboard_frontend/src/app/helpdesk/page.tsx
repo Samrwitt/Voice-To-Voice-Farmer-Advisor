@@ -7,8 +7,9 @@ import {
   fetchEscalations,
   fetchUsers,
   respondEscalation,
+  uploadEscalationAudio,
 } from '@/lib/api';
-import { getRole, getUserId, hasRole } from '@/lib/auth';
+import { getRole, getUserId, hasRole, getToken } from '@/lib/auth';
 import type { DashboardUser, EscalationCase } from '@/types';
 import Badge from '@/components/ui/Badge';
 
@@ -35,6 +36,7 @@ export default function Helpdesk() {
   const [experts, setExperts]     = useState<DashboardUser[]>([]);
   const [busy, setBusy]           = useState(false);
   const [toast, setToast]         = useState('');
+  const [pendingAudio, setPendingAudio] = useState<Blob | null>(null);
   const role = typeof window !== 'undefined' ? getRole() : null;
   const myUserId = typeof window !== 'undefined' ? getUserId() : null;
 
@@ -85,6 +87,10 @@ export default function Helpdesk() {
     if (!selected || selected.id == null) return;
     setBusy(true);
     try {
+      if (pendingAudio) {
+        await uploadEscalationAudio(selected.id, pendingAudio);
+        setPendingAudio(null);
+      }
       await respondEscalation(selected.id, answer);
       showToast(`Ticket #${selected.id} answered ✓`);
       load();
@@ -263,6 +269,7 @@ export default function Helpdesk() {
                       }
                       busy={busy}
                       onRespond={handleRespond}
+                      onAudioUpload={setPendingAudio}
                     />
                   )}
                 </div>
@@ -285,43 +292,126 @@ function ExpertResponsePanel({
   canRespond,
   busy,
   onRespond,
+  onAudioUpload,
 }: {
   caseItem: EscalationCase;
   canRespond: boolean;
   busy: boolean;
   onRespond: (answer: string) => void;
+  onAudioUpload: (blob: Blob) => void;
 }) {
   const [answer, setAnswer] = useState('');
+  const [isRecording, setIsRecording] = useState(false);
+  const [recorder, setRecorder] = useState<MediaRecorder | null>(null);
+  const [audioUrl, setAudioUrl] = useState<string | null>(null);
 
   useEffect(() => {
     setAnswer(caseItem.expert_response ?? '');
   }, [caseItem.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  const startRecording = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mediaRecorder = new MediaRecorder(stream);
+      const chunks: Blob[] = [];
+
+      mediaRecorder.ondataavailable = (e) => chunks.push(e.data);
+      mediaRecorder.onstop = () => {
+        const blob = new Blob(chunks, { type: 'audio/wav' });
+        setAudioUrl(URL.createObjectURL(blob));
+        onAudioUpload(blob);
+        stream.getTracks().forEach(track => track.stop());
+      };
+
+      mediaRecorder.start();
+      setRecorder(mediaRecorder);
+      setIsRecording(true);
+    } catch (err) {
+      console.error('Recording failed:', err);
+    }
+  };
+
+  const stopRecording = () => {
+    recorder?.stop();
+    setIsRecording(false);
+  };
+
   return (
-    <div className="pt-4 border-t border-slate-100 space-y-3">
-      <span className="block text-xs font-semibold text-slate-500 uppercase tracking-wide">
-        Expert response
-      </span>
+    <div className="pt-4 border-t border-slate-100 space-y-4">
+      <div className="flex items-center justify-between">
+        <span className="block text-xs font-semibold text-slate-500 uppercase tracking-wide">
+          Expert response
+        </span>
+        {caseItem.expert_audio_url && (
+          <audio 
+            controls 
+            src={caseItem.expert_audio_url + (typeof window !== 'undefined' && getToken() ? `?token=${getToken()}` : '')} 
+            className="h-8 w-48"
+          />
+        )}
+      </div>
+
       {!canRespond && (
         <div className="bg-amber-50 border border-amber-200 rounded-md p-3 text-sm text-amber-800">
           This case must be assigned to you before you can answer.
         </div>
       )}
-      <textarea
-        value={answer}
-        onChange={(e) => setAnswer(e.target.value)}
-        rows={5}
-        className="w-full p-3 rounded-md border border-slate-300 text-sm focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-green-500 resize-none"
-        placeholder="Write the expert answer here…"
-        disabled={!canRespond || busy}
-      />
-      <button
-        onClick={() => onRespond(answer.trim())}
-        disabled={!canRespond || busy || !answer.trim()}
-        className="w-full h-10 bg-green-600 hover:bg-green-700 disabled:opacity-50 text-white text-sm font-medium rounded-md transition-colors"
-      >
-        Submit answer
-      </button>
+
+      <div className="space-y-3">
+        <div className="flex items-center gap-2">
+          {!isRecording ? (
+            <button
+              onClick={startRecording}
+              disabled={!canRespond || busy}
+              className="flex-1 h-10 flex items-center justify-center gap-2 rounded-md border border-slate-300 text-slate-700 text-sm font-medium hover:bg-slate-50 disabled:opacity-50 transition-colors"
+            >
+              <div className="w-2 h-2 rounded-full bg-red-500" />
+              Record Voice Response
+            </button>
+          ) : (
+            <button
+              onClick={stopRecording}
+              className="flex-1 h-10 flex items-center justify-center gap-2 rounded-md bg-red-50 text-red-700 text-sm font-medium border border-red-200 animate-pulse"
+            >
+              <div className="w-2 h-2 rounded-full bg-red-600" />
+              Stop Recording...
+            </button>
+          )}
+          {audioUrl && (
+            <button
+              onClick={() => setAudioUrl(null)}
+              className="h-10 px-3 rounded-md text-slate-400 hover:text-slate-600 hover:bg-slate-50"
+              title="Clear recording"
+            >
+              ✕
+            </button>
+          )}
+        </div>
+
+        {audioUrl && (
+          <div className="bg-slate-50 p-2 rounded-md border border-slate-200 flex items-center gap-3">
+            <span className="text-xs text-slate-500 font-medium ml-2">Preview:</span>
+            <audio src={audioUrl} controls className="h-8 flex-1" />
+          </div>
+        )}
+
+        <textarea
+          value={answer}
+          onChange={(e) => setAnswer(e.target.value)}
+          rows={4}
+          className="w-full p-3 rounded-md border border-slate-300 text-sm focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-green-500 resize-none"
+          placeholder="Or write the expert answer here…"
+          disabled={!canRespond || busy}
+        />
+        
+        <button
+          onClick={() => onRespond(answer.trim())}
+          disabled={!canRespond || busy || (!answer.trim() && !audioUrl)}
+          className="w-full h-11 bg-green-600 hover:bg-green-700 disabled:opacity-50 text-white text-sm font-medium rounded-md shadow-sm transition-all active:scale-[0.98]"
+        >
+          {audioUrl ? 'Submit Voice & Text Response' : 'Submit Response'}
+        </button>
+      </div>
     </div>
   );
 }
