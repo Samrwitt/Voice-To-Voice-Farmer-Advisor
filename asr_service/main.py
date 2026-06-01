@@ -397,12 +397,20 @@ from engine import create_asr_engine
 from audio_utils import save_upload_file, prepare_audio_for_asr
 from config import SHARED_UTTERANCES_DIR, ASR_ENGINE
 from postprocess import postprocess_asr_transcript
-from hosted_llm_fix import hosted_fix_enabled, groq_keys, gemini_keys, _backend_mode
+from hosted_llm_fix import (
+    hosted_fix_enabled,
+    groq_keys,
+    gemini_keys,
+    free_gemini_keys,
+    shared_gemini_keys,
+    use_shared_gemini_keys_for_asr,
+    _backend_mode,
+)
 
 
 app = FastAPI(
     title="Amharic ASR Service",
-    description="Amharic ASR (SpeechBrain or Whisper) with post-processing and optional LLM typo fix.",
+    description="Local Whisper Amharic ASR with post-processing and optional Gemini typo fix.",
     version="0.1.0",
 )
 
@@ -445,7 +453,7 @@ def _load_asr_engine_background() -> None:
 
 @app.on_event("startup")
 def startup_event():
-    # SpeechBrain first boot downloads large HF weights; do not block HTTP.
+    # Load the local Whisper model in the background so health endpoints respond.
     threading.Thread(target=_load_asr_engine_background, daemon=True).start()
 
 
@@ -491,6 +499,9 @@ def fix_status():
         "backend_mode": _backend_mode(),
         "groq_key_count": len(groq_keys()),
         "gemini_key_count": len(gemini_keys()),
+        "free_gemini_key_count": len(free_gemini_keys()),
+        "shared_gemini_key_count": len(shared_gemini_keys()),
+        "using_shared_gemini_keys": use_shared_gemini_keys_for_asr(),
     }
 
 

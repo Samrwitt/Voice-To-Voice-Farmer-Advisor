@@ -1,6 +1,4 @@
 # Shared requirements (fastapi, uvicorn, pydantic, python-multipart) are in requirements-common.txt
-speechbrain
-transformers
 fastapi
 uvicorn[standard]
 python-multipart

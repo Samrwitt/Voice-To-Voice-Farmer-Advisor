@@ -34,6 +34,7 @@ INTENT_MAP = {
     "soil_water_conservation": "soil_advice",
     "land_characterization": "soil_advice",
     "post_harvest": "general_agriculture",
+    "weather_advice": "weather_advice",
 }
 
 INTENT_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -425,10 +426,26 @@ def _simple_market_answer(market: dict[str, Any], language: str) -> str:
     if not market.get("available"):
         return ""
     crop = market.get("crop") or "crop"
+    crop_am = {
+        "teff": "ጤፍ",
+        "wheat": "ስንዴ",
+        "maize": "በቆሎ",
+        "barley": "ገብስ",
+        "sorghum": "ማሽላ",
+        "coffee": "ቡና",
+    }.get(str(crop).strip().lower(), crop)
+    trend_am = {
+        "up": "እየጨመረ",
+        "down": "እየቀነሰ",
+        "flat": "ተመሳሳይ",
+        "unknown": "ያልታወቀ",
+    }.get(str(market.get("trend") or "").lower(), "ያልታወቀ")
+    source = market.get("source")
+    source_am = "የሙከራ ውሂብ" if source == "mock_demo_data" else "የአካባቢ ዳታቤዝ"
     return (
-        f"የ{crop} ዋጋ {market.get('price')} {market.get('unit')} ነው። "
-        f"አዝማሚያው {market.get('trend')} ነው። "
-        f"ምንጭ: {market.get('source')}። "
+        f"የ{crop_am} ዋጋ {market.get('price')} {market.get('unit')} ነው። "
+        f"አዝማሚያው {trend_am} ነው። "
+        f"ምንጭ: {source_am}። "
         "ትልቅ መጠን ከመሸጥዎ በፊት የአካባቢ ገበያ ዋጋን ያረጋግጡ።"
         if language == "am"
         else f"{crop} price is {market.get('price')} {market.get('unit')}; trend: {market.get('trend')}. Source: {market.get('source')}."

@@ -48,7 +48,6 @@ REGION_ENTITY_WORDS = set(REGION_KEYWORDS.keys())
 # Explicit market/price terms only — bare "ስንት" matches fertilizer dose questions too.
 MARKET_KEYWORDS = [
     "ዋጋ",
-    "ስንት ነው",
     "ገበያ",
     "price",
     "market",
@@ -88,7 +87,6 @@ def _is_market_price_intent(text: str, lower: str) -> bool:
         "cost",
         "ብር",
         "ሽያጭ",
-        "ስንት ነው",
     )
     if has_dose and not any(m in lower or m in text for m in strong_market):
         return False
@@ -115,12 +113,26 @@ AGRI_INTENT_KEYWORDS = [
     "መሬት",
     "ውኃ",
     "ጥበቃ",
+    "ዝናብ",
+    "የአየር",
     "extension",
     "ማራዘም",
 ]
 
 # (intent_id, keywords) — Amharic + English tokens; first match wins by score
 _TOPIC_RULES: list[tuple[str, list[str]]] = [
+    (
+        "weather_advice",
+        [
+            "weather",
+            "forecast",
+            "rain",
+            "ዝናብ",
+            "የአየር",
+            "አየር ሁኔታ",
+            "ትንበያ",
+        ],
+    ),
     (
         "post_harvest",
         [
@@ -233,6 +245,7 @@ _RETRIEVAL_HINTS: dict[str, str] = {
     "pest_disease": "ፀረ ተባይ እና በሽታ አስተዳደር",
     "land_characterization": "የመሬት ምድብ እና LandPKS",
     "extension_advisory": "የማራዘም ቅያት እና ሰነዶች",
+    "weather_advice": "የአየር ሁኔታ ዝናብ ትንበያ እና የሰብል ምክር",
     "crop_production": "የሰብል ምርት እና የመስኖ አማራጮች",
     "general_agronomy": "የግብርና ምክር እና ልምድ",
 }
@@ -354,6 +367,7 @@ def needs_slot_filling(text: str, session_state: Optional[dict], nlu: NLUResult)
         "soil_fertility",
         "pest_disease",
         "general_agronomy",
+        "weather_advice",
     }
     if nlu.primary_intent not in intents_requiring_crop:
         return None

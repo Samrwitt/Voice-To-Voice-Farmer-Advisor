@@ -4,10 +4,10 @@
 # Usage:
 #   ./scripts/test_asr_typo_fix.sh
 #   ./scripts/test_asr_typo_fix.sh 'ለስንዴ ማዳብሪያ ስንት መጠን ይሰጣል'
-#   ASR_URL=http://127.0.0.1:8001 ASR_LLM_FIX_BACKEND=gemini ./scripts/test_asr_typo_fix.sh
+#   ASR_URL=http://127.0.0.1:8001 ./scripts/test_asr_typo_fix.sh
 #
-# Force Gemini only (skip Groq): set ASR_LLM_FIX_BACKEND=gemini in .env and restart asr-service.
-# Keys: GEMINI_API_KEY or GEMINI_API_KEYS in .env (same as RAG).
+# Default is Gemini only: set ASR_LLM_FIX_BACKEND=gemini and restart asr-service.
+# Keys: FREE_GEMINI_API_KEYS / FREE_GEMINI_API_KEY preferred, then GEMINI_API_KEY(S).
 
 set -euo pipefail
 
@@ -32,5 +32,5 @@ for k in ('input', 'domain_corrected_transcript', 'semantic_corrected_transcript
 "
 
 echo ""
-echo "If transcript_fix_backend is null, set GEMINI_API_KEY in .env, ASR_HOSTED_LLM_FIX=auto, then:"
+echo "If transcript_fix_backend is null, set FREE_GEMINI_API_KEYS or GEMINI_API_KEY in .env, ASR_HOSTED_LLM_FIX=auto, then:"
 echo "  docker compose up -d --build asr-service"

@@ -168,29 +168,24 @@ services:
     build:
       context: .
       dockerfile: asr_service/Dockerfile
-      args:
-        HF_TOKEN: ${HF_TOKEN:-}
-        BAKE_SPEECHBRAIN: ${BAKE_SPEECHBRAIN:-1}
     container_name: asr_service
     ports:
       - "8001:8001"
     environment:
-      # speechbrain needs ~12GB+ Docker RAM (downloads wav2vec2-large-xlsr-53 ~1.2GB).
-      # Use whisper_local on 8GB machines (BDU CT2 model already under ./models/asr).
       ASR_ENGINE: ${ASR_ENGINE:-whisper_local}
-      ASR_SPEECHBRAIN_SOURCE: ${ASR_SPEECHBRAIN_SOURCE:-speechbrain/asr-wav2vec2-dvoice-amharic}
-      ASR_SPEECHBRAIN_SAVEDIR: ${ASR_SPEECHBRAIN_SAVEDIR:-/opt/asr-models/speechbrain-wav2vec2-dvoice-amharic}
       ASR_MODEL_PATH: ${ASR_MODEL_PATH:-/models/asr/whisper-small-amharic-bdu-8khz-aug-ct2-fp16}
-      HF_TOKEN: ${HF_TOKEN:-}
-      HF_HOME: ${HF_HOME:-/opt/asr-models/hf-cache}
       SHARED_UTTERANCES_DIR: /shared/utterances
       ASR_HOSTED_LLM_FIX: ${ASR_HOSTED_LLM_FIX:-auto}
-      ASR_LLM_FIX_BACKEND: ${ASR_LLM_FIX_BACKEND:-groq_then_gemini}
+      ASR_LLM_FIX_BACKEND: ${ASR_LLM_FIX_BACKEND:-gemini}
       GROQ_API_KEYS: ${GROQ_API_KEYS:-}
       GROQ_API_KEY: ${GROQ_API_KEY:-}
+      FREE_GEMINI_API_KEYS: ${FREE_GEMINI_API_KEYS:-}
+      FREE_GEMINI_API_KEY: ${FREE_GEMINI_API_KEY:-}
       GEMINI_API_KEYS: ${GEMINI_API_KEYS:-}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      ASR_USE_SHARED_GEMINI_KEYS: ${ASR_USE_SHARED_GEMINI_KEYS:-0}
+      ASR_LLM_FIX_MAX_KEYS_PER_REQUEST: ${ASR_LLM_FIX_MAX_KEYS_PER_REQUEST:-1}
       ASR_USE_OLLAMA: ${ASR_USE_OLLAMA:-false}
       OLLAMA_URL: http://ollama:11434
       OLLAMA_MODEL: qwen2.5:7b

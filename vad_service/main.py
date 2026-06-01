@@ -197,6 +197,9 @@ async def handle_completed_utterance(
                 "confidence": asr_result.get("confidence"),
                 "engine": asr_result.get("engine"),
                 "audio_id": asr_result.get("audio_id"),
+                "needs_confirmation": asr_result.get("needs_confirmation"),
+                "confirmation_prompt": asr_result.get("confirmation_prompt"),
+                "unusual_words": asr_result.get("unusual_words"),
                 "message": "ASR transcription completed",
             },
         )
@@ -261,6 +264,54 @@ async def handle_completed_utterance(
             )
             return
 
+        if (
+            os.getenv("VAD_ASR_CONFIRMATION_GATE", "1").strip().lower()
+            in ("1", "true", "yes", "on")
+            and asr_result.get("needs_confirmation")
+        ):
+            rag_answer = (
+                asr_result.get("confirmation_prompt")
+                or f"የሰማሁት ይህ ነው፦ {transcript}። ትክክል ነው?"
+            )
+            print(
+                f"[ASR CONFIRMATION] session={session_id}, transcript={transcript!r}",
+                flush=True,
+            )
+            await safe_send(
+                websocket,
+                send_lock,
+                {
+                    "event": "rag_answer",
+                    "session_id": session_id,
+                    "utterance_path": utterance_path,
+                    "response": rag_answer,
+                    "references": [],
+                    "trust": {"grounding": "asr_confirmation"},
+                    "meta": {"reason": "asr_needs_confirmation"},
+                    "message": "ASR requested transcript confirmation",
+                },
+            )
+            await safe_send(
+                websocket,
+                send_lock,
+                {
+                    "event": "tts_started",
+                    "session_id": session_id,
+                    "utterance_path": utterance_path,
+                    "message": "Synthesizing voice response...",
+                },
+            )
+            session_state.playback_task = asyncio.create_task(
+                play_advisor_response(
+                    websocket=websocket,
+                    send_lock=send_lock,
+                    session_id=session_id,
+                    utterance_path=utterance_path,
+                    rag_answer=rag_answer,
+                )
+            )
+            return
+
         await safe_send(
             websocket,
             send_lock,
@@ -275,7 +326,18 @@ async def handle_completed_utterance(
         rag_result = await get_rag_answer(
             text=transcript,
             session_id=session_id,
-            phone_number=phone_number
+            phone_number=phone_number,
+            asr_meta={
+                "raw_transcript": asr_result.get("raw_transcript"),
+                "final_transcript": asr_result.get("final_transcript"),
+                "confidence": asr_result.get("confidence"),
+                "transcript_fix_backend": asr_result.get("transcript_fix_backend"),
+                "needs_confirmation": asr_result.get("needs_confirmation"),
+                "confirmation_prompt": asr_result.get("confirmation_prompt"),
+                "unusual_words": asr_result.get("unusual_words"),
+                "engine": asr_result.get("engine"),
+                "audio_id": asr_result.get("audio_id"),
+            },
         )
 
         rag_answer = rag_result.get("response")
@@ -291,6 +353,7 @@ async def handle_completed_utterance(
                 "references": rag_result.get("references"),
                 "trust": rag_result.get("trust"),
                 "meta": rag_result.get("meta"),
+                "best_distance": rag_result.get("best_distance"),
                 "message": "RAG answer generated",
             },
         )

@@ -17,10 +17,9 @@ def agrochemical_expert_only_enabled() -> bool:
 _AGROCHEM_PATTERN = re.compile(
     r"(?:"
     r"pesticide|pesticides|herbicide|insecticide|fungicide|nematicide|"
-    r"fertilizer|fertiliser|fertilizers|npk|urea|glyphosate|paraquat|"
-    r"spray|spraying|application\s+rate|mixing\s+ratio|dose|dosage|ppm|"
-    r"ማዳበሪያ|ፀረ[\s-]?ተባይ|ፀረ\s+ተባይ|መርጨት|መርጨ|ርጭት|የመድሐኒት|መድሐኒት|"
-    r"መጠን|ምን\s*ያህል|እንዴት\s*መርጨት"
+    r"glyphosate|paraquat|spray|spraying|mixing\s+ratio|ppm|"
+    r"ፀረ[\s-]?ተባይ|ፀረ\s+ተባይ|መርጨት|መርጨ|ርጭት|የመድሐኒት|መድሐኒት|"
+    r"እንዴት\s*መርጨት"
     r")",
     re.IGNORECASE,
 )

@@ -187,7 +187,13 @@ def retrieve_for_query(
     query_params = [lit]
 
     if region:
-        where_clause += " AND (d.extra->>'region' = %s OR d.extra->>'region' = 'ethiopia_all')"
+        # Many dashboard/bootstrap documents are untagged. Keep them eligible so
+        # profile region does not accidentally hide national/general guidance.
+        where_clause += (
+            " AND (d.extra->>'region' = %s "
+            "OR d.extra->>'region' = 'ethiopia_all' "
+            "OR d.extra->>'region' IS NULL)"
+        )
         query_params.append(region)
     
     query_params.extend([lit, top_k])

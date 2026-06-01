@@ -3,9 +3,10 @@ Post-ASR typo / grammar fix via Groq or Gemini (same API keys as RAG).
 
 Env (shared with rag-service):
   GROQ_API_KEYS / GROQ_API_KEY
+  FREE_GEMINI_API_KEYS / FREE_GEMINI_API_KEY
   GEMINI_API_KEYS / GEMINI_API_KEY / GOOGLE_API_KEY
   ASR_HOSTED_LLM_FIX=auto|1|0
-  ASR_LLM_FIX_BACKEND=groq_then_gemini|groq|gemini
+  ASR_LLM_FIX_BACKEND=gemini|gemini_then_groq|groq_then_gemini|groq
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from typing import Callable, TypeVar
 import httpx
 
 logger = logging.getLogger("asr-hosted-llm-fix")
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 T = TypeVar("T")
 _SPLIT_RE = re.compile(r"[,;\n|]+")
@@ -44,15 +46,30 @@ def groq_keys() -> list[str]:
     return _parse_keys("GROQ_API_KEYS", "GROQ_API_KEY")
 
 
+def free_gemini_keys() -> list[str]:
+    return _parse_keys("FREE_GEMINI_API_KEYS", "FREE_GEMINI_API_KEY")
+
+
+def shared_gemini_keys() -> list[str]:
+    return _parse_keys("GEMINI_API_KEYS", "GEMINI_API_KEY", "GOOGLE_API_KEY", "GENAI_API_KEY")
+
+
+def use_shared_gemini_keys_for_asr() -> bool:
+    return os.getenv("ASR_USE_SHARED_GEMINI_KEYS", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 def gemini_keys() -> list[str]:
-    keys = _parse_keys("GEMINI_API_KEYS")
-    if keys:
-        return keys
-    for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GENAI_API_KEY"):
-        v = (os.environ.get(name) or "").strip()
-        if v:
-            return [v]
-    return []
+    keys = free_gemini_keys()
+    if use_shared_gemini_keys_for_asr():
+        for key in shared_gemini_keys():
+            if key not in keys:
+                keys.append(key)
+    return keys
 
 
 def hosted_fix_enabled() -> bool:
@@ -66,7 +83,7 @@ def hosted_fix_enabled() -> bool:
 
 
 def _backend_mode() -> str:
-    return os.getenv("ASR_LLM_FIX_BACKEND", "groq_then_gemini").strip().lower()
+    return os.getenv("ASR_LLM_FIX_BACKEND", "gemini").strip().lower()
 
 
 class _KeyPool:
@@ -103,22 +120,22 @@ class _KeyPool:
         return self._keys[index]
 
 
-_groq_pool: _KeyPool | None = None
-_gemini_pool: _KeyPool | None = None
+_groq_pool_instance: _KeyPool | None = None
+_gemini_pool_instance: _KeyPool | None = None
 
 
 def _groq_pool() -> _KeyPool:
-    global _groq_pool
-    if _groq_pool is None:
-        _groq_pool = _KeyPool(groq_keys(), "groq")
-    return _groq_pool
+    global _groq_pool_instance
+    if _groq_pool_instance is None:
+        _groq_pool_instance = _KeyPool(groq_keys(), "groq")
+    return _groq_pool_instance
 
 
 def _gemini_pool() -> _KeyPool:
-    global _gemini_pool
-    if _gemini_pool is None:
-        _gemini_pool = _KeyPool(gemini_keys(), "gemini")
-    return _gemini_pool
+    global _gemini_pool_instance
+    if _gemini_pool_instance is None:
+        _gemini_pool_instance = _KeyPool(gemini_keys(), "gemini")
+    return _gemini_pool_instance
 
 
 def _is_rate_limit(exc: BaseException) -> bool:
@@ -130,14 +147,26 @@ def _is_rate_limit(exc: BaseException) -> bool:
 
 def _run_pool(pool: _KeyPool, fn: Callable[[str], T]) -> T:
     last: BaseException | None = None
-    for idx in pool.ordered_indices():
+    order = pool.ordered_indices()
+    try:
+        max_attempts = int(os.getenv("ASR_LLM_FIX_MAX_KEYS_PER_REQUEST", "1") or "1")
+    except ValueError:
+        max_attempts = 1
+    max_attempts = max(1, min(max_attempts, len(order) or 1))
+    for attempt_no, idx in enumerate(order[:max_attempts], start=1):
         try:
+            logger.info(
+                "ASR hosted fix trying %s key attempt %s/%s",
+                pool._label,
+                attempt_no,
+                max_attempts,
+            )
             return fn(pool.key_at(idx))
         except BaseException as exc:
             last = exc
             if _is_rate_limit(exc):
                 pool.mark_rate_limited(idx)
-                continue
+                break
             raise
     if last is not None:
         raise last
@@ -240,6 +269,10 @@ def _sanitize_llm_output(text: str, fallback: str) -> str:
     return t
 
 
+def _safe_error(exc: BaseException) -> str:
+    return re.sub(r"key=[^\\s'\"&]+", "key=***", str(exc))
+
+
 def semantic_correction_hosted(raw_text: str) -> tuple[str, str]:
     """
     Returns ``(corrected_text, backend)`` where backend is ``groq`` or ``gemini``.
@@ -267,6 +300,8 @@ def semantic_correction_hosted(raw_text: str) -> tuple[str, str]:
     order: list[tuple[str, Callable[[], str]]] = []
     if mode == "gemini":
         order = [("gemini", try_gemini)]
+    elif mode == "gemini_then_groq":
+        order = [("gemini", try_gemini), ("groq", try_groq)]
     elif mode == "groq":
         order = [("groq", try_groq)]
     else:
@@ -278,8 +313,9 @@ def semantic_correction_hosted(raw_text: str) -> tuple[str, str]:
             logger.info("ASR hosted fix via %s: %r -> %r", name, text[:80], out[:80])
             return out, name
         except Exception as exc:
-            errors.append(f"{name}: {exc}")
-            logger.warning("ASR hosted fix %s failed: %s", name, exc)
+            safe = _safe_error(exc)
+            errors.append(f"{name}: {safe}")
+            logger.warning("ASR hosted fix %s failed: %s", name, safe)
 
     logger.warning("ASR hosted fix exhausted: %s", "; ".join(errors))
     return text, "none"

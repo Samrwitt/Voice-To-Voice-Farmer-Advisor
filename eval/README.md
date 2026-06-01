@@ -2,7 +2,7 @@
 
 ## Golden questions
 
-- File: `golden_questions.json` — Amharic questions plus a small **rubric** per case (substrings, max latency, min length).
+- File: `golden_questions.json` — Amharic farmer-core questions plus a small **rubric** per case (substrings, max latency, min length, scenario, grounding, and references).
 - Runner: `run_rag_eval.py` — calls `POST {RAG_BASE_URL}/rag/answer` for each case and prints a JSON report. Exit code **1** if any rubric fails (CI-friendly).
 
 ### Run locally
@@ -15,6 +15,12 @@ python3 eval/run_rag_eval.py
 Optional: `EVAL_PHONE=+2519...` if personalization paths need a real profile.
 
 Tune rubrics as your KB grows (keywords are intentionally loose).
+
+Farmer-core coverage includes normal crop production, fertilizer clarification,
+market routing, weather location clarification, noisy slot-style questions, and
+agrochemical safety escalation. Normal production/fertilizer/market/weather
+questions should not become expert escalations unless the safety policy requires
+it.
 
 ## Quality snapshot (Postgres)
 
@@ -33,9 +39,10 @@ Policy knobs (read in snapshot JSON `policy`):
 
 `POST /rag/answer` now includes a **`trust`** object, e.g.:
 
-- `sources`: `kb`, `dynamic`, `expert_delivery`, `escalation`
-- `grounding`: `kb_llm` | `kb_compose` | `dynamic_only` | `none` | `escalation`
+- `sources`: `kb`, `tools`, `dynamic`, `expert_delivery`, `clarification`, `escalation`
+- `grounding`: `kb_llm` | `kb_compose` | `dynamic_only` | `clarification` | `none` | `escalation`
 - `latency_ms`, `escalation_sla_target_hours`, `human_review`
+- `scenario`, `retrieval`, and optional `asr` diagnostics on `/rag/answer`.
 
 Optional Amharic disclaimer footer on KB answers: set `RAG_TRUST_FOOTER=1`.
 
@@ -43,7 +50,10 @@ Optional Amharic disclaimer footer on KB answers: set `RAG_TRUST_FOOTER=1`.
 
 When `RAG_AGROCHEM_EXPERT_ONLY=1` (default in `docker-compose`), pesticide / fertilizer / spray / dose questions **without a confident KB match** escalate (`AGROCHEM_NO_KB`). A match requires in-threshold chunk distances **and** `best_distance <= RAG_PG_MAX_L2_DISTANCE` (weak Chroma-only junk with a high PG `best` still escalates).
 
-`RAG_VOICE_LOW_CONF_ESCALATE=1` (default) applies the same distance rule to **non-agrochemical** queries (`LOW_CONFIDENCE`).
+`RAG_VOICE_LOW_CONF_ESCALATE=1` (default) only applies after the voice scenario
+router has decided the question is eligible for escalation. Core farmer
+scenarios such as crop production, fertilizer, market, weather, and pest/disease
+get a clarification/tool/KB chance first.
 
 `POST /rag/answer` logs user/assistant turns to `conversation_history` so follow-up questions in the same `session_id` appear in `/rag/debug/context` (`session_history_count`, `recent_advisory_records`).
 

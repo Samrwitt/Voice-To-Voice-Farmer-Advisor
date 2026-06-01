@@ -1,24 +1,12 @@
 import os
 from pathlib import Path
 
-# whisper_local | speechbrain
+# Local Whisper CT2 ASR.
 ASR_ENGINE = os.getenv("ASR_ENGINE", "whisper_local").strip().lower()
 
 MODEL_DIR = os.getenv(
     "ASR_MODEL_PATH",
     "./models/asr/whisper-small-amharic-bdu-8khz-aug-ct2-fp16",
-)
-
-SPEECHBRAIN_SOURCE = os.getenv(
-    "ASR_SPEECHBRAIN_SOURCE",
-    "speechbrain/asr-wav2vec2-dvoice-amharic",
-).strip()
-
-SPEECHBRAIN_SAVEDIR = Path(
-    os.getenv(
-        "ASR_SPEECHBRAIN_SAVEDIR",
-        "/opt/asr-models/speechbrain-wav2vec2-dvoice-amharic",
-    )
 )
 
 SHARED_UTTERANCES_DIR = os.getenv(

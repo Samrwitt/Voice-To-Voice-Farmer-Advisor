@@ -51,7 +51,14 @@ def build_voice_trust_meta(
         base["grounding"] = "escalation"
         return base
     if "kb" not in sources:
-        base["grounding"] = "dynamic_only" if "dynamic" in sources else "none"
+        if "dynamic" in sources:
+            base["grounding"] = "dynamic_only"
+        elif "tools" in sources:
+            base["grounding"] = "tools"
+        elif "clarification" in sources:
+            base["grounding"] = "clarification"
+        else:
+            base["grounding"] = "none"
         return base
     if used_llm_assistant:
         base["grounding"] = "kb_llm"

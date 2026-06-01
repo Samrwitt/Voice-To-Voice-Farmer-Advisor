@@ -21,9 +21,9 @@ def ranked_hits_for_voice_query(
     user_region: str | None,
     hist_pairs: list[tuple[str, str]],
     max_l2_distance: float,
-) -> tuple[list[dict[str, Any]], str, Any, float]:
+) -> tuple[list[dict[str, Any]], str, Any, float, dict[str, Any]]:
     """
-    Returns ``(hits, retrieval_query, farmer_nlu, best_distance)``.
+    Returns ``(hits, retrieval_query, farmer_nlu, best_distance, diagnostics)``.
     ``hits`` is already trimmed to ``RAG_PG_FINAL_TOP_K`` (when non-empty).
     """
     import rag_pg
@@ -45,6 +45,17 @@ def ranked_hits_for_voice_query(
     chroma_k = max(8, int(os.getenv("RAG_CHROMA_TOP_K", "18").strip() or "18"))
     chroma_hits = retrieve_chroma_mirror_hits(rq, top_k=chroma_k)
     merged = merge_pg_chroma_hits(pg_hits, chroma_hits)
+    diagnostics: dict[str, Any] = {
+        "query": rq,
+        "user_region": user_region,
+        "max_l2_distance": max_l2_distance,
+        "pg_raw_count": len(raw_hits),
+        "pg_filtered_count": len(pg_hits),
+        "chroma_count": len(chroma_hits),
+        "merged_count": len(merged),
+        "best_distance": best,
+        "top_titles": [h.get("title") for h in raw_hits[:5] if h.get("title")],
+    }
 
     def _retrieve_more(q: str) -> list:
         hh, _ = rag_pg.retrieve_for_query(
@@ -67,4 +78,6 @@ def ranked_hits_for_voice_query(
             max_hits=max(keep, 8),
         )
         hits = hits[:keep]
-    return hits, rq, farmer_nlu, best
+    diagnostics["final_count"] = len(hits)
+    diagnostics["final_titles"] = [h.get("title") for h in hits[:5] if h.get("title")]
+    return hits, rq, farmer_nlu, best, diagnostics

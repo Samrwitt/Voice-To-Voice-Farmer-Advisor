@@ -6,7 +6,12 @@ logger = logging.getLogger("rag_client")
 
 RAG_SERVICE_URL = os.getenv("RAG_SERVICE_URL", "http://rag-service:8000")
 
-async def get_rag_answer(text: str, session_id: str, phone_number: str = "Unknown") -> dict:
+async def get_rag_answer(
+    text: str,
+    session_id: str,
+    phone_number: str = "Unknown",
+    asr_meta: dict | None = None,
+) -> dict:
     """
     Call the RAG service to get a grounded answer for the transcript.
     """
@@ -17,6 +22,8 @@ async def get_rag_answer(text: str, session_id: str, phone_number: str = "Unknow
         "session_id": session_id,
         "phone_number": phone_number
     }
+    if asr_meta:
+        payload["asr"] = asr_meta
     
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
