@@ -19,7 +19,8 @@ _AGROCHEM_PATTERN = re.compile(
     r"pesticide|pesticides|herbicide|insecticide|fungicide|nematicide|"
     r"glyphosate|paraquat|spray|spraying|mixing\s+ratio|ppm|"
     r"ፀረ[\s-]?ተባይ|ፀረ\s+ተባይ|መርጨት|መርጨ|ርጭት|የመድሐኒት|መድሐኒት|"
-    r"እንዴት\s*መርጨት"
+    r"እንዴት\s*መርጨት|"
+    r"(?:ጥቁር\s*)?አክሲድ|ሲፕር|ሲፕርድ"
     r")",
     re.IGNORECASE,
 )

@@ -160,6 +160,8 @@ class Escalation(Base):
     expert_response = Column(Text, nullable=True)
     expert_audio_path = Column(String, nullable=True)
     expert_notes = Column(Text, nullable=True)
+    transcript_snapshot = Column(Text, nullable=True)
+    session_recording_path = Column(String, nullable=True)
     answered_at = Column(DateTime, nullable=True)
     closed_at = Column(DateTime, nullable=True)
 
@@ -181,6 +183,20 @@ class Alert(Base):
     published_at = Column(DateTime, nullable=True)
     created_by = Column(String, ForeignKey("dashboard_users.user_id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class AlertCallNotification(Base):
+    __tablename__ = "alert_call_notifications"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    alert_id = Column(Integer, ForeignKey("alerts.id"), nullable=False, index=True)
+    phone_number = Column(String, nullable=False, index=True)
+    target_region = Column(String, nullable=True, index=True)
+    status = Column(String, default="queued", index=True)
+    provider_ref = Column(String, nullable=True)
+    error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow)
 
 
 class MarketPrice(Base):

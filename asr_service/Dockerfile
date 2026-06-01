@@ -28,8 +28,10 @@ COPY asr_service/requirements.txt .
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --default-timeout=1000 --retries=20 -r requirements.txt
 
+COPY shared/ /app/shared/
 COPY asr_service/ /app/
 
+ENV PYTHONPATH=/app
 ENV ASR_DEVICE=cpu
 ENV ASR_COMPUTE_TYPE=int8
 ENV ASR_MAX_NEW_TOKENS=160

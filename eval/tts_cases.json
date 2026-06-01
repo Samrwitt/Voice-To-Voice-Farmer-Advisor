@@ -1,0 +1,38 @@
+[
+  {
+    "id": "short_greeting",
+    "text": "ሰላም፣ እንዴት ነዎት?",
+    "rubric": {
+      "max_latency_ms": 5000,
+      "max_rtf": 3.0,
+      "min_duration_sec": 0.5
+    }
+  },
+  {
+    "id": "farmer_advice_medium",
+    "text": "ለስንዴ ማሳዎ ዘር ከመዝራት በፊት መሬቱን በጥሩ ሁኔታ ያዘጋጁ። አፈር እርጥበት ካለው የተሻለ ውጤት ይሰጣል።",
+    "rubric": {
+      "max_latency_ms": 8000,
+      "max_rtf": 2.5,
+      "min_duration_sec": 2.0
+    }
+  },
+  {
+    "id": "safety_message",
+    "text": "ፀረ ተባይ ከመጠቀምዎ በፊት የምርቱን መመሪያ ያንብቡ፣ ጓንት ይጠቀሙ፣ እና የአካባቢ ግብርና ባለሙያን ያማክሩ።",
+    "rubric": {
+      "max_latency_ms": 8000,
+      "max_rtf": 2.5,
+      "min_duration_sec": 2.0
+    }
+  },
+  {
+    "id": "long_voice_answer",
+    "text": "የበቆሎ ማሳ ለማዘጋጀት መጀመሪያ አፈሩን በደንብ ያርሱ። የተሻለ ውጤት ለማግኘት ዘሩን በትክክለኛ ርቀት ይዝሩ፣ እንክርዳድን በጊዜው ያስወግዱ፣ እና የዝናብ ሁኔታን ይከታተሉ።",
+    "rubric": {
+      "max_latency_ms": 12000,
+      "max_rtf": 2.5,
+      "min_duration_sec": 4.0
+    }
+  }
+]

@@ -8,9 +8,38 @@ import re
 
 _AMH = re.compile(r"[\u1200-\u137F]")
 
+_KNOWN_SHORT_OK = {
+    "አዎ",
+    "አወ",
+    "አው",
+    "እሺ",
+    "እሽ",
+    "አይ",
+    "አይደለም",
+    "awo",
+    "aw",
+    "eshi",
+    "ishi",
+    "ok",
+    "okay",
+    "yes",
+    "no",
+}
+
+_GREETING_OK = (
+    "ሰላም",
+    "selam",
+    "salam",
+    "hello",
+    "hi",
+)
+
 
 def is_asr_gibberish(transcript: str | None, confidence: float | None = None) -> bool:
     t = (transcript or "").strip()
+    normalized = re.sub(r"\s+", " ", t.lower())
+    if normalized in _KNOWN_SHORT_OK or any(g in normalized for g in _GREETING_OK):
+        return False
     if len(t) < 2:
         return True
     # Very low diversity (e.g. repeated symbols)
@@ -26,5 +55,5 @@ def is_asr_gibberish(transcript: str | None, confidence: float | None = None) ->
 
 
 GIBBERISH_REPLY_AM = (
-    "ይቅርታ፣ ጥያቄዎን በትክክል አልተረዳኩም። እባክዎ በአማርኛ እንደገና ይናገሩልኝ።"
+    "ይቅርታ፣ ጥያቄዎን በትክክል አልተረዳኩም። እባክዎ በአማርኛ እንደገና ይናገሩ።"
 )

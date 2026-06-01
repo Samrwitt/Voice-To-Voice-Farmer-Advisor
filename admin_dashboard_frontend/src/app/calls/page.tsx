@@ -1,10 +1,11 @@
 "use client";
 
-import { useEffect, useState } from 'react';
+import { Fragment, useEffect, useState } from 'react';
 import Link from 'next/link';
 import { fetchCalls } from '@/lib/api';
 import { getToken } from '@/lib/auth';
 import type { CallLog } from '@/types';
+import AudioPlayer from '@/components/ui/AudioPlayer';
 
 export default function CallLogs() {
   const [calls, setCalls]         = useState<CallLog[]>([]);
@@ -29,6 +30,12 @@ export default function CallLogs() {
       (c.session_id ?? '').toLowerCase().includes(q)
     );
   });
+
+  const audioUrlForCall = (call: CallLog) => {
+    const token = typeof window !== 'undefined' ? getToken() : null;
+    const suffix = token ? `?token=${token}` : '';
+    return `/api/admin/calls/${encodeURIComponent(call.session_id ?? String(call.id))}/audio${suffix}`;
+  };
 
   return (
     <div className="space-y-6">
@@ -66,7 +73,7 @@ export default function CallLogs() {
               </thead>
               <tbody className="divide-y divide-slate-100">
                 {filtered.length > 0 ? filtered.map((c) => (
-                  <>
+                  <Fragment key={c.id}>
                     <tr
                       key={c.id}
                       className="hover:bg-slate-50 transition-colors"
@@ -112,23 +119,17 @@ export default function CallLogs() {
                     {playingId === c.id && c.recording_path && (
                       <tr key={`audio-${c.id}`}>
                         <td colSpan={7} className="px-8 py-4 bg-slate-50 border-b border-slate-100">
-                          <div className="flex items-center gap-4">
-                            <span className="text-xs text-slate-500 font-medium">Recording:</span>
-                            <audio
-                              controls
-                              autoPlay
-                              src={
-                                c.session_id
-                                  ? `/api/admin/calls/${encodeURIComponent(c.session_id)}/audio${(typeof window !== 'undefined' && getToken()) ? `?token=${getToken()}` : ''}`
-                                  : `/api/audio?path=${encodeURIComponent(c.recording_path)}${(typeof window !== 'undefined' && getToken()) ? `&token=${getToken()}` : ''}`
-                              }
-                              className="flex-1 h-9"
-                            />
-                          </div>
+                          <AudioPlayer
+                            src={audioUrlForCall(c)}
+                            label="Session recording"
+                            detail={c.session_id ?? String(c.id)}
+                            autoPlay
+                            compact
+                          />
                         </td>
                       </tr>
                     )}
-                  </>
+                  </Fragment>
                 )) : (
                   <tr>
                     <td colSpan={7} className="py-16 text-center text-sm text-slate-400">

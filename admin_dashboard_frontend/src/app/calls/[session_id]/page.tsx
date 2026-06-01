@@ -7,6 +7,7 @@ import Link from "next/link";
 import { fetchCallDetail, fetchInteractionRecords } from "@/lib/api";
 import { getToken } from "@/lib/auth";
 import type { CallDetail, InteractionRecord } from "@/types";
+import AudioPlayer from "@/components/ui/AudioPlayer";
 
 export default function CallSessionPage() {
   const params = useParams<{ session_id: string }>();
@@ -17,6 +18,12 @@ export default function CallSessionPage() {
   const [interactions, setInteractions] = useState<InteractionRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+
+  const audioUrl = () => {
+    const token = typeof window !== "undefined" ? getToken() : null;
+    const suffix = token ? `?token=${token}` : "";
+    return `/api/admin/calls/${encodeURIComponent(sessionId)}/audio${suffix}`;
+  };
 
   useEffect(() => {
     setLoading(true);
@@ -109,20 +116,12 @@ export default function CallSessionPage() {
           </div>
 
           {detail.record?.recording_path && (
-            <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-6">
-              <div className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-3">
-                Recording
-              </div>
-              <audio
-                controls
-                src={
-                  detail.session_id
-                    ? `/api/admin/calls/${encodeURIComponent(detail.session_id)}/audio${(typeof window !== 'undefined' && getToken()) ? `?token=${getToken()}` : ''}`
-                    : `/api/audio?path=${encodeURIComponent(detail.record.recording_path)}${(typeof window !== 'undefined' && getToken()) ? `&token=${getToken()}` : ''}`
-                }
-                className="w-full h-10"
-              />
-            </div>
+            <AudioPlayer
+              src={audioUrl()}
+              label="Session recording"
+              detail={detail.session_id}
+              className="rounded-xl"
+            />
           )}
 
           <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">

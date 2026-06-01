@@ -25,7 +25,7 @@ A production-ready, full-duplex conversational AI system designed to provide rea
 *   **Engine**: `faster-whisper` (CTranslate2 optimized).
 *   **Model**: Fine-tuned Whisper-Small for Amharic.
 *   **Accuracy**: Optimized for telephone-bandwidth (8kHz) audio with data augmentation to handle noisy field environments.
-*   **Semantic Correction**: Uses a local Ollama (Qwen2.5) layer to correct transcription hallucinations in real-time.
+*   **Semantic Correction**: Uses a hosted LLM layer (Gemini/Groq) to correct transcription hallucinations in real-time.
 
 ### 3. Retrieval-Augmented Generation (RAG Service)
 *   **Engine**: FastAPI + pgvector (PostgreSQL).

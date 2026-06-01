@@ -13,8 +13,6 @@ from .context_utils import build_context, sanitize_chat_answer
 from .llm_providers import effective_llm_backend, load_dotenv_if_present
 from .nlu_farmer import parse_farmer_nlu
 from .query_llm import (
-    hosted_ollama_fallback_enabled,
-    ollama_failover_answer,
     prepare_rag_llm_messages,
     run_sync_llm,
 )
@@ -36,8 +34,6 @@ def _fast_mode() -> bool:
 def _looks_like_llm_error(text: str) -> bool:
     t = (text or "").strip()
     if not t:
-        return True
-    if t.startswith("[Ollama]"):
         return True
     if t.startswith("[groq]") or t.startswith("[gemini]") or t.startswith("[openai]"):
         return True
@@ -130,13 +126,8 @@ def try_llm_assistant_response(
         logger.warning("LLM primary failed: %s", exc)
         answer = ""
         llm_used = backend
-        if backend in ("groq", "gemini", "openai") and hosted_ollama_fallback_enabled():
-            try:
-                answer = ollama_failover_answer(msgs, fast)
-                llm_used = "ollama"
-            except Exception as fe:
-                logger.warning("Ollama fallback failed: %s", fe)
-                answer = f"[{backend}]\n{exc}\n[Ollama]\n{fe}"
+        if backend in ("groq", "gemini", "openai"):
+            answer = f"[{backend}]\n{exc}"
 
     answer = sanitize_chat_answer(answer)
     if _looks_like_llm_error(answer):

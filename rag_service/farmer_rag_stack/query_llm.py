@@ -1,13 +1,9 @@
-"""LLM routing for RAG: message shaping, hosted APIs, Ollama, and quota fallbacks."""
+"""LLM routing for RAG: message shaping, hosted APIs, and quota fallbacks."""
 
 from __future__ import annotations
 
-import json
 import os
-import sys
 from collections.abc import Iterator
-
-import httpx
 
 from .llm_providers import (
     gemini_chat_messages,
@@ -15,35 +11,6 @@ from .llm_providers import (
     iter_gemini_chat_with_groq_fallback,
     openai_style_chat,
 )
-
-
-def default_chat_model(fast: bool) -> str:
-    if os.environ.get("OLLAMA_MODEL", "").strip():
-        return os.environ["OLLAMA_MODEL"].strip()
-    return "qwen2.5:3b" if fast else "qwen3:4b-instruct"
-
-
-def ollama_options(fast: bool) -> dict:
-    raw = os.environ.get("OLLAMA_OPTIONS_JSON", "").strip()
-    if raw:
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            print("Warning: OLLAMA_OPTIONS_JSON invalid JSON, using preset.", file=sys.stderr)
-    if fast:
-        return {
-            "temperature": 0.06,
-            "top_p": 0.82,
-            "repeat_penalty": 1.12,
-            "num_ctx": int(os.environ.get("OLLAMA_NUM_CTX", "3072")),
-            "num_predict": int(os.environ.get("OLLAMA_NUM_PREDICT", "240")),
-        }
-    return {
-        "temperature": 0.05,
-        "top_p": 0.9,
-        "num_ctx": int(os.environ.get("OLLAMA_NUM_CTX", "4096")),
-        "num_predict": int(os.environ.get("OLLAMA_NUM_PREDICT", "512")),
-    }
 
 
 def _hosted_chat_rounds_limit() -> int:
@@ -71,17 +38,6 @@ def trim_hosted_conversation_messages(messages: list[dict]) -> list[dict]:
     if len(mid) <= max_mid:
         return messages
     return [system] + mid[-max_mid:] + [tail]
-
-
-def hosted_ollama_fallback_enabled() -> bool:
-    if os.environ.get("RAG_HOSTED_FALLBACK_OLLAMA", "1").strip().lower() in (
-        "0",
-        "false",
-        "no",
-        "off",
-    ):
-        return False
-    return os.environ.get("USE_OLLAMA", "1").strip().lower() in ("1", "true", "yes")
 
 
 def shrink_messages_for_hosted_api(messages: list[dict]) -> list[dict]:
@@ -119,79 +75,7 @@ def shrink_messages_for_hosted_api(messages: list[dict]) -> list[dict]:
     return out
 
 
-def ollama_chat_messages(
-    messages: list[dict],
-    model: str,
-    base_url: str,
-    *,
-    options: dict,
-    timeout_sec: float,
-) -> str:
-    url = base_url.rstrip("/") + "/api/chat"
-    payload = {
-        "model": model,
-        "messages": messages,
-        "stream": False,
-        "options": options,
-    }
-    tmo = httpx.Timeout(connect=20.0, read=timeout_sec, write=120.0, pool=10.0)
-    try:
-        with httpx.Client(timeout=tmo) as client:
-            r = client.post(url, json=payload)
-    except httpx.ReadTimeout as e:
-        raise RuntimeError(
-            f"Ollama read timed out after {timeout_sec:g}s (model may be loading on CPU/GPU). "
-            f"Try: export OLLAMA_HTTP_TIMEOUT=180  or  ollama run {model}  once to warm the model."
-        ) from e
-    except httpx.ConnectError as e:
-        raise RuntimeError(
-            f"Cannot connect to Ollama at {base_url!r}. Is `ollama serve` running?"
-        ) from e
-    if r.status_code >= 400:
-        detail = (r.text or "").strip()[:2500]
-        raise RuntimeError(
-            f"Ollama HTTP {r.status_code} for model {model!r}. "
-            f"Often: out of memory — try export OLLAMA_NUM_CTX=2048 or a smaller model. Body:\n{detail}"
-        )
-    data = r.json()
-    msg = data.get("message") or {}
-    return (msg.get("content") or "").strip()
-
-
-def iter_ollama_chat(
-    messages: list[dict],
-    model: str,
-    base_url: str,
-    *,
-    options: dict,
-    timeout_sec: float,
-):
-    url = base_url.rstrip("/") + "/api/chat"
-    payload = {
-        "model": model,
-        "messages": messages,
-        "stream": True,
-        "options": options,
-    }
-    tmo = httpx.Timeout(connect=20.0, read=timeout_sec, write=120.0, pool=10.0)
-    with httpx.Client(timeout=tmo) as client:
-        with client.stream("POST", url, json=payload) as response:
-            response.raise_for_status()
-            for line in response.iter_lines():
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if data.get("done"):
-                    break
-                piece = (data.get("message") or {}).get("content") or ""
-                if piece:
-                    yield piece
-
-
-def _ollama_messages(
+def _base_messages(
     system: str,
     conversation: list[dict] | None,
     user_block: str,
@@ -216,24 +100,11 @@ def prepare_rag_llm_messages(
     user_block: str,
     backend: str,
 ) -> list[dict]:
-    msgs = _ollama_messages(system, conversation, user_block)
+    msgs = _base_messages(system, conversation, user_block)
     if backend in ("groq", "gemini", "openai"):
         msgs = trim_hosted_conversation_messages(msgs)
         msgs = shrink_messages_for_hosted_api(msgs)
     return msgs
-
-
-def _ollama_runtime(fast: bool) -> tuple[str, str, dict, float]:
-    base = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
-    model = default_chat_model(fast)
-    opts = ollama_options(fast)
-    timeout = float(os.environ.get("OLLAMA_HTTP_TIMEOUT", "120" if fast else "300"))
-    return base, model, opts, timeout
-
-
-def ollama_failover_answer(msgs: list[dict], fast: bool) -> str:
-    base, model, opts, timeout = _ollama_runtime(fast)
-    return ollama_chat_messages(msgs, model, base, options=opts, timeout_sec=timeout)
 
 
 def hosted_llm_timeout(fast: bool) -> float:
@@ -266,16 +137,10 @@ def run_sync_llm(backend: str, msgs: list[dict], fast: bool) -> tuple[str, str]:
             ),
             "openai",
         )
-    if os.environ.get("USE_OLLAMA", "1").strip() not in ("1", "true", "yes"):
-        return (
-            "USE_OLLAMA=0 ነው። RAG_LLM_BACKEND=groq ወይም gemini ይመርጡ ወይም USE_OLLAMA=1 ያድርጉ።",
-            backend,
-        )
-    base, model, opts, timeout = _ollama_runtime(fast)
-    try:
-        return ollama_chat_messages(msgs, model, base, options=opts, timeout_sec=timeout), "ollama"
-    except RuntimeError as e:
-        return f"[Ollama]\n{e}", "ollama"
+    return (
+        f"Unsupported backend {backend!r}. RAG_LLM_BACKEND=groq ወይም gemini ይጠቀሙ።",
+        backend,
+    )
 
 
 def iter_primary_llm(backend: str, msgs: list[dict], fast: bool) -> Iterator[str]:
@@ -301,16 +166,4 @@ def iter_primary_llm(backend: str, msgs: list[dict], fast: bool) -> Iterator[str
             timeout_sec=t,
         )
         return
-    if os.environ.get("USE_OLLAMA", "1").strip() not in ("1", "true", "yes"):
-        yield "USE_OLLAMA=0 — RAG_LLM_BACKEND=groq ወይም gemini ይጠቀሙ።"
-        return
-    base, model, opts, timeout = _ollama_runtime(fast)
-    try:
-        yield from iter_ollama_chat(msgs, model, base, options=opts, timeout_sec=timeout)
-    except (RuntimeError, httpx.HTTPError, httpx.RequestError) as e:
-        yield f"[Ollama]\n{e}"
-
-
-def iter_ollama_failover(msgs: list[dict], fast: bool) -> Iterator[str]:
-    base, model, opts, timeout = _ollama_runtime(fast)
-    yield from iter_ollama_chat(msgs, model, base, options=opts, timeout_sec=timeout)
+    yield f"Unsupported backend {backend!r}. RAG_LLM_BACKEND=groq ወይም gemini ይጠቀሙ።"

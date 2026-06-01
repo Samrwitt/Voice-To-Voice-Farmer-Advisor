@@ -71,16 +71,29 @@ def auto_ingest_if_empty() -> dict:
 
     rag_pg.init_pg_schema()
 
-    # Check if already populated
+    # Check if already populated. In normal startup mode we still scan the
+    # configured folders and ingest files that are not already present.
     force_reindex = os.getenv("FORCE_REINDEX_KB", "false").lower() in ("1", "true", "yes")
-    
+    existing_external_ids: set[str] = set()
+
     with psycopg.connect(rag_pg.POSTGRES_URL) as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM rag_kb_chunks;")
             existing = int((cur.fetchone() or [0])[0])
-            
-    if existing > 0 and not force_reindex:
-        return {"enabled": True, "ingested": 0, "skipped": "already_populated", "existing_chunks": existing}
+
+            if existing > 0 and not force_reindex:
+                cur.execute(
+                    """
+                    SELECT external_document_id
+                    FROM rag_kb_documents
+                    WHERE external_document_id IS NOT NULL;
+                    """
+                )
+                existing_external_ids = {
+                    str(row[0]).strip()
+                    for row in (cur.fetchall() or [])
+                    if row and str(row[0]).strip()
+                }
 
     if force_reindex:
         logger.info("FORCE_REINDEX_KB is true. Clearing old data...")
@@ -120,9 +133,15 @@ def auto_ingest_if_empty() -> dict:
     max_files = int(os.getenv("AUTO_INGEST_MAX_FILES", "50"))
     batch_size = int(os.getenv("EMBED_BATCH_SIZE", "16"))
     ingested = 0
+    skipped_existing = 0
     for p in files:
         if ingested >= max_files:
             break
+
+        folder_external_id = f"kb_folder:{p.name}"
+        if not force_reindex and p.suffix.lower() != ".jsonl" and folder_external_id in existing_external_ids:
+            skipped_existing += 1
+            continue
         
         if p.suffix.lower() == ".jsonl":
             import json
@@ -135,6 +154,8 @@ def auto_ingest_if_empty() -> dict:
                     
                     doc_uuid = uuid.uuid4()
                     external_id = f"jsonl:{p.name}:{item.get('id', uuid.uuid4())}"
+                    if not force_reindex and external_id in existing_external_ids:
+                        continue
                     title = item.get("title") or f"KB Item {item.get('id')}"
 
                     chunks = rag_pg.chunk_amharic_text(text)
@@ -166,6 +187,7 @@ def auto_ingest_if_empty() -> dict:
                         upsert_kb_chunks(external_id, title, chunks, kind="kb")
                     except Exception as exc:
                         logger.debug("chroma mirror jsonl: %s", exc)
+                    existing_external_ids.add(external_id)
             ingested += 1
             continue
 
@@ -177,7 +199,7 @@ def auto_ingest_if_empty() -> dict:
         if not chunks:
             continue
 
-        external_id = f"kb_folder:{p.name}"
+        external_id = folder_external_id
         title = p.stem.replace("_", " ").replace("-", " ")
 
         with psycopg.connect(rag_pg.POSTGRES_URL, autocommit=False) as conn:
@@ -232,11 +254,19 @@ def auto_ingest_if_empty() -> dict:
             upsert_kb_chunks(external_id, title, chunks, kind="kb")
         except Exception as exc:
             logger.debug("chroma mirror folder: %s", exc)
+        existing_external_ids.add(external_id)
         ingested += 1
+
+    skipped_reason = None
+    if ingested == 0 and skipped_existing:
+        skipped_reason = "already_up_to_date"
 
     return {
         "enabled": True,
         "ingested": ingested,
+        "skipped": skipped_reason,
+        "skipped_existing": skipped_existing,
+        "existing_chunks_at_start": existing,
         "folders": [str(p) for p in valid_folders],
         "missing_folders": missing_folders,
         "files_seen": len(files),

@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List
 
 
@@ -20,9 +20,12 @@ class ASRResponse(BaseModel):
     semantic_corrected_transcript: Optional[str] = None
     transcript_fix_backend: Optional[str] = None
     final_transcript: str
+    structured_transcript: str
     transcript: str
     text: str
     confidence: float
+    acoustic_confidence: Optional[float] = None
+    fuzzy: dict = Field(default_factory=dict)
 
     engine: str
     audio_id: str

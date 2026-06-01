@@ -36,10 +36,7 @@ TMP_DIR = Path(os.getenv("ASR_TMP_DIR", "/tmp/asr_service"))
 TMP_DIR.mkdir(parents=True, exist_ok=True)
 
 # Post-ASR semantic / typo correction
-# Hosted Groq/Gemini (preferred when keys exist): ASR_HOSTED_LLM_FIX=auto
-USE_HOSTED_LLM_FIX = os.getenv("ASR_HOSTED_LLM_FIX", "auto").strip().lower()
-
-# Ollama fallback when hosted fix is off or fails
-USE_OLLAMA = os.getenv("ASR_USE_OLLAMA", "false").lower() == "true"
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
+# Hosted Groq/Gemini token usage is intentionally disabled for now.
+# To re-enable later, set ASR_HOSTED_LLM_FIX=auto or ASR_HOSTED_LLM_FIX=1
+# and uncomment the hosted block in postprocess._apply_semantic_correction().
+USE_HOSTED_LLM_FIX = os.getenv("ASR_HOSTED_LLM_FIX", "0").strip().lower()

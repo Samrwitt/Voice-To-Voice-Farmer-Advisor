@@ -34,8 +34,8 @@ services:
 
   rag-service:
     build:
-      context: rag_service
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: rag_service/Dockerfile
     container_name: rag_service
     depends_on:
       postgres:
@@ -45,8 +45,8 @@ services:
     environment:
       POSTGRES_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       RAG_PG_MAX_L2_DISTANCE: "1.35"
-      OLLAMA_HOST: http://ollama:11434
-      OLLAMA_MODEL: qwen2.5:7b
+
+
       RAG_ASSISTANT_LLM: "1"
       RAG_PG_RETRIEVE_POOL: "40"
       RAG_PG_FINAL_TOP_K: "6"
@@ -60,8 +60,10 @@ services:
       AUTO_INGEST_KB_DIR: /app/kb_documents/amharic
       AUTO_INGEST_KB_DIRS: /app/kb_documents/amharic,/app/RAG/KB
       AUTO_INGEST_ON_STARTUP: "true"
-      FORCE_REINDEX_KB: "true"
+      FORCE_REINDEX_KB: "false"
       AUTO_INGEST_MAX_FILES: "100"
+      RAG_CHROMA_RETRIEVE: "0"
+      RAG_CHROMA_MIRROR: "0"
       EMBED_BATCH_SIZE: "8"
       HF_TOKEN: ${HF_TOKEN}
       HF_HUB_ETAG_TIMEOUT: "60"
@@ -78,10 +80,16 @@ services:
       CALL_RECORDING_RETENTION_DAYS: "30"
       RAG_AGROCHEM_EXPERT_ONLY: "1"
       RAG_VOICE_LOW_CONF_ESCALATE: "1"
+      RAG_ESCALATE_OUT_OF_DOMAIN: "1"
+      RAG_OUT_OF_DOMAIN_NLU_CONFIDENCE: "0.35"
+      RAG_COMPLEX_ESCALATION_CONFIDENCE: "0.45"
       RAG_RESPONSE_CACHE_TTL_SEC: "120"
       RAG_RESPONSE_CACHE_MAX: "512"
       RAG_SMART_PIPELINE: ${RAG_SMART_PIPELINE:-1}
       RAG_SMART_FINAL_BACKEND: ${RAG_SMART_FINAL_BACKEND:-gemini}
+      COPERNICUS_CLIENT_ID: ${COPERNICUS_CLIENT_ID:-}
+      COPERNICUS_CLIENT_SECRET: ${COPERNICUS_CLIENT_SECRET:-}
+      COPERNICUS_SWI_COLLECTION_ID: ${COPERNICUS_SWI_COLLECTION_ID:-f2278442-eb7f-4926-93e9-7a382f567fb4}
       RAG_LLM_BACKEND: ${RAG_LLM_BACKEND:-gemini}
       GROQ_API_KEYS: ${GROQ_API_KEYS:-}
       GROQ_API_KEY: ${GROQ_API_KEY:-}
@@ -90,6 +98,8 @@ services:
       GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
       GROQ_GEMINI_FALLBACK: ${GROQ_GEMINI_FALLBACK:-1}
       RAG_API_KEY_COOLDOWN_SEC: ${RAG_API_KEY_COOLDOWN_SEC:-90}
+      TQDM_DISABLE: "1"
+      TOKENIZERS_PARALLELISM: "false"
     volumes:
       - ./kb_documents:/app/kb_documents:ro
       - ./RAG:/app/RAG:ro
@@ -112,6 +122,26 @@ services:
       RECORDINGS_DIR: /app/recordings
       VAD_WS_BASE_URL: ws://vad-service:8010/ws/vad
       TTS_SERVICE_URL: http://tts-service:8009/synthesize
+      SIP_AUDIOSOCKET_ENABLED: "true"
+      SIP_AUDIOSOCKET_HOST: 0.0.0.0
+      SIP_AUDIOSOCKET_PORT: "9092"
+      SIP_AUDIOSOCKET_SAMPLE_RATE: "16000"
+      SIP_ALERT_AUDIOSOCKET_ENABLED: "true"
+      SIP_ALERT_AUDIOSOCKET_PORT: "9093"
+      SIP_ALERT_AUDIOSOCKET_SAMPLE_RATE: "8000"
+      SIP_ALERT_AUDIOSOCKET_CONNECT_HOST: phone-gateway
+      ASTERISK_AMI_HOST: sip-gateway
+      ASTERISK_AMI_PORT: "5038"
+      ASTERISK_AMI_USERNAME: ${ASTERISK_AMI_USERNAME:-farmer_admin}
+      ASTERISK_AMI_PASSWORD: ${ASTERISK_AMI_PASSWORD:-farmer_admin_dev}
+      SIP_ALERT_DEFAULT_ENDPOINT: ${SIP_ALERT_DEFAULT_ENDPOINT:-farmeruhamayohannes}
+      SIP_PLAY_OPENING_GREETING: "true"
+      SIP_DEFAULT_CALLER_PHONE_NUMBER: "sip:farmeruhamayohannes"
+      SIP_DEFAULT_CALLER_NAME: "Ruhama SIP Farmer"
+      SIP_TTS_CHUNK_MAX_CHARS: "140"
+      SIP_CHECK_ENDPOINT_CONTACTS: "1"
+      SIP_AUDIO_LOG_EVERY: "0"
+      SIP_EVENT_LOGS: "1"
       S3_ENDPOINT_URL: http://minio:9000
       S3_REGION: us-east-1
       S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID}
@@ -124,10 +154,29 @@ services:
       DEFAULT_ADMIN_PASSWORD: ${DEFAULT_ADMIN_PASSWORD}
       RESET_DEFAULT_ADMIN_PASSWORD: "false"
     ports:
-      - "8000:8000"
+      - "8000:8004"
+    expose:
+      - "9092"
+      - "9093"
     volumes:
       - call_recordings:/app/recordings
       - vad_utterances:/app/utterances:ro
+      - logic_data:/app/data:ro
+
+  sip-gateway:
+    build:
+      context: phone_gateway/asterisk
+      dockerfile: Dockerfile
+    container_name: farmer_advisor_sip_gateway
+    depends_on:
+      phone-gateway:
+        condition: service_started
+    ports:
+      - "5062:5060/udp"
+      - "5062:5060/tcp"
+      - "10000-10050:10000-10050/udp"
+    expose:
+      - "5038"
 
   pgadmin:
     image: dpage/pgadmin4
@@ -160,9 +209,26 @@ services:
       RAG_SERVICE_URL: http://rag-service:8000
       TTS_SERVICE_URL: http://tts-service:8009
       VAD_UTTERANCES_DIR: /app/utterances
+      VAD_THRESHOLD: "0.58"
+      VAD_CANDIDATE_THRESHOLD: "0.38"
+      VAD_CONTINUE_THRESHOLD: "0.28"
+      VAD_ENERGY_THRESHOLD: "0.012"
+      VAD_ENERGY_MIN_SPEECH_PROB: "0.20"
+      VAD_MIN_SPEECH_MS: "128"
+      VAD_SPEECH_START_GAP_MS: "96"
+      VAD_END_SILENCE_MS: "520"
+      VAD_TTS_MAX_SENTENCES: "0"
+      VAD_TTS_MAX_CHARS: "0"
+      VAD_TTS_SINGLE_CHUNK_MAX_CHARS: "180"
+      VAD_TTS_CHUNK_MAX_CHARS: "140"
+      VAD_AUDIO_LOG_EVERY: "0"
       MAX_CONCURRENT_ASR: 2
+      VAD_ASR_CONFIRMATION_GATE: "1"
+      VAD_CONFIRMATION_MIN_WORDS: "3"
+      VAD_CONFIRMATION_MIN_CONFIDENCE: "0.68"
     volumes:
       - vad_utterances:/app/utterances
+      - logic_data:/app/data:ro
 
   asr-service:
     build:
@@ -175,40 +241,36 @@ services:
       ASR_ENGINE: ${ASR_ENGINE:-whisper_local}
       ASR_MODEL_PATH: ${ASR_MODEL_PATH:-/models/asr/whisper-small-amharic-bdu-8khz-aug-ct2-fp16}
       SHARED_UTTERANCES_DIR: /shared/utterances
-      ASR_HOSTED_LLM_FIX: ${ASR_HOSTED_LLM_FIX:-auto}
-      ASR_LLM_FIX_BACKEND: ${ASR_LLM_FIX_BACKEND:-gemini}
-      GROQ_API_KEYS: ${GROQ_API_KEYS:-}
-      GROQ_API_KEY: ${GROQ_API_KEY:-}
-      FREE_GEMINI_API_KEYS: ${FREE_GEMINI_API_KEYS:-}
-      FREE_GEMINI_API_KEY: ${FREE_GEMINI_API_KEY:-}
-      GEMINI_API_KEYS: ${GEMINI_API_KEYS:-}
-      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
-      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
-      ASR_USE_SHARED_GEMINI_KEYS: ${ASR_USE_SHARED_GEMINI_KEYS:-0}
-      ASR_LLM_FIX_MAX_KEYS_PER_REQUEST: ${ASR_LLM_FIX_MAX_KEYS_PER_REQUEST:-1}
-      ASR_USE_OLLAMA: ${ASR_USE_OLLAMA:-false}
-      OLLAMA_URL: http://ollama:11434
-      OLLAMA_MODEL: qwen2.5:7b
-    depends_on:
-      - ollama
+      ASR_HOSTED_LLM_FIX: "0"
+      # ASR hosted-token correction is commented out for now.
+      # ASR_LLM_FIX_BACKEND: ${ASR_LLM_FIX_BACKEND:-gemini}
+      # GROQ_API_KEYS: ${GROQ_API_KEYS:-}
+      # GROQ_API_KEY: ${GROQ_API_KEY:-}
+      # FREE_GEMINI_API_KEYS: ${FREE_GEMINI_API_KEYS:-}
+      # FREE_GEMINI_API_KEY: ${FREE_GEMINI_API_KEY:-}
+      # GEMINI_API_KEYS: ${GEMINI_API_KEYS:-}
+      # GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      # GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      # ASR_USE_SHARED_GEMINI_KEYS: ${ASR_USE_SHARED_GEMINI_KEYS:-0}
+      # ASR_LLM_FIX_MAX_KEYS_PER_REQUEST: ${ASR_LLM_FIX_MAX_KEYS_PER_REQUEST:-1}
+
+
+
+      ASR_DOMAIN_TERMS_PATHS: /app/RAG/KB,/app/kb_documents/amharic
+      ASR_DOMAIN_TERMS_MAX_FILES: "160"
+      ASR_DOMAIN_TERMS_MAX_TERMS: "1800"
+      ASR_DOMAIN_TERM_FUZZY_THRESHOLD: "84"
+      ASR_CONFIRMATION_MIN_WORDS: "3"
+      ASR_CONFIRMATION_UNUSUAL_RATIO: "0.55"
+      ASR_CONFIRMATION_MIN_UNUSUAL_WORDS: "2"
+      ASR_CONFIRMATION_MIN_CONFIDENCE: "0.68"
+
     volumes:
       - vad_utterances:/shared/utterances:ro
       - ./models/asr:/models/asr
+      - ./RAG:/app/RAG:ro
+      - ./kb_documents:/app/kb_documents:ro
 
-  ollama:
-    image: ollama/ollama:latest
-    container_name: ollama_service
-    ports:
-      - "11435:11434"
-    volumes:
-      - ollama_data:/root/.ollama
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: 1
-    #           capabilities: [gpu]
 
 
 
@@ -222,6 +284,10 @@ services:
         condition: service_completed_successfully
     ports:
       - "8009:8009"
+    environment:
+      TTS_SAMPLE_RATE: "16000"
+      TTS_ATEMPO: "1.5"
+      TTS_VOLUME: "1.5"
 
   admin-dashboard:
     image: farmer-advisor-admin-dashboard
@@ -233,7 +299,7 @@ services:
       - logic-service
     ports:
       # Host 3000 is often taken (other Next.js, Grafana, etc.). Override: ADMIN_DASHBOARD_PORT=3000
-      - "${ADMIN_DASHBOARD_PORT:-3001}:3000"
+      - "${ADMIN_DASHBOARD_PORT:-3000}:3000"
     environment:
       NODE_ENV: production
       NEXT_TELEMETRY_DISABLED: 1
@@ -287,7 +353,13 @@ services:
       VAD_HEALTH_URL: "http://vad-service:8010/health"
       ASR_HEALTH_URL: "http://asr-service:8001/docs"
       TTS_HEALTH_URL: "http://tts-service:8000/docs"
-      PHONE_GATEWAY_URL: "http://phone-gateway:8000/health"
+      PHONE_GATEWAY_URL: "http://phone-gateway:8004/health"
+      PHONE_GATEWAY_ALERT_CALL_URL: "http://phone-gateway:8004"
+      PHONE_GATEWAY_EXPERT_CALLBACK_URL: "http://phone-gateway:8004"
+      EXPERT_RESPONSE_CALL_ENABLED: "1"
+      EXPERT_RESPONSE_CALLBACK_WAIT_SECONDS: "300"
+      EXPERT_RESPONSE_CALLBACK_POLL_SECONDS: "5"
+      ALERT_CALL_MAX_RECIPIENTS: ${ALERT_CALL_MAX_RECIPIENTS:-50}
       RAG_SERVICE_URL: "http://rag-service:8000"
       ESCALATION_SLA_HOURS: "48"
       S3_ENDPOINT_URL: http://minio:9000
@@ -295,10 +367,12 @@ services:
       S3_REGION: us-east-1
       S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID}
       S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY}
+      S3_BUCKET: farmer-advisor-media
 
       DATA_DIR: "/app/data"
     volumes:
       - logic_data:/app/data
+      - call_recordings:/app/recordings:ro
       - ./models:/models
 
 volumes:
@@ -306,7 +380,7 @@ volumes:
   call_recordings:
   pgadmin_data:
   vad_utterances:
-  ollama_data:
+
 
   logic_data:
   minio_data:

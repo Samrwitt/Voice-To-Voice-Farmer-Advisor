@@ -7,8 +7,8 @@ from typing import Any
 
 # Short Amharic footer when ``RAG_TRUST_FOOTER=1`` (informational-only disclaimer).
 TRUST_FOOTER_AM = (
-    "ማሳሰቢያ፦ እነዚህ ምክሮች ከመርሃ መመሪያ ሰነዶች የተገነዘቡ አጠቃላይ መረጃዎች ብቻ ናቸው። "
-    "ለመርቢያ እርሻ ጉዳዮች በአካል ባለሙያ ይጠይቁ።"
+    "ማሳሰቢያ፦ ምክሩ በተገኘው መረጃ ላይ የተመሠረተ ነው፤ "
+    "የአካባቢ ሁኔታ ከተለየ ውጤቱ ሊለይ ይችላል።"
 )
 
 

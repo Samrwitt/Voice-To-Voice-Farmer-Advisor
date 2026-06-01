@@ -1,12 +1,10 @@
-"""Hosted LLM backends (Groq, Gemini) + helpers. Ollama stays in query.py.
+"""Hosted LLM backends (Groq, Gemini) + helpers.
 
 **Multiple team keys:** set ``GROQ_API_KEYS`` and/or ``GEMINI_API_KEYS`` (comma-separated) so each
 teammate's free-tier key is rotated round-robin; on 429/503 the next key is tried automatically.
 
 Groq → Gemini: when ``RAG_LLM_BACKEND`` is groq and all Groq keys fail, ``groq_*_with_gemini_fallback``
 calls Gemini (also pooled via ``GEMINI_API_KEYS`` / ``GEMINI_API_KEY``). Disable with ``GROQ_GEMINI_FALLBACK=0``.
-
-When both hosted calls fail, ``query.py`` can fall back to local Ollama (``RAG_HOSTED_FALLBACK_OLLAMA``).
 """
 
 from __future__ import annotations
@@ -16,6 +14,7 @@ import os
 import random
 import re
 import time
+import hashlib
 from pathlib import Path
 
 import httpx
@@ -27,6 +26,10 @@ from .api_key_pool import (
     groq_pool,
     run_with_key_pool,
 )
+
+
+_gemini_cached_content: dict[tuple[str, str, str], tuple[float, str]] = {}
+_gemini_cache_disabled_until: dict[tuple[str, str, str], float] = {}
 
 
 def load_dotenv_if_present() -> None:
@@ -67,23 +70,17 @@ def _is_rate_limit_error(exc: BaseException) -> bool:
 
 
 def effective_llm_backend() -> str:
-    """groq | gemini | ollama | openai — see RAG_LLM_BACKEND, auto if unset."""
+    """groq | gemini | openai — see RAG_LLM_BACKEND, auto if unset."""
     b = os.environ.get("RAG_LLM_BACKEND", "").strip().lower()
-    if b in ("groq", "gemini", "ollama", "openai"):
+    if b in ("groq", "gemini", "openai"):
         return b
-    # Use local Ollama first when keys exist but you want zero API unless Ollama fails (no auto-up to API).
-    if os.environ.get("RAG_LOCAL_FIRST", "").strip().lower() in ("1", "true", "yes", "ollama"):
-        if os.environ.get("USE_OLLAMA", "1").strip().lower() in ("1", "true", "yes"):
-            return "ollama"
     if gemini_api_keys():
         return "gemini"
     if groq_api_keys():
         return "groq"
-    if os.environ.get("USE_OLLAMA", "1").strip() in ("1", "true", "yes"):
-        return "ollama"
     if os.environ.get("OPENAI_API_KEY", "").strip():
         return "openai"
-    return "ollama"
+    return "gemini"
 
 
 def groq_model(fast: bool) -> str:
@@ -113,7 +110,7 @@ def _groq_backoff_sec(attempt_index: int) -> float:
 def _groq_rate_limit_hint() -> str:
     return (
         "Groq የጥያቄ ወሰን (429) — ከአንድ ወደ ሁለት ደቂቃ በኋላ ይሞክሩ፣ ወይም "
-        "`.env` ውስጥ `RAG_LLM_BACKEND=gemini` ወይም `ollama` ያዘጋጁ።"
+        "`.env` ውስጥ `RAG_LLM_BACKEND=gemini` ያዘጋጁ።"
     )
 
 
@@ -135,7 +132,7 @@ def openai_style_chat(
         "model": model,
         "messages": messages,
         "temperature": 0.12 if "llama" in model.lower() else 0.15,
-        "max_tokens": int(os.environ.get("RAG_MAX_OUTPUT_TOKENS", "2048")),
+        "max_tokens": int(os.environ.get("RAG_MAX_OUTPUT_TOKENS", "400")),
     }
     tmo = httpx.Timeout(connect=30.0, read=timeout_sec, write=120.0, pool=10.0)
     is_groq = "api.groq.com" in base_url
@@ -206,7 +203,7 @@ def _iter_groq_stream_with_key(
         "model": groq_model(fast),
         "messages": messages,
         "temperature": 0.12,
-        "max_tokens": int(os.environ.get("RAG_MAX_OUTPUT_TOKENS", "2048")),
+        "max_tokens": int(os.environ.get("RAG_MAX_OUTPUT_TOKENS", "400")),
         "stream": True,
     }
     tmo = httpx.Timeout(connect=30.0, read=timeout_sec, write=120.0, pool=10.0)
@@ -298,6 +295,91 @@ def _gemini_backoff_sec(attempt_index: int, response_text: str) -> float:
     return min(cap, base * (2**attempt_index) + random.uniform(0.0, 0.5))
 
 
+def gemini_context_cache_enabled() -> bool:
+    return os.getenv("GEMINI_CONTEXT_CACHE", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _gemini_context_cache_ttl_sec() -> int:
+    raw = os.getenv("GEMINI_CONTEXT_CACHE_TTL_SEC", "3600").strip()
+    try:
+        return max(60, int(raw))
+    except ValueError:
+        return 3600
+
+
+def _gemini_context_cache_min_chars() -> int:
+    # Explicit caching has a minimum token threshold on current Gemini models.
+    # Use a char gate so short prompts do not pay an extra create-cache roundtrip.
+    raw = os.getenv("GEMINI_CONTEXT_CACHE_MIN_CHARS", "1200").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 1200
+
+
+def _gemini_model_resource_name(model: str) -> str:
+    return model if model.startswith("models/") else f"models/{model}"
+
+
+def _gemini_cache_signature(model: str, key: str, system_text: str) -> tuple[str, str, str]:
+    key_hash = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+    prompt_hash = hashlib.sha256(system_text.encode("utf-8")).hexdigest()
+    return model, key_hash, prompt_hash
+
+
+def _gemini_cached_content_name(
+    *,
+    key: str,
+    model: str,
+    system_text: str,
+    timeout_sec: float,
+) -> str | None:
+    if not gemini_context_cache_enabled():
+        return None
+    if len(system_text or "") < _gemini_context_cache_min_chars():
+        return None
+
+    sig = _gemini_cache_signature(model, key, system_text)
+    now = time.time()
+    disabled_until = _gemini_cache_disabled_until.get(sig, 0)
+    if disabled_until > now:
+        return None
+
+    cached = _gemini_cached_content.get(sig)
+    if cached and cached[0] > now + 10:
+        return cached[1]
+
+    ttl = _gemini_context_cache_ttl_sec()
+    url = f"https://generativelanguage.googleapis.com/v1beta/cachedContents?key={key}"
+    body = {
+        "model": _gemini_model_resource_name(model),
+        "systemInstruction": {"parts": [{"text": system_text}]},
+        "ttl": f"{ttl}s",
+        "displayName": f"farmer-rag-system-{sig[2][:12]}",
+    }
+    tmo = httpx.Timeout(connect=10.0, read=min(timeout_sec, 30.0), write=30.0, pool=10.0)
+    try:
+        with httpx.Client(timeout=tmo) as client:
+            r = client.post(url, json=body)
+        if r.status_code >= 400:
+            _gemini_cache_disabled_until[sig] = now + float(
+                os.getenv("GEMINI_CONTEXT_CACHE_FAILURE_BACKOFF_SEC", "600")
+            )
+            return None
+        data = r.json()
+    except Exception:
+        _gemini_cache_disabled_until[sig] = now + float(
+            os.getenv("GEMINI_CONTEXT_CACHE_FAILURE_BACKOFF_SEC", "600")
+        )
+        return None
+
+    name = str(data.get("name") or "").strip()
+    if not name:
+        return None
+    _gemini_cached_content[sig] = (now + ttl, name)
+    return name
+
+
 def _gemini_chat_with_key(
     messages: list[dict],
     *,
@@ -317,10 +399,20 @@ def _gemini_chat_with_key(
         "contents": contents,
         "generationConfig": {
             "temperature": 0.15,
-            "maxOutputTokens": int(os.environ.get("RAG_MAX_OUTPUT_TOKENS", "2048")),
+            "maxOutputTokens": int(os.environ.get("RAG_MAX_OUTPUT_TOKENS", "400")),
         },
     }
+    cache_name = None
     if system_text:
+        cache_name = _gemini_cached_content_name(
+            key=key,
+            model=model,
+            system_text=system_text,
+            timeout_sec=timeout_sec,
+        )
+    if cache_name:
+        body["cachedContent"] = cache_name
+    elif system_text:
         body["systemInstruction"] = {"parts": [{"text": system_text}]}
     tmo = httpx.Timeout(connect=30.0, read=timeout_sec, write=120.0, pool=10.0)
     per_key_attempts = min(2, _gemini_retry_attempts())

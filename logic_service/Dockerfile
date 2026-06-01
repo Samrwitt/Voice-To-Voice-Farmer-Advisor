@@ -1,6 +1,9 @@
 FROM farmer-advisor-base
 WORKDIR /app
 
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements-common.txt .
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --default-timeout=100 --retries=10 -r requirements-common.txt

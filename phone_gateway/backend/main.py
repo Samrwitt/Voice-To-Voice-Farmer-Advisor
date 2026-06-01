@@ -1,6 +1,8 @@
 import asyncio
 import json
 import os
+import socket
+import time
 import uuid
 from pathlib import Path
 
@@ -12,12 +14,24 @@ from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 import httpx
 
+from backend.ami_utils import (
+    ami_action as _ami_action,
+    ami_contacts_include_endpoint,
+    sip_endpoint_for_alert as _sip_endpoint_for_alert,
+)
 from backend.database import Base, engine, SessionLocal
 from backend.models import Caller
 from backend.sessions import create_session, end_session
 from backend.recorder import AudioRecorder
 from backend.callers import create_or_get_caller
 from backend.auth.routes import router as auth_router
+from backend.sip_audio import (
+    register_alert_call_payload,
+    start_alert_audiosocket_server,
+    start_sip_audiosocket_server,
+    stop_alert_audiosocket_server,
+    stop_sip_audiosocket_server,
+)
 
 from backend.monitor_state import (
     start_call_monitor,
@@ -48,7 +62,7 @@ seed_default_admin()
 # FastAPI App
 # ============================================================
 
-app = FastAPI(title="Phone Browser Telephony Gateway")
+app = FastAPI(title="SIP Telephony Gateway")
 
 # Auth routes:
 # POST /api/auth/login
@@ -97,6 +111,21 @@ class TtsSynthesizeBody(BaseModel):
     """Proxy to tts-service for browser playback (same-origin; avoids exposing internal URLs)."""
 
     text: str
+
+
+class AlertCallRequest(BaseModel):
+    alert_id: int
+    phone_number: str
+    target_region: str | None = None
+    alert_message: str
+    severity: str = "warning"
+
+
+class ExpertResponseCallRequest(BaseModel):
+    escalation_id: int
+    phone_number: str
+    expert_audio_path: str
+    message: str | None = None
 
 
 @app.post("/api/tts/synthesize")
@@ -165,6 +194,88 @@ def get_caller_details(caller_id: str | None):
 
     finally:
         db.close()
+
+
+def _ami_originate_alert_call(call_id: str, endpoint: str) -> str:
+    host = os.getenv("ASTERISK_AMI_HOST", "sip-gateway")
+    port = int(os.getenv("ASTERISK_AMI_PORT", "5038"))
+    username = os.getenv("ASTERISK_AMI_USERNAME", "farmer_admin")
+    secret = os.getenv("ASTERISK_AMI_PASSWORD", "farmer_admin_dev")
+    timeout_ms = os.getenv("SIP_ALERT_CALL_TIMEOUT_MS", "30000")
+    audiosocket_host = os.getenv("SIP_ALERT_AUDIOSOCKET_CONNECT_HOST", "phone-gateway")
+    audiosocket_port = os.getenv("SIP_ALERT_AUDIOSOCKET_PORT", "9093")
+    channel = f"PJSIP/{endpoint}"
+
+    def _recv_until(marker: str | None = None, timeout_sec: float = 2.0) -> str:
+        deadline = time.monotonic() + timeout_sec
+        chunks: list[bytes] = []
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            sock.settimeout(min(0.5, remaining))
+            try:
+                chunk = sock.recv(8192)
+            except TimeoutError:
+                break
+            if not chunk:
+                break
+            chunks.append(chunk)
+            text = b"".join(chunks).decode("utf-8", errors="ignore")
+            if marker and marker in text:
+                return text
+            if not marker and "\r\n\r\n" in text:
+                return text
+        return b"".join(chunks).decode("utf-8", errors="ignore")
+
+    with socket.create_connection((host, port), timeout=5) as sock:
+        sock.settimeout(5)
+        try:
+            sock.recv(4096)
+        except TimeoutError:
+            pass
+        sock.sendall(
+            _ami_action(
+                {
+                    "Action": "Login",
+                    "Username": username,
+                    "Secret": secret,
+                    "Events": "off",
+                }
+            )
+        )
+        login_resp = _recv_until(timeout_sec=3.0)
+        if "Success" not in login_resp:
+            raise RuntimeError(f"AMI login failed: {login_resp.strip()[:200]}")
+
+        if os.getenv("SIP_CHECK_ENDPOINT_CONTACTS", "1").strip().lower() in ("1", "true", "yes", "on"):
+            sock.sendall(_ami_action({"Action": "Command", "Command": "pjsip show contacts"}))
+            contacts_resp = _recv_until("--END COMMAND--", timeout_sec=3.0)
+            if not ami_contacts_include_endpoint(contacts_resp, endpoint):
+                raise RuntimeError(
+                    f"SIP endpoint '{endpoint}' has no registered contacts. "
+                    "Open/register the softphone before expert callback calls can ring."
+                )
+
+        sock.sendall(
+            _ami_action(
+                {
+                    "Action": "Originate",
+                    "ActionID": call_id,
+                    "Channel": channel,
+                    "Application": "AudioSocket",
+                    "Data": f"{call_id},{audiosocket_host}:{audiosocket_port}",
+                    "CallerID": "Farmer Alert <8028>",
+                    "Timeout": timeout_ms,
+                    "Async": "true",
+                }
+            )
+        )
+        originate_resp = _recv_until(timeout_sec=3.0)
+        sock.sendall(_ami_action({"Action": "Logoff"}))
+        if "Error" in originate_resp:
+            raise RuntimeError(originate_resp.strip()[:300])
+        return originate_resp.strip()[:300] or "originate_sent"
 
 
 def calculate_pcm16_audio_level(pcm_bytes: bytes) -> float:
@@ -429,7 +540,115 @@ def health_check():
     return {
         "status": "ok",
         "service": "phone-gateway",
+        "telephony": "sip-audiosocket",
     }
+
+
+@app.post("/api/alerts/call")
+async def place_alert_call(req: AlertCallRequest):
+    """Originate a SIP call and play an alert message through AudioSocket."""
+    phone = (req.phone_number or "").strip()
+    message = (req.alert_message or "").strip()
+    if not phone or not message:
+        raise HTTPException(status_code=400, detail="phone_number and alert_message are required")
+
+    call_id = str(uuid.uuid4())
+    endpoint = _sip_endpoint_for_alert(phone)
+    register_alert_call_payload(
+        call_id,
+        {
+            "alert_id": req.alert_id,
+            "phone_number": phone,
+            "target_region": req.target_region,
+            "alert_message": message,
+            "severity": req.severity,
+        },
+    )
+    try:
+        provider_ref = await asyncio.to_thread(_ami_originate_alert_call, call_id, endpoint)
+    except Exception as exc:
+        add_event(
+            "alert_call_originate_failed",
+            {"call_id": call_id, "phone_number": phone, "endpoint": endpoint, "error": str(exc)},
+        )
+        raise HTTPException(status_code=503, detail=f"Could not originate alert call: {exc}") from exc
+
+    add_event(
+        "alert_call_originated",
+        {"call_id": call_id, "phone_number": phone, "endpoint": endpoint, "provider_ref": provider_ref},
+    )
+    return {
+        "status": "queued",
+        "call_id": call_id,
+        "phone_number": phone,
+        "sip_endpoint": endpoint,
+        "provider_ref": provider_ref,
+    }
+
+
+@app.post("/api/expert-responses/call")
+async def place_expert_response_call(req: ExpertResponseCallRequest):
+    """Originate a SIP call and play a recorded expert response."""
+    phone = (req.phone_number or "").strip()
+    audio_path = (req.expert_audio_path or "").strip()
+    if not phone or not audio_path:
+        raise HTTPException(
+            status_code=400,
+            detail="phone_number and expert_audio_path are required",
+        )
+
+    call_id = str(uuid.uuid4())
+    endpoint = _sip_endpoint_for_alert(phone)
+    register_alert_call_payload(
+        call_id,
+        {
+            "kind": "expert_response",
+            "escalation_id": req.escalation_id,
+            "phone_number": phone,
+            "target_region": "expert_response",
+            "alert_message": (req.message or "").strip(),
+            "expert_audio_path": audio_path,
+            "severity": "expert_response",
+        },
+    )
+    try:
+        provider_ref = await asyncio.to_thread(_ami_originate_alert_call, call_id, endpoint)
+    except Exception as exc:
+        add_event(
+            "expert_response_call_originate_failed",
+            {"call_id": call_id, "phone_number": phone, "endpoint": endpoint, "error": str(exc)},
+        )
+        raise HTTPException(status_code=503, detail=f"Could not originate expert response call: {exc}") from exc
+
+    add_event(
+        "expert_response_call_originated",
+        {
+            "call_id": call_id,
+            "escalation_id": req.escalation_id,
+            "phone_number": phone,
+            "endpoint": endpoint,
+            "provider_ref": provider_ref,
+        },
+    )
+    return {
+        "status": "queued",
+        "call_id": call_id,
+        "phone_number": phone,
+        "sip_endpoint": endpoint,
+        "provider_ref": provider_ref,
+    }
+
+
+@app.on_event("startup")
+async def startup_sip_audiosocket():
+    await start_sip_audiosocket_server()
+    await start_alert_audiosocket_server()
+
+
+@app.on_event("shutdown")
+async def shutdown_sip_audiosocket():
+    await stop_alert_audiosocket_server()
+    await stop_sip_audiosocket_server()
 
 
 # ============================================================

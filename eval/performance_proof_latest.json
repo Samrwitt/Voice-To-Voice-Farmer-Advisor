@@ -1,0 +1,142 @@
+{
+  "base_url": "http://127.0.0.1:8004",
+  "metrics": {
+    "cases_total": 12,
+    "cases_passed": 12,
+    "case_pass_rate_pct": 100.0,
+    "scenario_accuracy_pct": 100.0,
+    "scenario_cases": 7,
+    "expected_grounding_accuracy_pct": 100.0,
+    "expected_grounding_cases": 5,
+    "forbidden_grounding_pass_rate_pct": 100.0,
+    "forbidden_grounding_cases": 3,
+    "latency_ms_mean": 3651.3,
+    "latency_ms_p50": 383.1,
+    "latency_ms_p95": 13557.6,
+    "latency_ms_max": 13557.6,
+    "avg_references": 1
+  },
+  "cases": [
+    {
+      "id": "greeting_amharic",
+      "ok": true,
+      "latency_ms": 87.6,
+      "trust_latency_ms": null,
+      "grounding": "greeting",
+      "scenario": "greeting_only",
+      "references": 0,
+      "response_preview": "በምን የግብርና ጥያቄ ልርዳዎት?"
+    },
+    {
+      "id": "wheat_altitude",
+      "ok": true,
+      "latency_ms": 10787.3,
+      "trust_latency_ms": 10599.5,
+      "grounding": "kb_unknown",
+      "scenario": "crop_production",
+      "references": 3,
+      "response_preview": "ችሉ የመስኖ መሠረተ-ልማቶች መሟላታቸውን ማረጋገጥ ያስፈልጋል፡፡ የአፈር ጨዋማነት እንዳይስፋፋ የመስኖ ውሃን በአግባቡ መጠቀም አስፈላጊ ነው፡፡ ውሃው ማሳ ላይ እንዳይተኛ ማድረግና ከተኛም ቶሎ ማጠንፈፍ ያስፈልጋል፡፡ በተጨማሪም አፈሩ ጨዋማ ከሆነ በማጠብ"
+    },
+    {
+      "id": "wheat_production_no_escalation",
+      "ok": true,
+      "latency_ms": 4492.5,
+      "trust_latency_ms": 4406.0,
+      "grounding": "kb_unknown",
+      "scenario": "crop_production",
+      "references": 3,
+      "response_preview": "ptoria spp) የስንዴ ቅጠል ቆርምድ በሽታ አምጪ ተህዋስ Septoria tritici blotch ስሆን የዛላ ምች በሽታን የሚያስከትለው ደግሞ Septoria nodorum blotch በመባል ይታወቃል፡፡ ለበሽታ አምጭ ተህዋስ ወበቃማና በአማካኝ ከ20-2"
+    },
+    {
+      "id": "fertilizer_general",
+      "ok": true,
+      "latency_ms": 198.7,
+      "trust_latency_ms": 194.8,
+      "grounding": "clarification",
+      "scenario": "fertilizer",
+      "references": 0,
+      "response_preview": "ለማዳበሪያ ምክር ሰብል እና አካባቢውን ይንገሩኝ። ለምሳሌ፦ ስንዴ በደጋ።"
+    },
+    {
+      "id": "wheat_fertilizer_region_clarification",
+      "ok": true,
+      "latency_ms": 299.9,
+      "trust_latency_ms": 294.6,
+      "grounding": "clarification",
+      "scenario": "fertilizer",
+      "references": 0,
+      "response_preview": "ለየትኛው አካባቢ ነው? (ደጋ፣ ቆላ ወይም ወይና ደጋ)"
+    },
+    {
+      "id": "teff_price_intent",
+      "ok": true,
+      "latency_ms": 1093.2,
+      "trust_latency_ms": 1006.0,
+      "grounding": "tools",
+      "scenario": "market_price",
+      "references": 0,
+      "response_preview": "የጤፍ ዋጋ በAsayta 14000.0 ብር/100 ኪሎ ግራም ነው። አዝማሚያው እየቀነሰ ነው። ዋጋው እየቀነሰ ከሆነ ብዙ ጊዜ ከመጠበቅ በፊት የአካባቢ ገበያን ያረጋግጡ። የመረጃው ቀን: 2026-03-15። የዋጋ አይነት: Retail። ይህ በመዝገቡ ያለ የመ"
+    },
+    {
+      "id": "weather_missing_location_clarifies",
+      "ok": true,
+      "latency_ms": 199.4,
+      "trust_latency_ms": 197.3,
+      "grounding": "clarification",
+      "scenario": "weather",
+      "references": 0,
+      "response_preview": "የአየር ሁኔታ ለየትኛው አካባቢ ነው የሚፈልጉት?"
+    },
+    {
+      "id": "coffee_pest",
+      "ok": true,
+      "latency_ms": 12076.3,
+      "trust_latency_ms": 11900.6,
+      "grounding": "kb_unknown",
+      "scenario": "pest_disease",
+      "references": 3,
+      "response_preview": "ጥያቄ፦ ለቡና ፍሬው የእቅፉ ጠቀሜታ ምንድነው? ምላሽ፦ እቅፉ፣ የዘር ኮት በመባልም ይታወቃል፣ የቡና ፍሬው ውጫዊው ሽፋን ነው። የቡና ፍሬ በማደግ እና በማቀነባበር ወቅት እንደ መከላከያ ሽፋን ሆኖ ያገለግላል. እንደ እርጥበት፣ነፍሳት እና አካላዊ ጉዳት "
+    },
+    {
+      "id": "compost_benefit",
+      "ok": true,
+      "latency_ms": 426.8,
+      "trust_latency_ms": 251.4,
+      "grounding": "tools",
+      "scenario": "fertilizer",
+      "references": 0,
+      "response_preview": "ኮምፖስት የአፈርን ኦርጋኒክ ንጥረ ነገር ይጨምራል፣ የውሃ መያዝ አቅምን ያሻሽላል፣ አፈርን ለሰብል ሥር ይለሰልሳል፣ እና ኬሚካል ማዳበሪያን ብቻ መመካትን ይቀንሳል።"
+    },
+    {
+      "id": "barley_region",
+      "ok": true,
+      "latency_ms": 13557.6,
+      "trust_latency_ms": 13333.1,
+      "grounding": "kb_unknown",
+      "scenario": "crop_production",
+      "references": 3,
+      "response_preview": "ጥያቄ፦ ረጅም ቁመት ላላቸው የገብስ ዘሮች ምን ያህል ዘር ያስፈልጋል? ምላሽ፦ በሄክታር 100-125 ኪ.ግ. ባዋል፡፡ በሚገባ ታርሶ የለሰለሰና ከአረም የጸዳ ማሳ ማዘጋጀት፤ ከአረም ነጻ የሆነ ዘር መጠቀም፤ በመስመርና ቀድሞ መዝራት፤ ከተዘራ ከ18-20 "
+    },
+    {
+      "id": "urea_timing",
+      "ok": true,
+      "latency_ms": 256.4,
+      "trust_latency_ms": 251.8,
+      "grounding": "clarification",
+      "scenario": "fertilizer",
+      "references": 0,
+      "response_preview": "ለዩሪያ ምክር ሰብል እና አካባቢውን ይንገሩኝ። ለምሳሌ፦ ስንዴ በደጋ።"
+    },
+    {
+      "id": "agrochemical_safety_escalates",
+      "ok": true,
+      "latency_ms": 339.5,
+      "trust_latency_ms": 335.6,
+      "grounding": "escalation",
+      "scenario": "safety_agrochemical",
+      "references": 0,
+      "response_preview": "ለመድሐኒት መጠን፣ የመርጨት ጊዜ፣ መገናኛና የደህንነት ጥያቄዎች ከዚህ ስልክ አጠቃላይ መረጃ ብቻ ሙሉ መልስ ልንሰጥ አንችልም። እባክዎን የገበር ልማት ባለሙያ፣ ኮኦፕ ወይም የአካባቢ ተቋም ይጠይቁ። ጥያቄዎን ለባለሙያ አስተላልፈናል።"
+    }
+  ],
+  "failures": []
+}

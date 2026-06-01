@@ -33,7 +33,10 @@ def _format_transcription_result(
     segments: list[dict[str, Any]] | None = None,
     latency: float | None = None,
 ) -> dict:
-    processed = postprocess_asr_transcript(raw_transcript)
+    processed = postprocess_asr_transcript(
+        raw_transcript,
+        acoustic_confidence=float(language_probability),
+    )
     if latency is None:
         latency = 0.0
     if segments is None:
@@ -53,9 +56,12 @@ def _format_transcription_result(
         "semantic_corrected_transcript": processed.get("semantic_corrected"),
         "transcript_fix_backend": processed.get("transcript_fix_backend"),
         "final_transcript": processed["final"],
+        "structured_transcript": processed["structured_transcript"],
         "transcript": processed["final"],
         "text": processed["final"],
-        "confidence": float(language_probability),
+        "confidence": processed["confidence"],
+        "acoustic_confidence": float(language_probability),
+        "fuzzy": processed.get("fuzzy") or {},
         "engine": engine,
         "audio_id": Path(audio_path).stem,
         "unusual_words": processed["unusual_words"],

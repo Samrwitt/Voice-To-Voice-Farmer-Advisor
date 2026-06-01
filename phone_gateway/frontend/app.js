@@ -7,10 +7,20 @@ let audioContext = null;
 let mediaStream = null;
 let sourceNode = null;
 let processorNode = null;
+let captureSinkNode = null;
 let playbackStartTime = 0;
 
 const DEFAULT_SERVICE_NUMBER = "8028";
 const TARGET_SAMPLE_RATE = 16000;
+
+function createAppAudioContext() {
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  try {
+    return new AudioContextClass({ sampleRate: TARGET_SAMPLE_RATE });
+  } catch (e) {
+    return new AudioContextClass();
+  }
+}
 
 /** Played once per session when the server confirms the call (Amharic). */
 const CALL_GREETING_AM =
@@ -235,7 +245,7 @@ function stopTimer() {
 async function startCall() {
   // Initialize AudioContext immediately on user gesture to avoid browser blocks
   if (!audioContext) {
-    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    audioContext = createAppAudioContext();
   }
 
   const dialedNumber = numberDisplay ? numberDisplay.value.trim() : "";
@@ -260,9 +270,10 @@ async function startCall() {
     mediaStream = await navigator.mediaDevices.getUserMedia({
       audio: {
         channelCount: 1,
+        sampleRate: TARGET_SAMPLE_RATE,
         echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true
+        noiseSuppression: false,
+        autoGainControl: false
       }
     });
 
@@ -368,7 +379,7 @@ async function playCallOpeningGreeting() {
     const raw = await res.arrayBuffer();
     const copy = raw.slice(0);
     if (!audioContext) {
-      audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      audioContext = createAppAudioContext();
     }
     if (audioContext.state === "suspended") {
       await audioContext.resume();
@@ -389,12 +400,12 @@ async function playCallOpeningGreeting() {
 
 async function startPCMStreaming(stream) {
   if (!audioContext) {
-    audioContext = new AudioContext();
+    audioContext = createAppAudioContext();
   }
 
   sourceNode = audioContext.createMediaStreamSource(stream);
 
-  const bufferSize = 4096;
+  const bufferSize = 1024;
   processorNode = audioContext.createScriptProcessor(bufferSize, 1, 1);
 
   processorNode.onaudioprocess = (event) => {
@@ -415,8 +426,13 @@ async function startPCMStreaming(stream) {
     websocket.send(pcm16.buffer);
   };
 
+  captureSinkNode = audioContext.createGain();
+  captureSinkNode.gain.value = 0;
+
   sourceNode.connect(processorNode);
-  processorNode.connect(audioContext.destination);
+  // ScriptProcessor must be connected to run, but keep microphone capture inaudible.
+  processorNode.connect(captureSinkNode);
+  captureSinkNode.connect(audioContext.destination);
 }
 
 function downsampleBuffer(buffer, inputSampleRate, outputSampleRate) {
@@ -457,7 +473,7 @@ function downsampleBuffer(buffer, inputSampleRate, outputSampleRate) {
 
 function handleIncomingAudio(arrayBuffer) {
   if (!audioContext) {
-    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    audioContext = createAppAudioContext();
   }
 
   // Modern browsers often suspend AudioContext until a user gesture or resume() call.
@@ -471,8 +487,7 @@ function handleIncomingAudio(arrayBuffer) {
   const pcm16 = new Int16Array(arrayBuffer);
   const float32 = new Float32Array(pcm16.length);
   for (let i = 0; i < pcm16.length; i++) {
-    // Boost volume by 1.5x
-    float32[i] = (pcm16[i] / 32768.0) * 1.5;
+    float32[i] = pcm16[i] / 32768.0;
   }
 
   const audioBuffer = audioContext.createBuffer(1, float32.length, TARGET_SAMPLE_RATE);
@@ -536,7 +551,7 @@ async function testAudio() {
   try {
     console.log("Starting audio test...");
     if (!audioContext) {
-      audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      audioContext = createAppAudioContext();
     }
     
     // Explicitly wait for resume
@@ -584,6 +599,13 @@ function cleanupAudio() {
       sourceNode.disconnect();
     } catch (e) {}
     sourceNode = null;
+  }
+
+  if (captureSinkNode) {
+    try {
+      captureSinkNode.disconnect();
+    } catch (e) {}
+    captureSinkNode = null;
   }
 
   if (audioContext) {

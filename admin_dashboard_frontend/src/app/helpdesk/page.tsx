@@ -12,6 +12,7 @@ import {
 import { getRole, getUserId, hasRole, getToken } from '@/lib/auth';
 import type { DashboardUser, EscalationCase } from '@/types';
 import Badge from '@/components/ui/Badge';
+import AudioPlayer from '@/components/ui/AudioPlayer';
 
 function statusLabel(s: string) {
   if (s === 'pending') return 'Pending';
@@ -26,6 +27,13 @@ function statusVariant(s: string): 'warning' | 'success' | 'info' | 'neutral' {
   if (s === 'answered') return 'success';
   if (s === 'closed' || s === 'resolved') return 'neutral';
   return 'neutral';
+}
+
+function withToken(url?: string | null) {
+  if (!url) return '';
+  const token = typeof window !== 'undefined' ? getToken() : null;
+  if (!token) return url;
+  return `${url}${url.includes('?') ? '&' : '?'}token=${token}`;
 }
 
 export default function Helpdesk() {
@@ -220,6 +228,60 @@ export default function Helpdesk() {
                     </div>
                   )}
 
+                  {/* Session record + transcription evidence pair */}
+                  <div className="pt-4 border-t border-slate-100 space-y-4">
+                    <span className="block text-xs font-semibold text-slate-500 uppercase tracking-wide">
+                      Escalation evidence pair
+                    </span>
+
+                    <div className="bg-slate-50 p-4 rounded-md border border-slate-200 space-y-3">
+                      <div className="flex items-center justify-between gap-3">
+                        <div>
+                          <p className="text-sm font-medium text-slate-800">Session record</p>
+                          <p className="text-xs text-slate-500">
+                            {selected.session_record?.session_id ?? selected.session_id ?? 'No session id'}
+                            {selected.session_record?.status ? ` · ${selected.session_record.status}` : ''}
+                          </p>
+                        </div>
+                      </div>
+                      {selected.session_recording_url || selected.session_record?.audio_url ? (
+                        <AudioPlayer
+                          src={withToken(selected.session_recording_url ?? selected.session_record?.audio_url)}
+                          label="Session audio"
+                          detail={selected.session_record?.duration_seconds != null ? `${selected.session_record.duration_seconds}s` : undefined}
+                          compact
+                        />
+                      ) : (
+                        <span className="text-xs text-slate-400">Recording appears after the call ends.</span>
+                      )}
+                      {selected.session_recording_path && (
+                        <p className="text-[11px] text-slate-400 font-mono break-all">
+                          {selected.session_recording_path}
+                        </p>
+                      )}
+                    </div>
+
+                    <div className="bg-slate-50 p-4 rounded-md border border-slate-200">
+                      <p className="text-sm font-medium text-slate-800 mb-3">Transcribed conversation</p>
+                      {selected.transcript_messages && selected.transcript_messages.length > 0 ? (
+                        <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
+                          {selected.transcript_messages.map((m, idx) => (
+                            <div key={`${m.timestamp ?? 'msg'}-${idx}`} className="text-sm leading-relaxed">
+                              <span className="font-semibold text-slate-700 capitalize">{m.role}: </span>
+                              <span className="text-slate-600">{m.message}</span>
+                            </div>
+                          ))}
+                        </div>
+                      ) : selected.transcript ? (
+                        <pre className="whitespace-pre-wrap text-sm text-slate-600 max-h-64 overflow-y-auto">
+                          {selected.transcript}
+                        </pre>
+                      ) : (
+                        <p className="text-sm text-slate-400">No transcript available yet.</p>
+                      )}
+                    </div>
+                  </div>
+
                   {/* Assignment (admin/da) */}
                   {hasRole('admin', 'da') && (
                     <div className="pt-4 border-t border-slate-100 space-y-3">
@@ -342,14 +404,14 @@ function ExpertResponsePanel({
         <span className="block text-xs font-semibold text-slate-500 uppercase tracking-wide">
           Expert response
         </span>
-        {caseItem.expert_audio_url && (
-          <audio 
-            controls 
-            src={caseItem.expert_audio_url + (typeof window !== 'undefined' && getToken() ? `?token=${getToken()}` : '')} 
-            className="h-8 w-48"
-          />
-        )}
       </div>
+      {caseItem.expert_audio_url && (
+        <AudioPlayer
+          src={withToken(caseItem.expert_audio_url)}
+          label="Expert audio"
+          compact
+        />
+      )}
 
       {!canRespond && (
         <div className="bg-amber-50 border border-amber-200 rounded-md p-3 text-sm text-amber-800">
@@ -389,10 +451,7 @@ function ExpertResponsePanel({
         </div>
 
         {audioUrl && (
-          <div className="bg-slate-50 p-2 rounded-md border border-slate-200 flex items-center gap-3">
-            <span className="text-xs text-slate-500 font-medium ml-2">Preview:</span>
-            <audio src={audioUrl} controls className="h-8 flex-1" />
-          </div>
+          <AudioPlayer src={audioUrl} label="Preview" compact />
         )}
 
         <textarea
