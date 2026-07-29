@@ -5,6 +5,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ami_utils import ami_action, ami_contacts_include_endpoint, sip_endpoint_for_alert
 from tts_chunking import chunk_tts_text
+from utterance_audio import resolve_farmer_utterance_audio
 
 
 def test_sip_endpoint_for_alert_strips_sip_uri():
@@ -25,6 +26,18 @@ Contact:  farmeruhamayohannes/sip:farmeruhamayohannes@172.18.0.1:5062  abc123  A
 
     assert ami_contacts_include_endpoint(response, "farmeruhamayohannes") is True
     assert ami_contacts_include_endpoint("No objects found.", "farmeruhamayohannes") is False
+
+
+def test_resolve_farmer_utterance_audio_prefers_basename(tmp_path, monkeypatch):
+    monkeypatch.setenv("FARMER_UTTERANCES_DIR", str(tmp_path))
+    session_id = "sess-abc"
+    first = tmp_path / f"{session_id}_utterance_001.wav"
+    second = tmp_path / f"{session_id}_utterance_002.wav"
+    first.write_bytes(b"RIFF")
+    second.write_bytes(b"RIFF")
+
+    assert resolve_farmer_utterance_audio(session_id) == str(second)
+    assert resolve_farmer_utterance_audio(session_id, basename=first.name) == str(first)
 
 
 def test_chunk_tts_text_splits_long_expert_message():

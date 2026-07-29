@@ -274,6 +274,18 @@ def init_pg_app_tables():
         print(f"[DB] init_pg_app_tables failed: {exc}")
 
 
+def _merge_escalation_entities(
+    entities: dict | None,
+    farmer_utterance_path: str | None = None,
+) -> dict | None:
+    from pathlib import Path
+
+    merged = dict(entities or {})
+    if farmer_utterance_path:
+        merged["farmer_utterance_basename"] = Path(farmer_utterance_path).name
+    return merged or None
+
+
 def add_to_escalation(
     query: str,
     context: str,
@@ -282,7 +294,9 @@ def add_to_escalation(
     reason_code: str = None,
     confidence: float = None,
     entities: dict = None,
+    farmer_utterance_path: str | None = None,
 ):
+    entities = _merge_escalation_entities(entities, farmer_utterance_path)
     if not POSTGRES_URL:
         # Fallback to legacy SQLite if Postgres is not configured
         conn = sqlite3.connect(DB_PATH)

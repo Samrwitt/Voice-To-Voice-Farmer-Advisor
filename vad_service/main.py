@@ -4,6 +4,7 @@ import audioop
 import os
 import re
 import time
+from dataclasses import dataclass
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 
@@ -46,7 +47,6 @@ VAD_TTS_MAX_SENTENCES = int(os.getenv("VAD_TTS_MAX_SENTENCES", "0"))
 VAD_TTS_MAX_CHARS = int(os.getenv("VAD_TTS_MAX_CHARS", "0"))
 VAD_AUDIO_LOG_EVERY = int(os.getenv("VAD_AUDIO_LOG_EVERY", "0"))
 ASR_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_ASR)
-PLAYBACK_LOCK = asyncio.Lock()
 
 
 # ============================================================
@@ -94,9 +94,18 @@ async def safe_send(
         return False
 
 
+@dataclass
+class AdvisorPlaybackItem:
+    utterance_path: str
+    rag_answer: str
+
+
 class SessionState:
     def __init__(self):
         self.playback_task = None
+        self.current_playback_task: asyncio.Task | None = None
+        self.advisor_speaking = False
+        self.playback_queue: asyncio.Queue = asyncio.Queue()
         self.pending_confirmation_transcript = None
         self.pending_confirmation_asr_meta = None
         self.pending_confirmation_utterance_path = None
@@ -160,6 +169,131 @@ def compact_voice_tts_text(text: str) -> str:
 # Playback Handling
 # ============================================================
 
+def _drain_playback_queue(session_state: SessionState) -> None:
+    while True:
+        try:
+            session_state.playback_queue.get_nowait()
+            session_state.playback_queue.task_done()
+        except asyncio.QueueEmpty:
+            break
+
+
+async def interrupt_advisor_playback_if_speaking(
+    session_state: SessionState,
+    websocket: WebSocket,
+    send_lock: asyncio.Lock,
+    session_id: str,
+) -> bool:
+    """Barge-in: stop active TTS and drop any queued responses."""
+    if not session_state.advisor_speaking:
+        return False
+
+    print(f"[BARGE-IN] Interrupting advisor playback session={session_id}", flush=True)
+    _drain_playback_queue(session_state)
+
+    current = session_state.current_playback_task
+    if current and not current.done():
+        current.cancel()
+        try:
+            await current
+        except asyncio.CancelledError:
+            pass
+
+    await safe_send(
+        websocket,
+        send_lock,
+        {
+            "event": "advisor_playback_interrupted",
+            "session_id": session_id,
+            "message": "Advisor speech interrupted by caller",
+        },
+    )
+    return True
+
+
+def _ensure_playback_dispatcher(
+    session_state: SessionState,
+    websocket: WebSocket,
+    send_lock: asyncio.Lock,
+    session_id: str,
+    playback_sample_rate: int,
+) -> None:
+    if session_state.playback_task and not session_state.playback_task.done():
+        return
+
+    session_state.playback_task = asyncio.create_task(
+        _advisor_playback_dispatcher(
+            session_state=session_state,
+            websocket=websocket,
+            send_lock=send_lock,
+            session_id=session_id,
+            playback_sample_rate=playback_sample_rate,
+        )
+    )
+
+
+async def schedule_advisor_playback(
+    session_state: SessionState,
+    websocket: WebSocket,
+    send_lock: asyncio.Lock,
+    session_id: str,
+    utterance_path: str,
+    rag_answer: str,
+    playback_sample_rate: int = 16000,
+) -> None:
+    """Queue TTS so the next response starts only after the previous one finishes."""
+    await session_state.playback_queue.put(
+        AdvisorPlaybackItem(
+            utterance_path=utterance_path,
+            rag_answer=rag_answer,
+        )
+    )
+    _ensure_playback_dispatcher(
+        session_state,
+        websocket,
+        send_lock,
+        session_id,
+        playback_sample_rate,
+    )
+
+
+async def _advisor_playback_dispatcher(
+    session_state: SessionState,
+    websocket: WebSocket,
+    send_lock: asyncio.Lock,
+    session_id: str,
+    playback_sample_rate: int,
+) -> None:
+    try:
+        while True:
+            item = await session_state.playback_queue.get()
+            try:
+                session_state.advisor_speaking = True
+                session_state.current_playback_task = asyncio.create_task(
+                    play_advisor_response(
+                        websocket=websocket,
+                        send_lock=send_lock,
+                        session_id=session_id,
+                        utterance_path=item.utterance_path,
+                        rag_answer=item.rag_answer,
+                        playback_sample_rate=playback_sample_rate,
+                    )
+                )
+                await session_state.current_playback_task
+            except asyncio.CancelledError:
+                print(
+                    f"[PLAYBACK DISPATCHER] item cancelled session={session_id}",
+                    flush=True,
+                )
+            finally:
+                session_state.advisor_speaking = False
+                session_state.current_playback_task = None
+                session_state.playback_queue.task_done()
+    except asyncio.CancelledError:
+        print(f"[PLAYBACK DISPATCHER STOPPED] session={session_id}", flush=True)
+        raise
+
+
 async def play_advisor_response(
     websocket: WebSocket,
     send_lock: asyncio.Lock,
@@ -168,93 +302,88 @@ async def play_advisor_response(
     rag_answer: str,
     playback_sample_rate: int = 16000,
 ):
-    """
-    Synthesizes and streams audio for a RAG answer.
-    Locked by PLAYBACK_LOCK to avoid overlapping speech.
-    """
-    async with PLAYBACK_LOCK:
-        try:
-            spoken_answer = compact_voice_tts_text(rag_answer)
-            if not spoken_answer:
-                return
+    """Synthesize and stream one advisor response (one queue item at a time)."""
+    try:
+        spoken_answer = compact_voice_tts_text(rag_answer)
+        if not spoken_answer:
+            return
 
+        print(
+            f"[TTS STARTING] full_text_len={len(rag_answer)}, "
+            f"spoken_text_len={len(spoken_answer)}, path={utterance_path}",
+            flush=True,
+        )
+        sentences = chunk_tts_text(spoken_answer)
+
+        print(f"[STREAMING] Total sentences: {len(sentences)}", flush=True)
+
+        for i, sentence in enumerate(sentences):
+            if not sentence.strip():
+                continue
+
+            print(f"[SENTENCE {i+1}/{len(sentences)}] Synthesizing: {sentence[:30]}...", flush=True)
+
+            sentence_path = f"{utterance_path}_s{i}.wav"
+
+            started_at = time.monotonic()
+            tts_path = await synthesize_speech(
+                text=sentence,
+                utterance_path=sentence_path,
+            )
             print(
-                f"[TTS STARTING] full_text_len={len(rag_answer)}, "
-                f"spoken_text_len={len(spoken_answer)}, path={utterance_path}",
+                f"[SENTENCE {i+1} SYNTH DONE] seconds={time.monotonic() - started_at:.2f}",
                 flush=True,
             )
-            sentences = chunk_tts_text(spoken_answer)
-            
-            print(f"[STREAMING] Total sentences: {len(sentences)}", flush=True)
-            
-            for i, sentence in enumerate(sentences):
-                if not sentence.strip():
-                    continue
-                    
-                print(f"[SENTENCE {i+1}/{len(sentences)}] Synthesizing: {sentence[:30]}...", flush=True)
-                
-                # Use a unique path for each sentence to avoid collisions
-                sentence_path = f"{utterance_path}_s{i}.wav"
-                
-                started_at = time.monotonic()
-                tts_path = await synthesize_speech(
-                    text=sentence,
-                    utterance_path=sentence_path
-                )
-                print(
-                    f"[SENTENCE {i+1} SYNTH DONE] seconds={time.monotonic() - started_at:.2f}",
-                    flush=True,
-                )
-                
-                if tts_path:
-                    try:
-                        import wave
-                        with wave.open(tts_path, "rb") as wf:
-                            source_sample_rate = wf.getframerate()
-                            channels = wf.getnchannels()
-                            sample_width = wf.getsampwidth()
-                            frames_per_chunk = max(1, source_sample_rate // 50)
-                            rate_state = None
+
+            if tts_path:
+                try:
+                    import wave
+
+                    with wave.open(tts_path, "rb") as wf:
+                        source_sample_rate = wf.getframerate()
+                        channels = wf.getnchannels()
+                        sample_width = wf.getsampwidth()
+                        frames_per_chunk = max(1, source_sample_rate // 50)
+                        rate_state = None
+                        data = wf.readframes(frames_per_chunk)
+                        while data:
+                            if sample_width != 2:
+                                data = audioop.lin2lin(data, sample_width, 2)
+
+                            if channels == 2:
+                                data = audioop.tomono(data, 2, 0.5, 0.5)
+                            elif channels != 1:
+                                raise ValueError(f"Unsupported TTS channel count: {channels}")
+
+                            if source_sample_rate != playback_sample_rate:
+                                data, rate_state = audioop.ratecv(
+                                    data,
+                                    2,
+                                    1,
+                                    source_sample_rate,
+                                    playback_sample_rate,
+                                    rate_state,
+                                )
+
+                            sent = await safe_send(websocket, send_lock, data)
+                            if not sent:
+                                break
+
+                            await asyncio.sleep(len(data) / (2 * playback_sample_rate))
                             data = wf.readframes(frames_per_chunk)
-                            while data:
-                                if sample_width != 2:
-                                    data = audioop.lin2lin(data, sample_width, 2)
 
-                                if channels == 2:
-                                    data = audioop.tomono(data, 2, 0.5, 0.5)
-                                elif channels != 1:
-                                    raise ValueError(f"Unsupported TTS channel count: {channels}")
+                    print(f"[SENTENCE {i+1} DONE] Streamed.", flush=True)
+                except Exception as e:
+                    print(f"[SENTENCE {i+1} ERROR] {e}", flush=True)
 
-                                if source_sample_rate != playback_sample_rate:
-                                    data, rate_state = audioop.ratecv(
-                                        data,
-                                        2,
-                                        1,
-                                        source_sample_rate,
-                                        playback_sample_rate,
-                                        rate_state,
-                                    )
+            await asyncio.sleep(0.2)
 
-                                sent = await safe_send(websocket, send_lock, data)
-                                if not sent:
-                                    break
-
-                                await asyncio.sleep(len(data) / (2 * playback_sample_rate))
-                                data = wf.readframes(frames_per_chunk)
-                                
-                        print(f"[SENTENCE {i+1} DONE] Streamed.", flush=True)
-                    except Exception as e:
-                        print(f"[SENTENCE {i+1} ERROR] {e}", flush=True)
-                
-                # Optional: Add a natural pause between sentences
-                await asyncio.sleep(0.2)
-
-            print(f"[TTS STREAM DONE] session={session_id}", flush=True)
-        except asyncio.CancelledError:
-            print(f"[PLAYBACK CANCELLED] session={session_id}", flush=True)
-            raise
-        except Exception as e:
-            print(f"[PLAYBACK ERROR] session={session_id}, error={e}", flush=True)
+        print(f"[TTS STREAM DONE] session={session_id}", flush=True)
+    except asyncio.CancelledError:
+        print(f"[PLAYBACK CANCELLED] session={session_id}", flush=True)
+        raise
+    except Exception as e:
+        print(f"[PLAYBACK ERROR] session={session_id}, error={e}", flush=True)
 
 # ============================================================
 # ASR / RAG Handling
@@ -406,15 +535,14 @@ async def handle_completed_utterance(
                         "message": "Synthesizing voice response...",
                     },
                 )
-                session_state.playback_task = asyncio.create_task(
-                    play_advisor_response(
-                        websocket=websocket,
-                        send_lock=send_lock,
-                        session_id=session_id,
-                        utterance_path=utterance_path,
-                        rag_answer=rag_answer,
-                        playback_sample_rate=playback_sample_rate,
-                    )
+                await schedule_advisor_playback(
+                    session_state=session_state,
+                    websocket=websocket,
+                    send_lock=send_lock,
+                    session_id=session_id,
+                    utterance_path=utterance_path,
+                    rag_answer=rag_answer,
+                    playback_sample_rate=playback_sample_rate,
                 )
                 return
             else:
@@ -447,15 +575,14 @@ async def handle_completed_utterance(
                         "message": "Synthesizing voice response...",
                     },
                 )
-                session_state.playback_task = asyncio.create_task(
-                    play_advisor_response(
-                        websocket=websocket,
-                        send_lock=send_lock,
-                        session_id=session_id,
-                        utterance_path=utterance_path,
-                        rag_answer=rag_answer,
-                        playback_sample_rate=playback_sample_rate,
-                    )
+                await schedule_advisor_playback(
+                    session_state=session_state,
+                    websocket=websocket,
+                    send_lock=send_lock,
+                    session_id=session_id,
+                    utterance_path=utterance_path,
+                    rag_answer=rag_answer,
+                    playback_sample_rate=playback_sample_rate,
                 )
                 return
 
@@ -502,15 +629,14 @@ async def handle_completed_utterance(
                     "message": "Synthesizing voice response...",
                 },
             )
-            session_state.playback_task = asyncio.create_task(
-                play_advisor_response(
-                    websocket=websocket,
-                    send_lock=send_lock,
-                    session_id=session_id,
-                    utterance_path=utterance_path,
-                    rag_answer=rag_answer,
-                    playback_sample_rate=playback_sample_rate,
-                )
+            await schedule_advisor_playback(
+                session_state=session_state,
+                websocket=websocket,
+                send_lock=send_lock,
+                session_id=session_id,
+                utterance_path=utterance_path,
+                rag_answer=rag_answer,
+                playback_sample_rate=playback_sample_rate,
             )
             return
 
@@ -550,15 +676,14 @@ async def handle_completed_utterance(
                     "message": "Synthesizing voice response...",
                 },
             )
-            session_state.playback_task = asyncio.create_task(
-                play_advisor_response(
-                    websocket=websocket,
-                    send_lock=send_lock,
-                    session_id=session_id,
-                    utterance_path=utterance_path,
-                    rag_answer=rag_answer,
-                    playback_sample_rate=playback_sample_rate,
-                )
+            await schedule_advisor_playback(
+                session_state=session_state,
+                websocket=websocket,
+                send_lock=send_lock,
+                session_id=session_id,
+                utterance_path=utterance_path,
+                rag_answer=rag_answer,
+                playback_sample_rate=playback_sample_rate,
             )
             return
 
@@ -618,15 +743,14 @@ async def handle_completed_utterance(
                     "message": "Synthesizing voice response...",
                 },
             )
-            session_state.playback_task = asyncio.create_task(
-                play_advisor_response(
-                    websocket=websocket,
-                    send_lock=send_lock,
-                    session_id=session_id,
-                    utterance_path=utterance_path,
-                    rag_answer=rag_answer,
-                    playback_sample_rate=playback_sample_rate,
-                )
+            await schedule_advisor_playback(
+                session_state=session_state,
+                websocket=websocket,
+                send_lock=send_lock,
+                session_id=session_id,
+                utterance_path=utterance_path,
+                rag_answer=rag_answer,
+                playback_sample_rate=playback_sample_rate,
             )
             return
 
@@ -645,6 +769,7 @@ async def handle_completed_utterance(
             text=transcript,
             session_id=session_id,
             phone_number=phone_number,
+            utterance_path=utterance_path,
             asr_meta={
                 "raw_transcript": asr_result.get("raw_transcript"),
                 "final_transcript": asr_result.get("final_transcript"),
@@ -704,17 +829,14 @@ async def handle_completed_utterance(
         )
 
         print(f"[TTS QUEUED] text_len={len(rag_answer)}, path={utterance_path}", flush=True)
-        # ── Start Playback in background ──
-        # We store it in session_state so the VAD loop can cancel it if barge-in occurs.
-        session_state.playback_task = asyncio.create_task(
-            play_advisor_response(
-                websocket=websocket,
-                send_lock=send_lock,
-                session_id=session_id,
-                utterance_path=utterance_path,
-                rag_answer=rag_answer,
-                playback_sample_rate=playback_sample_rate,
-            )
+        await schedule_advisor_playback(
+            session_state=session_state,
+            websocket=websocket,
+            send_lock=send_lock,
+            session_id=session_id,
+            utterance_path=utterance_path,
+            rag_answer=rag_answer,
+            playback_sample_rate=playback_sample_rate,
         )
 
     except Exception as e:
@@ -892,10 +1014,12 @@ async def vad_websocket(
                             f"[SPEECH STARTED] session={session_id}",
                             flush=True,
                         )
-                        # Barge-in: Cancel current advisor playback if they were talking
-                        if session_state.playback_task and not session_state.playback_task.done():
-                            print(f"[BARGE-IN] Interrupting advisor playback", flush=True)
-                            session_state.playback_task.cancel()
+                        await interrupt_advisor_playback_if_speaking(
+                            session_state=session_state,
+                            websocket=websocket,
+                            send_lock=send_lock,
+                            session_id=session_id,
+                        )
 
                     elif event_name == "speech_ended":
                         print(
@@ -1027,6 +1151,11 @@ async def vad_websocket(
         print(f"[VAD DISCONNECTED] session={session_id}", flush=True)
 
     finally:
+        _drain_playback_queue(session_state)
+        if session_state.playback_task and not session_state.playback_task.done():
+            session_state.playback_task.cancel()
+            await asyncio.gather(session_state.playback_task, return_exceptions=True)
+
         for task in list(active_asr_tasks):
             if not task.done():
                 task.cancel()

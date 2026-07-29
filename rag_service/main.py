@@ -196,6 +196,7 @@ class RagAnswerRequest(BaseModel):
     phone_number: str = "Unknown"
     session_id: str = "default_session"
     asr: Optional[dict] = None
+    utterance_path: Optional[str] = None
 
 
 class RagDebugContextRequest(BaseModel):
@@ -1113,6 +1114,7 @@ def _voice_escalation_response(
     safety: dict | None = None,
     meta_reason: str,
     nlu,
+    farmer_utterance_path: str | None = None,
 ) -> dict:
     add_to_escalation(
         query_text,
@@ -1122,6 +1124,7 @@ def _voice_escalation_response(
         reason_code=reason_code,
         confidence=float(best_distance) if best_distance is not None else None,
         entities=getattr(nlu, "entities", None),
+        farmer_utterance_path=farmer_utterance_path,
     )
     final = f"{expert_delivery}\n\n{body}" if expert_delivery else body
     final = normalize_text(final)
@@ -1390,6 +1393,7 @@ async def rag_answer(req: RagAnswerRequest):
             t0=t0,
             meta_reason="user_requested_escalation",
             nlu=nlu,
+            farmer_utterance_path=req.utterance_path,
         )
 
     if is_out_of_domain(query_text, nlu):
@@ -1407,6 +1411,7 @@ async def rag_answer(req: RagAnswerRequest):
             t0=t0,
             meta_reason="out_of_domain_escalation",
             nlu=nlu,
+            farmer_utterance_path=req.utterance_path,
         )
 
     is_agro = chemical_safety.is_high_risk_agrochemical_query(query_text)
@@ -1463,6 +1468,7 @@ async def rag_answer(req: RagAnswerRequest):
             safety={"agrochemical_expert_only": True, "reason": "dose_or_spray_question"},
             meta_reason="agrochemical_escalation",
             nlu=nlu,
+            farmer_utterance_path=req.utterance_path,
         )
 
     smart_on = os.environ.get("RAG_SMART_PIPELINE", "1").strip().lower() not in ("0", "false", "no", "off")
@@ -1631,6 +1637,7 @@ async def rag_answer(req: RagAnswerRequest):
             safety={"agrochemical_expert_only": True, "reason": reason},
             meta_reason="agrochemical_escalation",
             nlu=nlu,
+            farmer_utterance_path=req.utterance_path,
         )
 
     if (
@@ -1655,6 +1662,7 @@ async def rag_answer(req: RagAnswerRequest):
             t0=t0,
             meta_reason="low_confidence_escalation",
             nlu=nlu,
+            farmer_utterance_path=req.utterance_path,
         )
 
     confident_hits = voice_guards.confident_kb_hits(hits, max_d)
@@ -1760,6 +1768,7 @@ async def rag_answer(req: RagAnswerRequest):
             t0=t0,
             meta_reason="voice_output_guard_escalation",
             nlu=nlu,
+            farmer_utterance_path=req.utterance_path,
         )
 
     escalated_empty = False
@@ -1780,7 +1789,8 @@ async def rag_answer(req: RagAnswerRequest):
             "Empty response in voice pipeline.",
             phone_number=req.phone_number,
             session_id=req.session_id,
-            reason_code="EMPTY_VOICE_RESP"
+            reason_code="EMPTY_VOICE_RESP",
+            farmer_utterance_path=req.utterance_path,
         )
         final = "ይቅርታ፣ ለዚህ ጥያቄ በቂ መረጃ አልተገኘም። ጥያቄዎን ለግብርና ባለሙያ ልከናል፤ በቅርቡ መልስ ያገኛሉ።"
 

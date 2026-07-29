@@ -25,6 +25,7 @@ from backend.monitor_state import (
 from backend.recorder import AudioRecorder
 from backend.sessions import create_session, end_session
 from backend.tts_chunking import chunk_tts_text
+from backend.utterance_audio import resolve_farmer_utterance_audio
 
 
 AUDIOSOCKET_KIND_HANGUP = 0x00
@@ -508,6 +509,11 @@ async def handle_alert_audiosocket_call(
         payload = _alert_call_payloads.pop(call_id, {})
         message = (payload.get("alert_message") or "").strip()
         expert_audio_path = (payload.get("expert_audio_path") or "").strip()
+        farmer_utterance_audio_path = (payload.get("farmer_utterance_audio_path") or "").strip()
+        if not farmer_utterance_audio_path:
+            farmer_utterance_audio_path = (
+                resolve_farmer_utterance_audio(payload.get("session_id")) or ""
+            ).strip()
         severity = (payload.get("severity") or "warning").strip()
         if severity == "critical":
             prefix = "አስቸኳይ ማስጠንቀቂያ። "
@@ -537,6 +543,28 @@ async def handle_alert_audiosocket_call(
                 "phone_number": payload.get("phone_number"),
                 "escalation_id": payload.get("escalation_id"),
             })
+            if farmer_utterance_audio_path:
+                add_event("expert_callback_farmer_question_start", {
+                    "call_id": call_id,
+                    "phone_number": payload.get("phone_number"),
+                    "escalation_id": payload.get("escalation_id"),
+                    "farmer_utterance_audio_path": farmer_utterance_audio_path,
+                })
+                await play_recorded_audio_file(sink, farmer_utterance_audio_path)
+                add_event("expert_callback_farmer_question_done", {
+                    "call_id": call_id,
+                    "phone_number": payload.get("phone_number"),
+                    "escalation_id": payload.get("escalation_id"),
+                })
+                bridge = os.getenv(
+                    "SIP_EXPERT_RESPONSE_BRIDGE_AM",
+                    "በባለሙያችን የተቀዳ የድምፅ መልስ ይህ ነው።",
+                ).strip()
+                if bridge:
+                    await play_alert_message(sink, bridge)
+            elif message and "ጥያቄዎ ይህ ነበር" in message:
+                # Backward compatibility for older callbacks that still embed the transcript.
+                await play_alert_message(sink, message)
             add_event("expert_callback_audio_start", {
                 "call_id": call_id,
                 "phone_number": payload.get("phone_number"),

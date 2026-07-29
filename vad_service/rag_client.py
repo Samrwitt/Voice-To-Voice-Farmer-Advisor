@@ -11,6 +11,7 @@ async def get_rag_answer(
     session_id: str,
     phone_number: str = "Unknown",
     asr_meta: dict | None = None,
+    utterance_path: str | None = None,
 ) -> dict:
     """
     Call the RAG service to get a grounded answer for the transcript.
@@ -24,7 +25,9 @@ async def get_rag_answer(
     }
     if asr_meta:
         payload["asr"] = asr_meta
-    
+    if utterance_path:
+        payload["utterance_path"] = utterance_path
+
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(url, json=payload)
