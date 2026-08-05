@@ -53,6 +53,3 @@ The system is fully containerized using **Docker Compose**.
 
 ## 📊 Evaluation
 The system was benchmarked using real-world agricultural queries. The modular architecture allows for independent scaling—for example, upgrading the ASR model without affecting the RAG logic.
-
----
-*Created by the Advanced Agentic Coding Team @ DeepMind.*
