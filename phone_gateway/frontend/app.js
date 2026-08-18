@@ -9,6 +9,7 @@ let sourceNode = null;
 let processorNode = null;
 let captureSinkNode = null;
 let playbackStartTime = 0;
+let scheduledPlaybackSources = [];
 
 const DEFAULT_SERVICE_NUMBER = "8028";
 const TARGET_SAMPLE_RATE = 16000;
@@ -324,6 +325,13 @@ async function startCall() {
           setStatus("Speaking...");
         }
 
+        if (data.event === "advisor_playback_interrupted") {
+          stopAdvisorPlayback();
+          if (activeCall) {
+            setStatus("Listening...");
+          }
+        }
+
         if (data.event === "speech_ended") {
           setStatus("Listening...");
         }
@@ -471,6 +479,25 @@ function downsampleBuffer(buffer, inputSampleRate, outputSampleRate) {
   return result;
 }
 
+function stopAdvisorPlayback() {
+  for (const source of scheduledPlaybackSources) {
+    try {
+      source.stop();
+    } catch (e) {
+      // Already stopped or not started yet.
+    }
+  }
+  scheduledPlaybackSources = [];
+
+  if (audioContext) {
+    playbackStartTime = audioContext.currentTime;
+  } else {
+    playbackStartTime = 0;
+  }
+
+  clearTimeout(window.statusTimeout);
+}
+
 function handleIncomingAudio(arrayBuffer) {
   if (!audioContext) {
     audioContext = createAppAudioContext();
@@ -497,13 +524,17 @@ function handleIncomingAudio(arrayBuffer) {
   source.buffer = audioBuffer;
   source.connect(audioContext.destination);
 
-  // Simple scheduling to avoid clicks
+  // Simple scheduling to avoid clicks; one response at a time from the server queue.
   const currentTime = audioContext.currentTime;
   if (playbackStartTime < currentTime) {
     playbackStartTime = currentTime + 0.05;
   }
   source.start(playbackStartTime);
   playbackStartTime += audioBuffer.duration;
+  scheduledPlaybackSources.push(source);
+  source.onended = () => {
+    scheduledPlaybackSources = scheduledPlaybackSources.filter((item) => item !== source);
+  };
 
   // Clear "Talking" status after a delay (approx when audio finishes)
   clearTimeout(window.statusTimeout);
@@ -587,6 +618,8 @@ async function testAudio() {
 }
 
 function cleanupAudio() {
+  stopAdvisorPlayback();
+
   if (processorNode) {
     try {
       processorNode.disconnect();

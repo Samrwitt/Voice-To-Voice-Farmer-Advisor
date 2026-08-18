@@ -32,6 +32,7 @@ from backend.sip_audio import (
     stop_alert_audiosocket_server,
     stop_sip_audiosocket_server,
 )
+from backend.utterance_audio import resolve_farmer_utterance_audio
 
 from backend.monitor_state import (
     start_call_monitor,
@@ -125,6 +126,8 @@ class ExpertResponseCallRequest(BaseModel):
     escalation_id: int
     phone_number: str
     expert_audio_path: str
+    session_id: str | None = None
+    farmer_utterance_basename: str | None = None
     message: str | None = None
 
 
@@ -599,15 +602,21 @@ async def place_expert_response_call(req: ExpertResponseCallRequest):
 
     call_id = str(uuid.uuid4())
     endpoint = _sip_endpoint_for_alert(phone)
+    farmer_utterance_audio_path = resolve_farmer_utterance_audio(
+        req.session_id,
+        basename=req.farmer_utterance_basename,
+    )
     register_alert_call_payload(
         call_id,
         {
             "kind": "expert_response",
             "escalation_id": req.escalation_id,
             "phone_number": phone,
+            "session_id": (req.session_id or "").strip() or None,
             "target_region": "expert_response",
             "alert_message": (req.message or "").strip(),
             "expert_audio_path": audio_path,
+            "farmer_utterance_audio_path": farmer_utterance_audio_path,
             "severity": "expert_response",
         },
     )

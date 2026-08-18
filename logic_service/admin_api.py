@@ -805,6 +805,12 @@ def _get_expert_audio_link(e: Escalation, db: Session) -> Optional[str]:
     return f"/api/admin/escalations/{e.id}/audio"
 
 
+def _farmer_utterance_basename_for_escalation(e: Escalation) -> Optional[str]:
+    entities = e.entities if isinstance(e.entities, dict) else {}
+    basename = (entities or {}).get("farmer_utterance_basename")
+    return str(basename).strip() if basename else None
+
+
 def _phone_number_for_escalation(e: Escalation, db: Session) -> Optional[str]:
     if e.phone_number:
         return e.phone_number
@@ -850,12 +856,11 @@ def _trigger_expert_response_call(
         return {"status": "disabled"}
 
     phone = (_phone_number_for_escalation(e, db) or "").strip()
-    original_query = (getattr(e, "query", None) or "").strip()
-    callback_message_parts: list[str] = []
-    if original_query:
-        callback_message_parts.append(f"ጥያቄዎ ይህ ነበር፦ {original_query}")
-    callback_message_parts.append("በባለሙያችን የተቀዳ የድምፅ መልስ ይህ ነው።")
-    callback_message = " ".join(callback_message_parts).strip()
+    farmer_utterance_basename = _farmer_utterance_basename_for_escalation(e)
+    callback_message = os.getenv(
+        "EXPERT_CALLBACK_INTRO_AM",
+        "የባለሙያ መልስ ዝግጁ ነው። መጀመሪያ ጥያቄዎን እናጫውታለን።",
+    ).strip()
 
     if not phone:
         return {"status": "skipped", "reason": "missing_phone_number"}
@@ -870,7 +875,9 @@ def _trigger_expert_response_call(
             json={
                 "escalation_id": e.id,
                 "phone_number": phone,
+                "session_id": e.session_id,
                 "expert_audio_path": audio_path,
+                "farmer_utterance_basename": farmer_utterance_basename,
                 "message": callback_message,
             },
             timeout=8,

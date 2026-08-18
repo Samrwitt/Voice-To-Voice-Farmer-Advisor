@@ -228,6 +228,18 @@ def seed_default_admin():
 
 
 # ── Escalations ──────────────────────────────────────────────────────────────
+def _merge_escalation_entities(
+    entities: Optional[dict],
+    farmer_utterance_path: Optional[str] = None,
+) -> Optional[dict]:
+    from pathlib import Path
+
+    merged = dict(entities or {})
+    if farmer_utterance_path:
+        merged["farmer_utterance_basename"] = Path(farmer_utterance_path).name
+    return merged or None
+
+
 def add_to_escalation(
     query: str,
     context: str,
@@ -236,7 +248,9 @@ def add_to_escalation(
     reason_code: Optional[str] = None,
     confidence: Optional[float] = None,
     entities: Optional[dict] = None,
+    farmer_utterance_path: Optional[str] = None,
 ):
+    entities = _merge_escalation_entities(entities, farmer_utterance_path)
     db = SessionLocal()
     try:
         esc = Escalation(
